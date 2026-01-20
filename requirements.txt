@@ -1,0 +1,6 @@
+pandas
+numpy
+scipy
+matplotlib
+nba_api
+requests

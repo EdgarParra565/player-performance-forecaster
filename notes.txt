@@ -1,0 +1,21 @@
+Player-level
+- Points per minute (not per game)
+- Usage rate
+- Rolling averages (last 5, 10, 20 games)
+- Home vs away splits
+- Rest days
+-Opponent defensive rank vs position
+
+Game-level
+- Pace
+- Vegas implied total (ironically useful)
+- Blowout risk
+- Back-to-back games
+- Injury-adjusted lineups
+
+
+TODO:
+Design a minimal working model
+Pick a sport/stat and outline exact features
+Talk about correlation modeling for parlays
+Sketch a full system architecture (data → model → dashboard)
