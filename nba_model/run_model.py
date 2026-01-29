@@ -1,14 +1,10 @@
-from nba_model.model.data_loader import load_player_logs
+from nba_model.data.data_loader import load_player_logs
 from nba_model.model.feature_engineering import add_rolling_stats
 from nba_model.model.simulation import monte_carlo_over
 from nba_model.model.defense_adjustment import adjust_mu_for_defense
 from nba_model.model.minutes_projection import project_minutes
 from nba_model.model.odds import american_to_implied_prob, expected_value
 from nba_model.visualization.distribution_plot import plot_distribution
-from nba_model.model.parlay_simulation import simulate_sgp
-from nba_model.model.line_tracking import log_line_comparison
-from nba_model.model.odds import odds_to_prob
-
 
 # === CONFIG ===
 PLAYER_ID = 2544
@@ -59,7 +55,7 @@ def main():
 
 from nba_model.model.correlation_calibration import calibrate_correlations, covariance_matrix
 from nba_model.model.parlay_simulation import simulate_multi_leg_sgp
-from nba_model.model.parlay_ev import calculate_parlay_ev, filter_profitable_parlays
+from nba_model.model.parlay_ev import calculate_parlay_ev
 from nba_model.model.odds_ingestion import fetch_odds
 
 # Example workflow

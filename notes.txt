@@ -35,3 +35,615 @@ Getting book odds:
 The Odds API - Legitimate, paid API (~$15/month) that aggregates lines from DraftKings, FanDuel, etc.
 Web scraping PrizePicks/Underdog - Use Selenium/Playwright since they're JavaScript-heavy
  - Consider rotating proxies to avoid IP bans
+
+# NBA Player Performance Forecaster - Development Log
+
+================================================================================
+COMPLETED WORK
+================================================================================
+
+## Phase 1: Project Setup & Structure
+------------------------------------------------------------
+### Repository Setup
+- Created GitHub repo: player-performance-forecaster
+- Fixed .gitignore to exclude IDE files (.idea/), Python cache, and data files
+- Cleaned commit history to remove .idea folder
+- Established professional project structure
+
+### Project Structure Created
+player-performance-forecaster/
+├── nba_model/                      # Main package
+│   ├── data/                       # Data handling
+│   │   ├── database/               # SQLite database management
+│   │   │   ├── __init__.py
+│   │   │   ├── db_manager.py      # Database operations class
+│   │   │   └── schema.sql         # Database schema (tables, indexes)
+│   │   ├── raw/                    # JSON cache for API responses
+│   │   ├── data_loader.py         # NBA API integration with caching
+│   │   ├── database_utils.py      # Old PostgreSQL code (kept for reference)
+│   │   └── nba_data_fetcher.py    # (If exists)
+│   ├── model/                      # Core prediction logic
+│   │   ├── data_loader.py         # (Original, may be duplicate)
+│   │   ├── feature_engineering.py # Rolling stats calculation
+│   │   ├── defense_adjustment.py  # Opponent defense adjustments
+│   │   ├── minutes_projection.py  # Playing time estimation
+│   │   ├── probability.py         # Closed-form probability calculations
+│   │   ├── simulation.py          # Monte Carlo simulation
+│   │   ├── correlation_calibration.py  # Multi-stat correlations
+│   │   ├── parlay_simulation.py   # Same-game parlay modeling
+│   │   ├── odds.py                # Odds conversion utilities
+│   │   ├── odds_ingestion.py      # Sportsbook data fetching
+│   │   ├── parlay_ev.py           # Parlay EV calculator
+│   │   └── line_tracking.py       # Line movement tracking
+│   ├── evaluation/                 # Model validation
+│   │   ├── __init__.py
+│   │   └── backtest.py            # Historical performance evaluation
+│   ├── visualization/              # Plotting and charts
+│   │   └── distribution_plot.py   # Probability distribution plots
+│   ├── notebooks/                  # Exploratory analysis
+│   ├── tests/                      # Test scripts
+│   │   ├── check_data.py          # Verify available data
+│   │   └── test_backtest.py       # Run backtesting
+│   └── run_model.py               # Main execution script
+├── setup.py                        # Package installation config
+├── requirements.txt                # Python dependencies
+├── .gitignore                      # Git exclusions
+└── README.md                       # Project documentation
+
+## Phase 2: Local Database Implementation
+------------------------------------------------------------
+### SQLite Database Setup
+- **Why SQLite?** Local-first, zero configuration, single-file storage
+- **Location:** data/database/nba_data.db
+- **Advantage:** No cloud dependency, fast queries, easy backup
+
+### Database Schema (schema.sql)
+Created 5 tables:
+
+1. **players**
+   - Stores player metadata (ID, name, team, position)
+   - Primary key: player_id
+
+2. **game_logs**
+   - Historical game-by-game stats
+   - Columns: points, assists, rebounds, minutes, FG%, etc.
+   - Indexed on (player_id, game_date) for fast queries
+   - Supports full stat tracking (shooting splits, +/-, turnovers)
+
+3. **team_defense**
+   - Opponent defensive ratings by season
+   - Used for defensive adjustments in predictions
+   - Fields: def_rating, opp_ppg, pace
+
+4. **betting_lines**
+   - Historical sportsbook lines (for reverse engineering)
+   - Tracks: book name, stat type, line value, odds
+   - Enables line movement analysis
+
+5. **predictions**
+   - Stores model predictions with actual outcomes
+   - Used for backtesting and model evaluation
+   - Links predictions to actual game results via foreign key
+
+### DatabaseManager Class (db_manager.py)
+**Key Features:**
+- Connection management with context managers (__enter__/__exit__)
+- CRUD operations for all tables
+- Bulk insert with duplicate handling
+- Date-range queries for backtesting
+- Error handling with rollback on failures
+- Logging for debugging
+
+**Methods:**
+- insert_player() - Add/update player records
+- insert_game_logs() - Bulk insert with deduplication
+- get_player_games() - Fetch recent N games
+- get_games_by_date_range() - Historical data for backtesting
+- insert_prediction() - Save model predictions
+- update_prediction_result() - Update with actual outcomes
+- get_backtest_data() - Join predictions with actuals
+- close() - Clean connection shutdown
+
+### Data Loader with Multi-Tier Caching (data_loader.py)
+**Caching Strategy (3 levels):**
+1. **Database** - Check SQLite first (fastest)
+2. **File cache** - JSON files in data/raw/ (fallback)
+3. **NBA API** - Fetch fresh data (slowest, rate-limited)
+
+**Key Features:**
+- Rate limiting (0.6s between API calls) to respect NBA API limits
+- Column standardization (API → database format)
+- Minutes conversion (MM:SS → decimal)
+- Home/away detection from matchup string
+- Error handling for API failures
+- Automatic cache invalidation option (force_refresh)
+
+**DataLoader Methods:**
+- get_player_id() - Name → NBA API player ID lookup
+- load_player_data() - Main entry point with caching logic
+- _clean_game_logs() - Standardize API response format
+- _convert_minutes() - Parse time strings to floats
+
+## Phase 3: Backtesting Framework
+------------------------------------------------------------
+### Backtester Class (evaluation/backtest.py)
+**Purpose:** Validate model on historical data to calculate real performance metrics
+
+**How It Works:**
+1. Load all historical games for a player
+2. For each game in test period:
+   - Use ONLY data before that game (no look-ahead bias)
+   - Generate prediction using rolling window
+   - Compare prediction to actual result
+   - Calculate profit/loss at standard -110 odds
+3. Aggregate results into performance metrics
+
+**Betting Strategy:**
+- Bet "over" if model prob > 55%
+- Bet "under" if model prob < 45%
+- No bet if 45% ≤ prob ≤ 55% (insufficient edge)
+- Standard bet size: $110 to win $100
+
+**Key Methods:**
+- run_backtest() - Main execution loop
+- _make_prediction() - Generate single game forecast
+- _evaluate_outcome() - Compare prediction vs actual
+- _calculate_metrics() - Aggregate performance stats
+- print_summary() - Formatted results display
+- get_results_df() - Export to pandas for analysis
+
+**Metrics Calculated:**
+- **Accuracy:** % of correct predictions
+- **Win Rate:** Wins / Total bets
+- **ROI:** (Total profit / Total risked) × 100
+- **Total Profit/Loss:** Net dollar amount
+- **Sharpe Ratio:** Risk-adjusted returns
+- **Brier Score:** Probability calibration (0 = perfect)
+- **Sample Size:** Number of games/bets
+
+## Phase 4: Development Environment Setup
+------------------------------------------------------------
+### Python Package Installation
+- Created setup.py for proper package installation
+- Installed package in editable mode: `pip install -e .`
+- **Benefit:** Imports work from anywhere in the project
+
+### IDE Configuration (PyCharm/VSCode)
+- Fixed "unresolved reference" errors
+- Added extraPaths to Python analysis
+- Configured SQLite database connection (optional)
+- Set nba_model as source root
+
+### Import Path Resolution
+- **Problem:** Relative imports failing due to package structure
+- **Solution 1:** Run scripts as modules: `python -m nba_model.tests.check_data`
+- **Solution 2:** Install package with `pip install -e .`
+- **Result:** All imports now work correctly
+
+### Dependencies (requirements.txt)
+Core libraries:
+- pandas - Data manipulation
+- numpy - Numerical operations
+- scipy - Statistical distributions
+- nba_api - NBA stats fetching
+- matplotlib, seaborn - Visualization
+- requests - HTTP for odds APIs
+- python-dotenv - Environment variables
+
+## Phase 5: Testing & Validation
+------------------------------------------------------------
+### Test Scripts Created
+1. **check_data.py**
+   - Verifies available game data
+   - Shows date ranges in database
+   - Suggests valid backtest periods
+   - Prevents future date errors
+
+2. **test_backtest.py**
+   - Runs full backtest on single player
+   - Exports results to CSV
+   - Displays formatted metrics
+   - Saves predictions to database
+
+### Bug Fixes Applied
+- Fixed .idea folder in version control
+- Resolved naming conflict (database.py vs database/ package)
+- Fixed import paths (relative vs absolute)
+- Added SQL query formatting (removed unnecessary backslashes)
+- Handled empty metrics dict in print_summary()
+- Added date validation (prevent future dates)
+- Fixed column mapping for missing API fields
+- Added error handling for database inserts
+
+================================================================================
+WHAT STILL NEEDS TO BE DONE
+================================================================================
+
+## Immediate Priorities (Next 1-2 Weeks)
+------------------------------------------------------------
+### 1. Complete Model Integration
+[ ] Integrate defense_adjustment.py into backtest predictions
+    - Currently not applied in _make_prediction()
+    - Need opponent defensive rating lookup
+    - Apply adjustment factor to expected value
+
+[ ] Integrate minutes_projection.py
+    - Adjust for blowout games using Vegas spread
+    - Factor in back-to-back penalties
+    - Reduce expected stats proportionally
+
+[ ] Add home/away adjustments
+    - Calculate home court advantage by player
+    - Separate rolling stats for home vs away
+    - Consider travel/rest days
+
+[ ] Test different rolling window sizes
+    - Currently fixed at 10 games
+    - Try: 5, 7, 10, 15, 20 game windows
+    - Find optimal window per stat type
+
+### 2. Expand Backtesting
+[ ] Run on multiple players (top 50 NBA scorers)
+    - Automate batch backtesting
+    - Aggregate results across all players
+    - Identify which players are most predictable
+
+[ ] Test multiple stat types
+    - Points (currently working)
+    - Assists
+    - Rebounds
+    - Points + Rebounds + Assists (PRA)
+    - 3-pointers made
+
+[ ] Longer backtest periods
+    - Currently testing 2-3 months
+    - Expand to full season (Oct 2024 - Apr 2025)
+    - Calculate monthly ROI to track consistency
+
+[ ] Statistical significance testing
+    - Confidence intervals on accuracy
+    - Compare model vs baseline (always bet over/under)
+    - Z-test for win rate vs 50%
+
+### 3. Professional Documentation
+[ ] Write comprehensive README.md
+    - Project overview with compelling metrics
+    - Installation instructions
+    - Usage examples with code snippets
+    - Methodology explanation
+    - Results section with backtest metrics
+    - Tech stack and architecture diagram
+    - Roadmap and future improvements
+    - License and disclaimer
+
+[ ] Add docstrings to all remaining files
+    - model/feature_engineering.py
+    - model/defense_adjustment.py
+    - model/minutes_projection.py
+    - model/correlation_calibration.py
+    - visualization/distribution_plot.py
+
+[ ] Create requirements.txt properly
+    - Currently might have too many dependencies
+    - Clean up to only necessary packages
+    - Pin versions for reproducibility
+
+[ ] Add example Jupyter notebook
+    - Step-by-step walkthrough
+    - Visualizations of predictions
+    - Exploratory data analysis
+    - Easy entry point for reviewers
+
+## Medium-Term Improvements (Next 1-2 Months)
+------------------------------------------------------------
+### 4. Data Pipeline Automation
+[ ] Daily data refresh script
+    - Cron job or GitHub Action
+    - Fetch previous day's games
+    - Update database automatically
+    - Log any API failures
+
+[ ] Historical data backfill
+    - Fetch all games back to 2020-21 season
+    - Enables longer backtests
+    - Improves rolling stat stability
+
+[ ] Team defensive stats scraping
+    - Currently table exists but empty
+    - Scrape from Basketball Reference or NBA.com
+    - Update weekly during season
+    - Required for defense_adjustment.py
+
+### 5. Odds Data Integration
+[ ] Sign up for The Odds API ($15/month)
+    - Track opening lines vs closing lines
+    - Identify sharp money movement
+    - Compare model to market consensus
+
+[ ] Build odds_ingestion pipeline
+    - Already have placeholder code
+    - Fetch daily player prop lines
+    - Store in betting_lines table
+    - Calculate EV vs model probabilities
+
+[ ] Reverse engineer sportsbook models
+    - Regression analysis on historical lines
+    - Identify which features books weight
+    - Find systematic biases to exploit
+    - Example: Do they overreact to last game?
+
+### 6. Visualization & Analysis
+[ ] Create distribution plots
+    - Show predicted distribution vs actual result
+    - Highlight where betting line falls
+    - Visualize edge opportunities
+
+[ ] Profit curve over time
+    - Cumulative profit/loss chart
+    - Show drawdown periods
+    - Compare to breakeven line
+
+[ ] Prediction accuracy by situation
+    - Home vs away accuracy
+    - Strong vs weak opponents
+    - High vs low confidence bets
+    - Rest days vs back-to-backs
+
+[ ] Interactive dashboard (optional)
+    - Streamlit or Plotly Dash
+    - Filter by player, date, stat type
+    - Real-time prediction updates
+    - But NOT a priority for portfolio
+
+## Advanced Features (Future/Optional)
+------------------------------------------------------------
+### 7. Model Improvements
+[ ] Alternative probability distributions
+    - Gamma distribution for positively skewed stats (rebounds)
+    - Poisson for discrete counts (3-pointers)
+    - Compare to normal distribution assumption
+
+[ ] Bayesian updating
+    - Update priors based on game flow
+    - In-game prediction adjustments
+    - Requires live data feed (expensive)
+
+[ ] Machine learning models
+    - Compare statistical approach vs ML
+    - XGBoost/Random Forest for feature importance
+    - Neural networks for non-linear patterns
+    - Probably overkill but interesting experiment
+
+[ ] Injury impact modeling
+    - Scrape injury reports
+    - Quantify usage rate changes
+    - Predict stat changes when stars sit
+
+### 8. Production Considerations (If Deploying)
+[ ] API endpoint development
+    - Flask/FastAPI REST API
+    - POST /predict endpoint
+    - Authentication/rate limiting
+    - BUT you said you don't want to deploy, so skip
+
+[ ] Unit tests
+    - pytest for core functions
+    - Test data_loader edge cases
+    - Mock NBA API responses
+    - Validate probability calculations
+
+[ ] CI/CD pipeline
+    - GitHub Actions for automated testing
+    - Lint code with Black/Flake8
+    - Only if making this production-grade
+
+## Research & Analysis Tasks
+------------------------------------------------------------
+### 9. Market Research
+[ ] Compare model to existing tools
+    - Props.Cash, ETR, BettingPros
+    - What features do they have?
+    - How is your approach different?
+    - Competitive analysis for interviews
+
+[ ] Study sportsbook pricing
+    - Read academic papers on betting markets
+    - Understand how books set lines
+    - Identify known biases (favorite-longshot bias)
+
+[ ] Analyze betting volume by book
+    - Which books have sharpest lines?
+    - Which have softest lines (higher limits)?
+    - PrizePicks vs FanDuel vs DraftKings
+
+### 10. Portfolio Presentation
+[ ] Write blog post explaining methodology
+    - Medium or Dev.to article
+    - "Building a Statistical Model for NBA Props"
+    - Code snippets with explanations
+    - Shows communication skills
+
+[ ] Create project demo video (optional)
+    - 2-3 minute walkthrough
+    - Show dashboard if built
+    - Explain key results
+    - Post on LinkedIn
+
+[ ] Prepare interview talking points
+    - "Tell me about a project you built"
+    - Technical deep-dive questions
+    - Challenges faced and solutions
+    - What you'd do differently
+
+## Cleanup & Maintenance
+------------------------------------------------------------
+### 11. Code Quality
+[ ] Remove duplicate code
+    - Looks like data_loader.py exists in both data/ and model/
+    - Consolidate to single location
+    - Update all imports
+
+[ ] Standardize naming conventions
+    - Consistent function names (snake_case)
+    - Clear variable names
+    - Remove any commented-out code
+
+[ ] Add logging throughout
+    - Replace print() with logger.info()
+    - Log levels: DEBUG, INFO, WARNING, ERROR
+    - Write logs to file for debugging
+
+[ ] Error handling improvements
+    - Try-except blocks in critical sections
+    - Graceful degradation (use cache if API fails)
+    - User-friendly error messages
+
+### 12. Database Optimization
+[ ] Add missing indexes
+    - Index on betting_lines(game_date, stat_type)
+    - Index on predictions(player_id, stat_type)
+    - Speeds up common queries
+
+[ ] Database vacuum/optimize
+    - SQLite VACUUM to reclaim space
+    - ANALYZE to update statistics
+    - Periodic maintenance script
+
+[ ] Backup strategy
+    - Automated daily backups
+    - Store in separate directory
+    - Or just commit .db file to Git (if small)
+
+================================================================================
+CAREER-FOCUSED PRIORITIES
+================================================================================
+
+## For Resume/LinkedIn
+------------------------------------------------------------
+**Once backtest results are solid, update resume with:**
+
+"Player Performance Forecaster | Python, SQLite, Statistical Modeling
+- Developed probabilistic forecasting system for NBA player statistics using
+  time-series analysis and Monte Carlo simulation
+- Achieved X% prediction accuracy on 500+ historical games with Y% ROI in
+  simulated betting scenarios
+- Implemented multi-tier caching system (SQLite + JSON) reducing API calls by
+  90% and query time to <2 seconds
+- Built automated backtesting framework with comprehensive performance metrics
+  (Sharpe ratio, Brier score, ROI)"
+
+## For Interviews
+------------------------------------------------------------
+**Prepare to discuss:**
+
+1. **Technical Decisions**
+   - Why SQLite over PostgreSQL? (Local-first, simplicity, no config)
+   - Why rolling windows vs season averages? (Captures recent form, adapts to changes)
+   - Why normal distribution? (Central limit theorem, reasonable for counting stats)
+
+2. **Challenges Overcome**
+   - Handling non-stationary data (player form changes)
+   - Avoiding look-ahead bias in backtesting
+   - Rate limiting NBA API (0.6s delays, caching strategy)
+   - Database schema design for complex queries
+
+3. **What You'd Improve**
+   - Add injury tracking and impact modeling
+   - Test alternative probability distributions
+   - Implement Bayesian updating for in-game adjustments
+   - Scale to all 450+ NBA players
+
+4. **Business Understanding**
+   - 52.4% accuracy needed to break even at -110 odds
+   - Sportsbooks use vig to guarantee profit
+   - Sharp vs recreational money
+   - Market efficiency in major vs niche sports
+
+## Target Companies
+------------------------------------------------------------
+**This project is relevant for:**
+
+1. **Sports Analytics**
+   - NBA/NFL team analytics departments
+   - Sports betting companies (DraftKings, FanDuel)
+   - Sports data providers (Sportradar, Stats Perform)
+
+2. **Quantitative Finance**
+   - Prop shops (Jane Street, Citadel, Two Sigma)
+   - Shows statistical arbitrage thinking
+   - Risk management and portfolio optimization
+
+3. **Data Science (General)**
+   - Any company needing time-series forecasting
+   - Real-world ML pipeline demonstration
+   - Production data engineering skills
+
+4. **Tech Companies**
+   - Shows full-stack thinking (data → model → evaluation)
+   - API integration and rate limiting
+   - Database design and optimization
+
+================================================================================
+CURRENT STATUS SUMMARY
+================================================================================
+
+WORKING:
+- SQLite database with proper schema
+- Data loading with 3-tier caching
+- Backtesting framework with metrics
+- Professional project structure
+- Package installation and imports
+
+NEEDS WORK:
+- Model adjustments not integrated (defense, minutes)
+- Only tested on single player (LeBron)
+- Only tested on points (not assists/rebounds)
+- No odds data collection yet
+- Documentation incomplete
+
+NEXT STEPS (Priority Order):
+1. Run backtests on 10+ players to get robust metrics
+2. Integrate defense/minutes adjustments
+3. Write comprehensive README with results
+4. Add docstrings to remaining files
+5. Create example Jupyter notebook
+
+================================================================================
+TECHNICAL DEBT / KNOWN ISSUES
+================================================================================
+
+- data_loader.py might exist in two places (data/ and model/)
+- team_defense table is empty (need to populate)
+- betting_lines table is empty (need odds API)
+- Some model/ files not yet integrated into backtest
+- No unit tests yet
+- Logging uses print() in some places instead of logger
+- Database path is hardcoded (should be configurable)
+- No handling for player trades (team changes mid-season)
+
+================================================================================
+RESOURCES & REFERENCES
+================================================================================
+
+**APIs Used:**
+- nba_api: https://github.com/swar/nba_api
+- The Odds API: https://the-odds-api.com/ (not yet implemented)
+
+**Relevant Documentation:**
+- SQLite: https://docs.python.org/3/library/sqlite3.html
+- pandas: https://pandas.pydata.org/docs/
+- scipy.stats: https://docs.scipy.org/doc/scipy/reference/stats.html
+
+**Academic References:**
+- "Forecasting Sports Outcomes" papers
+- Market efficiency in sports betting
+- Time-series analysis techniques
+
+**Industry Standards:**
+- -110 odds = 52.4% breakeven rate
+- Kelly Criterion for bet sizing
+- Sharpe ratio for risk-adjusted returns
+
+================================================================================
+END OF NOTES
+================================================================================
