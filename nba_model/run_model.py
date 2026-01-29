@@ -16,9 +16,12 @@ SEASON = "2023-24"
 POINTS_LINE = 27.5
 ROLLING_WINDOW = 10
 
+# odds free to change
 AMERICAN_ODDS = -110
+# defensive rating free to change
 OPP_DEF_RATING = 112.5
-VEGAS_SPREAD = 11.5   # example: Lakers -11.5
+# spread line free to change
+VEGAS_SPREAD = 11.5
 
 
 def main():
@@ -61,25 +64,25 @@ from nba_model.model.odds_ingestion import fetch_odds
 
 # Example workflow
 def run_parlay_simulation():
-    # 1️⃣ Fetch odds (placeholder)
+    # Fetch odds (placeholder)
     odds_data = fetch_odds("YOUR_API_KEY_HERE")
 
-    # 2️⃣ Prepare stats for calibration
+    # Prepare stats for calibration
     stats_cols = ["PTS", "AST", "REB"]
     stds = {"PTS": 8.2, "AST": 4.5, "REB": 5.0}  # example
     df_player = load_player_logs(PLAYER_ID)
     corr_matrix = calibrate_correlations(df_player, stats_cols)
     cov_matrix = covariance_matrix(corr_matrix, stds)
 
-    # 3️⃣ Set lines for each leg
+    # Set lines for each leg
     lines = [27.5, 7.5, 8.5]  # points, assists, rebounds
 
-    # 4️⃣ Multi-leg probability
+    # Multi-leg probability
     means = [27.0, 7.2, 8.0]
     prob = simulate_multi_leg_sgp(means, cov_matrix, lines)
     print(f"Multi-leg SGP probability: {prob:.2%}")
 
-    # 5️⃣ Example parlay EV calculation
+    # Example parlay EV calculation
     example_odds = -110
     ev = calculate_parlay_ev(prob, example_odds)
     print(f"Expected value: {ev:.3f}")
