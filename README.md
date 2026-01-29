@@ -160,5 +160,5 @@ features = {
     'injury_status': starter_minutes_available,
 }
 
-# Train regression: line = f(features)
-# Compare model's coefficients to identify their weights
+Train regression: line = f(features)
+Compare model's coefficients to identify their weights
