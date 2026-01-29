@@ -1,4 +1,5 @@
-# ProbabilityAlgo
+README:
+
 NBA Player Props Betting Model
 
 This is a probabilistic sports betting analysis system that models NBA player performance 
@@ -144,3 +145,20 @@ Enables +EV betting strategies over large sample sizes
 
 The edge comes from better modeling (accounting for defense, minutes, recency) than 
 recreational bettors, and faster than sportsbooks can adjust lines.
+
+
+Variables needed:
+Collect data: [opening_line, player_stat, result]
+Key variables sportsbooks likely manipulate:
+features = {
+    'rolling_avg_10': player.recent_ppg,
+    'usage_rate': player.touches / team.total_touches,
+    'opponent_def_rating': opp.def_rating,
+    'home_away': 1 if home else 0,
+    'days_rest': days_since_last_game,
+    'vegas_total': game_total_o_u,  # Game pace proxy
+    'injury_status': starter_minutes_available,
+}
+
+# Train regression: line = f(features)
+# Compare model's coefficients to identify their weights

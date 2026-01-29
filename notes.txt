@@ -8,7 +8,7 @@ Player-level
 
 Game-level
 - Pace
-- Vegas implied total (ironically useful)
+- Vegas implied total
 - Blowout risk
 - Back-to-back games
 - Injury-adjusted lineups
@@ -19,3 +19,19 @@ Design a minimal working model
 Pick a sport/stat and outline exact features
 Talk about correlation modeling for parlays
 Sketch a full system architecture (data → model → dashboard)
+
+
+Dats Source:
+NBA Stats API to get player data (updated after games tho)
+from nba_api.stats.endpoints import playergamelogs
+# Set up daily cron job to pull previous day's games
+
+Storage:
+PostgreSQL for relational game logs (easy querying by player/date)
+Supabase (free tier, PostgreSQL-based, has Python SDK)
+Schema: games, player_stats, team_stats, betting_lines
+
+Getting book odds:
+The Odds API - Legitimate, paid API (~$15/month) that aggregates lines from DraftKings, FanDuel, etc.
+Web scraping PrizePicks/Underdog - Use Selenium/Playwright since they're JavaScript-heavy
+ - Consider rotating proxies to avoid IP bans
