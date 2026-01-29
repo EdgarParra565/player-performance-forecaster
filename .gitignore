@@ -1,4 +1,44 @@
-notes.txt
-
-.venv.idea/
+# IDE
 .idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Environment
+.env
+.env.local
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Data (if you have large files)
+data/raw/
+*.csv
+*.db
+*.sqlite
+
+# Logs
+*.log
+logs/
