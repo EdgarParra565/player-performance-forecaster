@@ -8,14 +8,14 @@ This benchmark uses deterministic synthetic player logs to validate the end-to-e
 
 ## Window Averages
  window   avg_roi  avg_win_rate  total_bets  total_games
-     10 14.267677      0.598545         252          315
-      7 10.676345      0.579733         256          315
+     10  1.099578      0.529569         233          315
+      7 -0.260349      0.522446         255          315
 
 ## Per-Player Results
-  player_name  window  line_value  total_games  bets_made  wins  losses  win_rate       roi  total_profit  brier_score
- LeBron James       7        25.5          105         95    65      30  0.684211 30.622010        3200.0     0.220628
- Nikola Jokic       7        26.5          105         83    45      38  0.542169  3.504929         320.0     0.278212
-Stephen Curry       7        27.5          105         78    40      38  0.512821 -2.097902        -180.0     0.278379
- LeBron James      10        25.5          105         96    68      28  0.708333 35.227273        3720.0     0.214593
- Nikola Jokic      10        26.5          105         84    47      37  0.559524  6.818182         630.0     0.263367
-Stephen Curry      10        27.5          105         72    38      34  0.527778  0.757576          60.0     0.266143
+  player_name  window  line_value  total_games  bets_made  wins  losses  win_rate        roi  total_profit  brier_score
+ LeBron James       7        25.5          105         78    50      28  0.641026  22.377622        1920.0     0.236606
+ Nikola Jokic       7        26.5          105         81    32      49  0.395062 -24.579125       -2190.0     0.296868
+Stephen Curry       7        27.5          105         96    51      45  0.531250   1.420455         150.0     0.293746
+ LeBron James      10        25.5          105         74    51      23  0.689189  31.572482        2570.0     0.228668
+ Nikola Jokic      10        26.5          105         70    26      44  0.371429 -29.090909       -2240.0     0.285626
+Stephen Curry      10        27.5          105         89    47      42  0.528090   0.817160          80.0     0.281897
