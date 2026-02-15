@@ -1,7 +1,10 @@
 import pandas as pd
 import numpy as np
+from typing import Optional
 from nba_model.data.data_loader import DataLoader
 from nba_model.model.feature_engineering import add_rolling_stats
+from nba_model.model.defense_adjustment import adjust_mu_for_defense
+from nba_model.model.minutes_projection import project_minutes
 from nba_model.model.probability import prob_over
 from nba_model.data.database.db_manager import DatabaseManager
 import logging
@@ -17,7 +20,17 @@ class Backtester:
     Simulates making predictions on past games and compares to actual outcomes.
     """
 
-    def __init__(self, start_date, end_date, line_value=None, stat_type='points'):
+    def __init__(
+        self,
+        start_date,
+        end_date,
+        line_value=None,
+        stat_type='points',
+        defense_sensitivity=0.4,
+        back_to_back_penalty=0.06,
+        home_away_blend=0.25,
+        min_home_away_games=5
+    ):
         """
         Args:
             start_date: Start of backtest period (YYYY-MM-DD)
@@ -29,6 +42,10 @@ class Backtester:
         self.end_date = pd.to_datetime(end_date)
         self.line_value = line_value
         self.stat_type = stat_type.lower()
+        self.defense_sensitivity = defense_sensitivity
+        self.back_to_back_penalty = back_to_back_penalty
+        self.home_away_blend = home_away_blend
+        self.min_home_away_games = min_home_away_games
         self.results = []
         self.loader = DataLoader()
         self.db = DatabaseManager()
@@ -63,6 +80,157 @@ class Backtester:
         if existing:
             df = df.rename(columns=existing)
         return df
+
+    @staticmethod
+    def _safe_float(value):
+        """Convert candidate numeric values safely; return None when unavailable."""
+        try:
+            if value is None or (isinstance(value, float) and np.isnan(value)):
+                return None
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _season_from_date(game_date) -> Optional[str]:
+        """Infer NBA season string from game date (e.g., 2024-25)."""
+        if game_date is None:
+            return None
+        ts = pd.to_datetime(game_date, errors='coerce')
+        if pd.isna(ts):
+            return None
+        start_year = ts.year if ts.month >= 10 else ts.year - 1
+        return f"{start_year}-{str(start_year + 1)[-2:]}"
+
+    @staticmethod
+    def _extract_opponent_team(matchup: Optional[str]) -> Optional[str]:
+        """Extract opponent abbreviation from matchup text."""
+        if not matchup:
+            return None
+        text = str(matchup)
+        if "vs." in text:
+            return text.split("vs.")[-1].strip().split()[0]
+        if "@" in text:
+            return text.split("@")[-1].strip().split()[0]
+        tokens = text.strip().split()
+        return tokens[-1] if tokens else None
+
+    def _get_opponent_def_rating(self, upcoming_game) -> Optional[float]:
+        """Lookup opponent defensive rating from team_defense table."""
+        opponent = self._extract_opponent_team(upcoming_game.get('matchup'))
+        if not opponent:
+            return None
+
+        season = upcoming_game.get('season') or self._season_from_date(upcoming_game.get('game_date'))
+        getter = getattr(self.db, 'get_team_defense', None)
+        if not callable(getter):
+            return None
+
+        try:
+            def_rating = getter(opponent, season=season)
+        except TypeError:
+            # Support fallback mocks or older method signatures.
+            def_rating = getter(opponent)
+        return self._safe_float(def_rating)
+
+    def _get_game_spread(self, upcoming_game) -> float:
+        """Use available spread columns when present; default to 0 (no blowout signal)."""
+        for key in ('vegas_spread', 'spread', 'line_spread'):
+            value = self._safe_float(upcoming_game.get(key))
+            if value is not None:
+                return value
+        return 0.0
+
+    @staticmethod
+    def _is_back_to_back(historical_data: pd.DataFrame, upcoming_game) -> bool:
+        """Flag back-to-back spots from date spacing."""
+        if 'game_date' not in historical_data.columns:
+            return False
+        upcoming_date = pd.to_datetime(upcoming_game.get('game_date'), errors='coerce')
+        prev_date = pd.to_datetime(historical_data['game_date'], errors='coerce').max()
+        if pd.isna(upcoming_date) or pd.isna(prev_date):
+            return False
+        return (upcoming_date.normalize() - prev_date.normalize()).days <= 1
+
+    def _apply_home_away_adjustment(
+        self,
+        expected_value: float,
+        historical_data: pd.DataFrame,
+        upcoming_game,
+        window: int
+    ) -> float:
+        """Blend venue-specific average into expected value when enough split sample exists."""
+        if 'home_away' not in historical_data.columns:
+            return expected_value
+
+        venue = str(upcoming_game.get('home_away', '')).strip().lower()
+        if venue not in {'home', 'away'}:
+            return expected_value
+
+        if self.stat_type not in historical_data.columns:
+            return expected_value
+
+        venue_games = historical_data[
+            historical_data['home_away'].astype(str).str.lower() == venue
+        ].tail(window)
+
+        min_games = max(3, self.min_home_away_games)
+        if len(venue_games) < min_games:
+            return expected_value
+
+        venue_mean = self._safe_float(venue_games[self.stat_type].mean())
+        if venue_mean is None:
+            return expected_value
+
+        blend = min(max(self.home_away_blend, 0.0), 1.0)
+        return ((1 - blend) * expected_value) + (blend * venue_mean)
+
+    def _apply_points_adjustments(
+        self,
+        expected_value: float,
+        historical_data: pd.DataFrame,
+        upcoming_game,
+        latest_stats,
+        window: int
+    ) -> float:
+        """
+        Apply minutes and defense adjustments for points projections.
+
+        Falls back gracefully when required context columns are missing.
+        """
+        if self.stat_type != 'points':
+            return expected_value
+
+        recent = historical_data.tail(window)
+        mean_minutes = self._safe_float(
+            latest_stats.get('rolling_mean_minutes') if latest_stats is not None else None
+        )
+        ppm = self._safe_float(
+            latest_stats.get('rolling_mean_points_per_minute') if latest_stats is not None else None
+        )
+
+        if mean_minutes is None and 'minutes' in recent.columns:
+            mean_minutes = self._safe_float(recent['minutes'].mean())
+        if ppm is None and {'points', 'minutes'}.issubset(recent.columns):
+            ppm_series = recent['points'] / recent['minutes'].replace(0, np.nan)
+            ppm = self._safe_float(ppm_series.mean())
+
+        if mean_minutes is not None and ppm is not None and mean_minutes > 0 and ppm > 0:
+            spread = self._get_game_spread(upcoming_game)
+            projected_minutes = project_minutes(mean_minutes, abs(spread))
+            if self._is_back_to_back(historical_data, upcoming_game):
+                projected_minutes *= (1 - self.back_to_back_penalty)
+            expected_value = ppm * projected_minutes
+
+        def_rating = self._get_opponent_def_rating(upcoming_game)
+        if def_rating is not None:
+            expected_value = adjust_mu_for_defense(
+                expected_value,
+                def_rating,
+                sensitivity=self.defense_sensitivity
+            )
+
+        return max(expected_value, 0.0)
 
 
     def run_backtest(self, player_name, window=10):
@@ -160,6 +328,7 @@ class Backtester:
         mean_col = f'rolling_mean_{self.stat_type}'
         std_col = f'rolling_std_{self.stat_type}'
 
+        latest_stats = None
         if stats.empty or len(stats) < window or mean_col not in stats.columns or std_col not in stats.columns:
             # Fallback to simple average
             mean_stat = historical_data[self.stat_type].mean()
@@ -174,9 +343,20 @@ class Backtester:
                 mean_stat = latest_stats[mean_col]
                 std_stat = latest_stats[std_col]
 
-        # Apply adjustments (defense, minutes, etc.)
-        # Note: You'll need to implement these if you want full accuracy
         expected_value = float(mean_stat)
+        expected_value = self._apply_points_adjustments(
+            expected_value=expected_value,
+            historical_data=historical_data,
+            upcoming_game=upcoming_game,
+            latest_stats=latest_stats,
+            window=window
+        )
+        expected_value = self._apply_home_away_adjustment(
+            expected_value=expected_value,
+            historical_data=historical_data,
+            upcoming_game=upcoming_game,
+            window=window
+        )
         std_stat = float(std_stat) if pd.notna(std_stat) else 0.0
 
         # Calculate probability of exceeding the line

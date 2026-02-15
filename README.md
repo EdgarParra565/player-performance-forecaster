@@ -38,6 +38,19 @@ python3 -m nba_model.run_model --mode parlay --player "LeBron James" --n-games 1
 python3 -m nba_model.run_model --mode both --player "LeBron James" --n-games 100
 ```
 
+### 1b) Simple Desktop UI
+
+Run from a lightweight local UI (Single Prop + Parlay with PrizePicks/Underdog inputs):
+
+```bash
+python3 -m nba_model.simple_ui
+```
+
+In the Parlay tab you can input:
+- sportsbook (`prizepicks`, `underdog`, or `custom`)
+- leg stats and lines
+- parlay odds and odds format (`american`, `decimal`, or `multiplier`)
+
 Optional flags:
 - `--window` (rolling window)
 - `--line` (prop line)

@@ -39,6 +39,51 @@ Web scraping PrizePicks/Underdog - Use Selenium/Playwright since they're JavaScr
 # NBA Player Performance Forecaster - Development Log
 
 ================================================================================
+IMPLEMENTATION UPDATE (2026-02-15)
+================================================================================
+
+## Current Plan Progress (Implemented)
+- [x] Unified data contract in core pipeline (`points`, `assists`, `rebounds`, `minutes`)
+- [x] Fixed backtest probability call ordering and entrypoint wiring
+- [x] Refactored `run_model.py` into stable CLI modes (`single`, `parlay`, `both`)
+- [x] Added deterministic smoke tests for features/probability/backtest
+- [x] Added offline baseline benchmark runner + saved artifacts
+- [x] Integrated current-priority context modeling in backtest:
+  - Defense adjustment (opponent team defensive rating lookup when available)
+  - Minutes projection (spread-aware when spread field exists)
+  - Back-to-back penalty in projected minutes
+  - Home/away split blending when sample size is sufficient
+- [x] Added `DatabaseManager.get_team_defense()` helper for team defense lookup
+
+## Current Active Next Step
+1. Populate `team_defense` table and wire repeatable update job
+   - Without this table, defense adjustment falls back and has limited impact.
+2. Run real-data multi-player benchmark (10+ players, windows 5/7/10/15)
+   - Export results and confidence intervals by player/window.
+3. Add spread inputs to backtest rows from lines data
+   - Enables minutes projection to use actual pregame spread consistently.
+
+## Future Implementation Queue (New)
+### Near-Term (1-2 weeks)
+- [ ] Batch backtest command for top scorers with one CLI run
+- [ ] Statistical significance module (CI, z-test vs breakeven win rate)
+- [ ] Expand baseline to assists/rebounds/PRA with same evaluation template
+- [ ] Finish docstrings in remaining model and visualization modules
+
+### Mid-Term (1-2 months)
+- [ ] Daily ETL refresh for game logs + defense + betting lines
+- [ ] Odds ingestion production pass (retry, schema validation, dedupe)
+- [ ] Cross-book line comparison engine (book-vs-book and model-vs-book)
+  - Normalize props across sportsbooks, compare best available lines/prices, and benchmark each against model fair value.
+- [ ] Monthly performance diagnostics (drift, drawdown, calibration trend)
+- [ ] Better contextual features: rest days, home/away travel, injury proxy
+
+### Long-Term / Portfolio Upgrades
+- [ ] Interactive analysis dashboard (Streamlit or Plotly Dash)
+- [ ] Research notebook comparing normal vs alternative distributions
+- [ ] Public write-up with methodology + benchmark evidence
+
+================================================================================
 COMPLETED WORK
 ================================================================================
 
@@ -365,6 +410,11 @@ WHAT STILL NEEDS TO BE DONE
     - Fetch daily player prop lines
     - Store in betting_lines table
     - Calculate EV vs model probabilities
+
+[ ] Compare sportsbook lines against each other and against your model
+    - Normalize equivalent props across books
+    - Identify best available prices/lines by market
+    - Track where your model disagrees most with market consensus
 
 [ ] Reverse engineer sportsbook models
     - Regression analysis on historical lines

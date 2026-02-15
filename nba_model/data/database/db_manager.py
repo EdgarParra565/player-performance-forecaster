@@ -49,17 +49,36 @@ class DatabaseManager:
             game_logs_df: DataFrame with columns matching game_logs table
         """
         try:
+            if game_logs_df is None or game_logs_df.empty:
+                return
+
             # Remove duplicates before inserting
             game_logs_df = game_logs_df.drop_duplicates(subset=['player_id', 'game_id'])
 
-            game_logs_df.to_sql(
-                'game_logs',
-                self.conn,
-                if_exists='append',
-                index=False
-            )
+            # Keep only actual table columns and rely on INSERT OR IGNORE for
+            # existing rows already present in SQLite.
+            table_columns = {
+                row[1]
+                for row in self.conn.execute("PRAGMA table_info(game_logs)").fetchall()
+            }
+            blocked_columns = {'game_log_id', 'created_at'}
+            columns = [col for col in game_logs_df.columns if col in table_columns and col not in blocked_columns]
+            if not columns:
+                logger.warning("No valid game_logs columns to insert")
+                return
+
+            payload = game_logs_df[columns].where(pd.notna(game_logs_df[columns]), None)
+            query = f"""
+                INSERT OR IGNORE INTO game_logs ({", ".join(columns)})
+                VALUES ({", ".join(["?"] * len(columns))})
+            """
+
+            before_changes = self.conn.total_changes
+            self.conn.executemany(query, payload.itertuples(index=False, name=None))
             self.conn.commit()
-            logger.info(f"✓ Inserted {len(game_logs_df)} game logs")
+            inserted = self.conn.total_changes - before_changes
+            ignored = len(payload) - inserted
+            logger.info(f"✓ Inserted {inserted} game logs ({ignored} duplicates ignored)")
         except Exception as e:
             logger.error(f"Error inserting game logs: {e}")
             self.conn.rollback()
@@ -153,6 +172,48 @@ class DatabaseManager:
             ORDER BY p.game_date DESC
         """
         return pd.read_sql_query(query, self.conn, params=(start_date, end_date))
+
+    def get_team_defense(self, team_abbrev, season=None):
+        """
+        Fetch latest defensive rating for a team.
+
+        Args:
+            team_abbrev: Team abbreviation (e.g., "LAL")
+            season: Optional season filter (e.g., "2024-25")
+
+        Returns:
+            float | None: defensive rating if available
+        """
+        if not team_abbrev:
+            return None
+
+        if season:
+            query = """
+                SELECT def_rating
+                FROM team_defense
+                WHERE team_abbrev = ?
+                  AND season = ?
+                ORDER BY last_updated DESC
+                LIMIT 1
+            """
+            params = (team_abbrev, season)
+        else:
+            query = """
+                SELECT def_rating
+                FROM team_defense
+                WHERE team_abbrev = ?
+                ORDER BY season DESC, last_updated DESC
+                LIMIT 1
+            """
+            params = (team_abbrev,)
+
+        row = self.conn.execute(query, params).fetchone()
+        if not row:
+            return None
+        try:
+            return float(row[0]) if row[0] is not None else None
+        except (TypeError, ValueError):
+            return None
 
     def close(self):
         """Close database connection."""
