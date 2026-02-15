@@ -4,7 +4,6 @@ import pandas as pd
 import time
 from pathlib import Path
 import json
-import os
 from nba_model.data.database.db_manager import DatabaseManager
 
 class DataLoader:
@@ -132,20 +131,6 @@ class DataLoader:
         return_cols = [v for v in column_mapping.values() if v in df.columns] + ['home_away']
         return df[return_cols]
 
-        df = df.rename(columns=column_mapping)
-        df['player_id'] = player_id
-
-        # Extract home/away
-        df['home_away'] = df['matchup'].apply(
-            lambda x: 'home' if 'vs.' in x else 'away'
-        )
-
-        # Convert minutes from "MM:SS" to decimal
-        if df['minutes'].dtype == 'object':
-            df['minutes'] = df['minutes'].apply(self._convert_minutes)
-
-        return df[list(column_mapping.values()) + ['home_away']]
-
     def _convert_minutes(self, time_str):
         """Convert 'MM:SS' to decimal minutes."""
         if pd.isna(time_str) or time_str == '':
@@ -153,5 +138,29 @@ class DataLoader:
         try:
             parts = str(time_str).split(':')
             return float(parts[0]) + float(parts[1]) / 60
-        except:
+        except (IndexError, TypeError, ValueError):
             return 0.0
+
+
+def load_player_logs(player, season=None, n_games=50, force_refresh=False):
+    """
+    Backward-compatible loader used by legacy scripts.
+
+    Args:
+        player: Full player name (str) or NBA player id (int).
+        season: Unused for now; retained for compatibility.
+        n_games: Number of games to return.
+        force_refresh: If True, bypass local cache.
+    """
+    del season  # Reserved for future season-selective loading.
+
+    loader = DataLoader()
+    if isinstance(player, int):
+        player_info = players.find_player_by_id(player)
+        if not player_info:
+            raise ValueError(f"Player id '{player}' not found")
+        player_name = player_info["full_name"]
+    else:
+        player_name = player
+
+    return loader.load_player_data(player_name=player_name, n_games=n_games, force_refresh=force_refresh)

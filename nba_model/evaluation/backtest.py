@@ -28,7 +28,7 @@ class Backtester:
         self.start_date = pd.to_datetime(start_date)
         self.end_date = pd.to_datetime(end_date)
         self.line_value = line_value
-        self.stat_type = stat_type
+        self.stat_type = stat_type.lower()
         self.results = []
         self.loader = DataLoader()
         self.db = DatabaseManager()
@@ -45,6 +45,25 @@ class Backtester:
         if self.start_date >= self.end_date:
             raise ValueError(f"Start date must be before end date!")
 
+        valid_stats = {'points', 'assists', 'rebounds'}
+        if self.stat_type not in valid_stats:
+            raise ValueError(f"stat_type must be one of {sorted(valid_stats)}")
+
+    @staticmethod
+    def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+        """Normalize historical input data to a stable lowercase schema."""
+        rename_map = {
+            'GAME_DATE': 'game_date',
+            'PTS': 'points',
+            'AST': 'assists',
+            'REB': 'rebounds',
+            'MIN': 'minutes',
+        }
+        existing = {src: dst for src, dst in rename_map.items() if src in df.columns and dst not in df.columns}
+        if existing:
+            df = df.rename(columns=existing)
+        return df
+
 
     def run_backtest(self, player_name, window=10):
         """
@@ -58,11 +77,15 @@ class Backtester:
             dict: Performance metrics
         """
         logger.info(f"Running backtest for {player_name} from {self.start_date.date()} to {self.end_date.date()}")
+        self.results = []
 
         player_id = self.loader.get_player_id(player_name)
 
         # Load ALL historical data (need enough for rolling window)
         all_games = self.loader.load_player_data(player_name, n_games=200)
+        all_games = self._normalize_columns(all_games)
+        if self.stat_type not in all_games.columns:
+            raise KeyError(f"Missing stat column '{self.stat_type}' in loaded game logs")
         all_games['game_date'] = pd.to_datetime(all_games['game_date'])
         all_games = all_games.sort_values('game_date')
 
@@ -130,25 +153,35 @@ class Backtester:
         Returns:
             dict: prediction with expected_value, std_dev, prob_over
         """
+        historical_data = self._normalize_columns(historical_data)
+
         # Calculate rolling stats
         stats = add_rolling_stats(historical_data.copy(), window=window)
+        mean_col = f'rolling_mean_{self.stat_type}'
+        std_col = f'rolling_std_{self.stat_type}'
 
-        if stats.empty or len(stats) < 1:
+        if stats.empty or len(stats) < window or mean_col not in stats.columns or std_col not in stats.columns:
             # Fallback to simple average
             mean_stat = historical_data[self.stat_type].mean()
             std_stat = historical_data[self.stat_type].std()
         else:
-            latest_stats = stats.iloc[-1]
-            mean_stat = latest_stats[f'rolling_mean_{self.stat_type}']
-            std_stat = latest_stats[f'rolling_std_{self.stat_type}']
+            latest_valid = stats.dropna(subset=[mean_col, std_col])
+            if latest_valid.empty:
+                mean_stat = historical_data[self.stat_type].mean()
+                std_stat = historical_data[self.stat_type].std()
+            else:
+                latest_stats = latest_valid.iloc[-1]
+                mean_stat = latest_stats[mean_col]
+                std_stat = latest_stats[std_col]
 
         # Apply adjustments (defense, minutes, etc.)
         # Note: You'll need to implement these if you want full accuracy
-        expected_value = mean_stat
+        expected_value = float(mean_stat)
+        std_stat = float(std_stat) if pd.notna(std_stat) else 0.0
 
         # Calculate probability of exceeding the line
         line = self.line_value or expected_value
-        prob_over1 = prob_over(expected_value, std_stat, line)
+        prob_over1 = prob_over(line, expected_value, std_stat)
 
         return {
             'expected_value': expected_value,
