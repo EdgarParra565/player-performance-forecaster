@@ -1,3 +1,4 @@
+# pyright: reportMissingModuleSource=false
 from setuptools import setup, find_packages
 
 setup(
@@ -12,7 +13,7 @@ setup(
         "pandas",
         "numpy",
         "scipy",
-        "nba-api",
+        "nba_api",
         "matplotlib",
         "seaborn",
         "requests",
