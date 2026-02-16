@@ -8,6 +8,7 @@ from nba_model.data.data_loader import DataLoader
 from nba_model.data.database.db_manager import DatabaseManager
 from nba_model.evaluation.backtest import Backtester
 from nba_model.evaluation.significance import win_rate_significance_summary
+from nba_model.model.simulation import SUPPORTED_DISTRIBUTIONS, normalize_distribution_name
 
 ARTIFACT_DIR = Path("nba_model/evaluation/artifacts")
 DEFAULT_PLAYERS = [
@@ -24,6 +25,12 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--players", nargs="+", default=DEFAULT_PLAYERS, help="List of player full names")
     parser.add_argument("--windows", nargs="+", type=int, default=[5, 7, 10, 15])
     parser.add_argument("--stat-types", nargs="+", default=["points", "assists", "rebounds", "pra"])
+    parser.add_argument(
+        "--distributions",
+        nargs="+",
+        default=["normal"],
+        help=f"Single-prop distribution(s). Supported: {', '.join(SUPPORTED_DISTRIBUTIONS)}",
+    )
     parser.add_argument("--start-date", default="2024-11-01")
     parser.add_argument("--end-date", default="2025-03-15")
     parser.add_argument("--line", type=float, default=None, help="Optional fixed line for all runs")
@@ -61,9 +68,16 @@ def run_batch_backtest(
     history_games: int = 120,
     confidence: float = 0.95,
     american_odds: int = -110,
+    distributions: list[str] = None,
 ):
     if history_games < 20:
         raise ValueError("history_games must be >= 20")
+    requested_distributions = distributions or ["normal"]
+    normalized_distributions: list[str] = []
+    for dist in requested_distributions:
+        canonical = normalize_distribution_name(dist)
+        if canonical not in normalized_distributions:
+            normalized_distributions.append(canonical)
 
     # Fast fail when caller requires market lines but no candidate rows exist.
     if use_market_lines and require_market_line and line is None:
@@ -122,67 +136,71 @@ def run_batch_backtest(
     rows = []
     failures = []
 
-    for stat_type in stat_types:
-        for window in windows:
-            for player_name in players:
-                try:
-                    backtester = Backtester(
-                        start_date=start_date,
-                        end_date=end_date,
-                        line_value=line,
-                        stat_type=stat_type,
-                        use_market_lines=use_market_lines,
-                        require_market_line=require_market_line,
-                        market_book=market_book,
-                        market_line_agg=market_line_agg,
+    for distribution in normalized_distributions:
+        for stat_type in stat_types:
+            for window in windows:
+                for player_name in players:
+                    try:
+                        backtester = Backtester(
+                            start_date=start_date,
+                            end_date=end_date,
+                            line_value=line,
+                            stat_type=stat_type,
+                            distribution=distribution,
+                            use_market_lines=use_market_lines,
+                            require_market_line=require_market_line,
+                            market_book=market_book,
+                            market_line_agg=market_line_agg,
+                        )
+                        backtester.loader = cached_loader
+                        metrics = backtester.run_backtest(player_name, window=window)
+                    except Exception as exc:
+                        failures.append(
+                            {
+                                "player_name": player_name,
+                                "distribution": distribution,
+                                "stat_type": stat_type,
+                                "window": window,
+                                "error": str(exc),
+                            }
+                        )
+                        continue
+
+                    if not metrics:
+                        continue
+
+                    wins = int(metrics.get("wins", 0))
+                    bets = int(metrics.get("bets_made", 0))
+                    sig = win_rate_significance_summary(
+                        wins=wins,
+                        bets=bets,
+                        confidence=confidence,
+                        american_odds=american_odds,
                     )
-                    backtester.loader = cached_loader
-                    metrics = backtester.run_backtest(player_name, window=window)
-                except Exception as exc:
-                    failures.append(
-                        {
-                            "player_name": player_name,
-                            "stat_type": stat_type,
-                            "window": window,
-                            "error": str(exc),
-                        }
-                    )
-                    continue
 
-                if not metrics:
-                    continue
-
-                wins = int(metrics.get("wins", 0))
-                bets = int(metrics.get("bets_made", 0))
-                sig = win_rate_significance_summary(
-                    wins=wins,
-                    bets=bets,
-                    confidence=confidence,
-                    american_odds=american_odds,
-                )
-
-                row = {
-                    "player_name": player_name,
-                    "stat_type": stat_type,
-                    "window": window,
-                    "line_value": line,
-                    "use_market_lines": use_market_lines,
-                    "market_book": market_book,
-                    "market_line_agg": market_line_agg,
-                    "history_games": history_games,
-                    "start_date": start_date,
-                    "end_date": end_date,
-                }
-                row.update(metrics)
-                row.update(sig)
-                rows.append(row)
+                    row = {
+                        "player_name": player_name,
+                        "distribution": distribution,
+                        "stat_type": stat_type,
+                        "window": window,
+                        "line_value": line,
+                        "use_market_lines": use_market_lines,
+                        "market_book": market_book,
+                        "market_line_agg": market_line_agg,
+                        "history_games": history_games,
+                        "start_date": start_date,
+                        "end_date": end_date,
+                    }
+                    row.update(metrics)
+                    row.update(sig)
+                    rows.append(row)
 
     results_df = pd.DataFrame(rows)
     failures_df = pd.DataFrame(failures)
     if not results_df.empty:
         results_df = results_df.sort_values(
-            ["stat_type", "window", "roi", "win_rate"],
-            ascending=[True, True, False, False],
+            ["distribution", "stat_type", "window", "roi", "win_rate"],
+            ascending=[True, True, True, False, False],
         ).reset_index(drop=True)
 
     return results_df, failures_df
@@ -192,7 +210,7 @@ def _build_summary(results_df: pd.DataFrame) -> pd.DataFrame:
     if results_df.empty:
         return pd.DataFrame()
     return (
-        results_df.groupby(["stat_type", "window"], as_index=False)
+        results_df.groupby(["distribution", "stat_type", "window"], as_index=False)
         .agg(
             avg_roi=("roi", "mean"),
             avg_win_rate=("win_rate", "mean"),
@@ -228,6 +246,7 @@ def _write_artifacts(
         "",
         f"- Players: {', '.join(args.players)}",
         f"- Stat types: {', '.join(args.stat_types)}",
+        f"- Distributions: {', '.join(args.distributions)}",
         f"- Windows: {', '.join(str(w) for w in args.windows)}",
         f"- Date range: {args.start_date} to {args.end_date}",
         f"- Use market lines: {args.use_market_lines}",
@@ -263,6 +282,7 @@ def main():
         players=args.players,
         windows=args.windows,
         stat_types=[s.lower() for s in args.stat_types],
+        distributions=[normalize_distribution_name(d) for d in args.distributions],
         start_date=args.start_date,
         end_date=args.end_date,
         line=args.line,

@@ -1,13 +1,17 @@
-import pandas as pd
-import numpy as np
+import json
+import logging
 from typing import Optional
+
+import numpy as np
+import pandas as pd
+
 from nba_model.data.data_loader import DataLoader
+from nba_model.data.database.db_manager import DatabaseManager
 from nba_model.model.feature_engineering import add_rolling_stats
 from nba_model.model.defense_adjustment import adjust_mu_for_defense
 from nba_model.model.minutes_projection import project_minutes
-from nba_model.model.probability import prob_over
-from nba_model.data.database.db_manager import DatabaseManager
-import logging
+from nba_model.model.probability import prob_over_distribution
+from nba_model.model.simulation import normalize_distribution_name
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -19,6 +23,19 @@ class Backtester:
 
     Simulates making predictions on past games and compares to actual outcomes.
     """
+    MARKET_SPREAD_STAT_TYPES = (
+        'spread',
+        'game_spread',
+        'game spread',
+        'line_spread',
+        'line spread',
+        'vegas_spread',
+        'vegas spread',
+        'pregame_spread',
+        'pregame spread',
+        'closing_spread',
+        'closing spread',
+    )
 
     def __init__(
         self,
@@ -26,6 +43,7 @@ class Backtester:
         end_date,
         line_value=None,
         stat_type='points',
+        distribution='normal',
         defense_sensitivity=0.4,
         back_to_back_penalty=0.06,
         home_away_blend=0.25,
@@ -46,6 +64,7 @@ class Backtester:
         self.end_date = pd.to_datetime(end_date)
         self.line_value = line_value
         self.stat_type = stat_type.lower()
+        self.distribution = normalize_distribution_name(distribution)
         self.defense_sensitivity = defense_sensitivity
         self.back_to_back_penalty = back_to_back_penalty
         self.home_away_blend = home_away_blend
@@ -145,13 +164,43 @@ class Backtester:
             def_rating = getter(opponent)
         return self._safe_float(def_rating)
 
-    def _get_game_spread(self, upcoming_game) -> float:
-        """Use available spread columns when present; default to 0 (no blowout signal)."""
+    def _get_market_spread(self, upcoming_game) -> Optional[float]:
+        """Resolve spread from betting_lines aliases when market data exists."""
+        player_id = self._safe_float(upcoming_game.get('player_id'))
+        game_date = upcoming_game.get('game_date')
+        if player_id is None or game_date is None:
+            return None
+
+        getter = getattr(self.db, 'get_market_spread', None)
+        if not callable(getter):
+            return None
+
+        spread_value = getter(
+            player_id=int(player_id),
+            game_date=game_date,
+            book=self.market_book,
+            agg=self.market_line_agg,
+            stat_types=self.MARKET_SPREAD_STAT_TYPES,
+        )
+        return self._safe_float(spread_value)
+
+    def _get_game_spread_with_source(self, upcoming_game) -> tuple[float, str]:
+        """Resolve spread with source tracking for diagnostics."""
         for key in ('vegas_spread', 'spread', 'line_spread'):
             value = self._safe_float(upcoming_game.get(key))
             if value is not None:
-                return value
-        return 0.0
+                return value, key
+
+        market_spread = self._get_market_spread(upcoming_game)
+        if market_spread is not None:
+            return market_spread, 'market_spread'
+
+        return 0.0, 'default_zero'
+
+    def _get_game_spread(self, upcoming_game) -> float:
+        """Use available spread columns, then market spread fallback, else zero."""
+        spread_value, _ = self._get_game_spread_with_source(upcoming_game)
+        return spread_value
 
     @staticmethod
     def _is_back_to_back(historical_data: pd.DataFrame, upcoming_game) -> bool:
@@ -288,8 +337,12 @@ class Backtester:
                 logger.warning(f"Skipping {game_date.date()} - insufficient history")
                 continue
 
+            # Carry player_id into upcoming row so market spread fallback can resolve.
+            upcoming_game = game.copy()
+            upcoming_game['player_id'] = player_id
+
             # Make prediction
-            prediction = self._make_prediction(train_data, game, window)
+            prediction = self._make_prediction(train_data, upcoming_game, window)
 
             # Compare to actual result
             actual_value = game[self.stat_type]
@@ -318,6 +371,7 @@ class Backtester:
                 line = prediction['expected_value']
                 line_source = "model"
 
+            spread_value, spread_source = self._get_game_spread_with_source(upcoming_game)
             outcome = self._evaluate_outcome(actual_value, line, prediction['prob_over'])
 
             # Store result
@@ -325,11 +379,15 @@ class Backtester:
                 'date': game_date,
                 'player_id': player_id,
                 'player_name': player_name,
+                'distribution': self.distribution,
+                'rolling_window': int(window),
                 'predicted_mean': prediction['expected_value'],
                 'predicted_std': prediction['std_dev'],
                 'prob_over': prediction['prob_over'],
                 'line': line,
                 'line_source': line_source,
+                'spread_value': spread_value,
+                'spread_source': spread_source,
                 'actual_value': actual_value,
                 'outcome': outcome['result'],  # 'over', 'under', 'push'
                 'bet_recommendation': outcome['bet'],  # 'over', 'under', 'none'
@@ -397,7 +455,13 @@ class Backtester:
 
         # Calculate probability of exceeding the line
         line = self.line_value or expected_value
-        prob_over1 = prob_over(line, expected_value, std_stat)
+        prob_over1 = prob_over_distribution(
+            line=line,
+            mu=expected_value,
+            sigma=std_stat,
+            distribution=self.distribution,
+            sample_size=int(window),
+        )
 
         return {
             'expected_value': expected_value,
@@ -515,6 +579,12 @@ class Backtester:
             'market_line_games': int((df['line_source'] == 'market').sum()) if 'line_source' in df.columns else 0,
             'fixed_line_games': int((df['line_source'] == 'fixed').sum()) if 'line_source' in df.columns else 0,
             'model_line_games': int((df['line_source'] == 'model').sum()) if 'line_source' in df.columns else 0,
+            'market_spread_games': int((df['spread_source'] == 'market_spread').sum()) if 'spread_source' in df.columns else 0,
+            'row_spread_games': int(
+                df['spread_source'].isin({'vegas_spread', 'spread', 'line_spread'}).sum()
+            ) if 'spread_source' in df.columns else 0,
+            'default_spread_games': int((df['spread_source'] == 'default_zero').sum()) if 'spread_source' in df.columns else 0,
+            'distribution': self.distribution,
         }
 
         return metrics
@@ -522,6 +592,22 @@ class Backtester:
     def _save_prediction_to_db(self, result):
         """Save prediction to database for future analysis."""
         try:
+            model_config = {
+                'distribution': self.distribution,
+                'rolling_window': int(result.get('rolling_window', 0)),
+                'line_source': result.get('line_source'),
+                'spread_source': result.get('spread_source'),
+                'spread_value': result.get('spread_value'),
+                'line_value': self.line_value,
+                'use_market_lines': bool(self.use_market_lines),
+                'require_market_line': bool(self.require_market_line),
+                'market_book': self.market_book,
+                'market_line_agg': self.market_line_agg,
+                'defense_sensitivity': float(self.defense_sensitivity),
+                'back_to_back_penalty': float(self.back_to_back_penalty),
+                'home_away_blend': float(self.home_away_blend),
+                'min_home_away_games': int(self.min_home_away_games),
+            }
             prediction_data = {
                 'player_id': result['player_id'],
                 'game_date': result['date'].strftime('%Y-%m-%d'),
@@ -532,6 +618,7 @@ class Backtester:
                 'line_value': result['line'],
                 'expected_value': None,  # Could calculate EV here
                 'book_odds': -110,  # Assuming standard odds
+                'model_config_json': json.dumps(model_config, sort_keys=True),
             }
             self.db.insert_prediction(prediction_data)
         except Exception as e:
@@ -548,6 +635,7 @@ class Backtester:
         print("=" * 60)
         print(f"Period: {self.start_date.date()} to {self.end_date.date()}")
         print(f"Stat Type: {self.stat_type}")
+        print(f"Distribution: {self.distribution}")
         print(f"Line: {self.line_value or 'Dynamic (rolling average)'}")
         print("-" * 60)
 

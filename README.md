@@ -50,11 +50,21 @@ In the Parlay tab you can input:
 - sportsbook (`prizepicks`, `underdog`, or `custom`)
 - leg stats and lines
 - parlay odds and odds format (`american`, `decimal`, or `multiplier`)
+- bounded sliders for correlation/volatility severity, plus reset-to-default
+
+In the Single Prop tab you can also tune:
+- opponent/league defense inputs and defense sensitivity
+- blowout threshold + blowout penalty
+- bounded severity sliders (defense, minutes penalty, and sigma)
+- selectable distribution family (`normal`, `student_t`, `binomial`, `poisson`, `exponential`, `uniform`, `lognormal`, `power_law`)
+- reset-to-default button for one-click baseline restore
 
 In the `Manual Lines Import` tab you can paste sportsbook rows and write them into
 `betting_lines` for market-line backtests. Supported row formats (pipe/csv/tab):
 - `player | stat | line | over_odds | under_odds`
 - `player | game_date | book | stat | line | over_odds | under_odds`
+- raw board text paste is also supported (auto-extracts player + matchup + line + stat blocks)
+After parsing, use the table preview to verify rows and delete selected entries before saving.
 
 Optional flags:
 - `--window` (rolling window)
@@ -62,6 +72,16 @@ Optional flags:
 - `--odds` (American odds)
 - `--opp-def-rating`
 - `--spread`
+- `--league-avg-def-rating`
+- `--defense-sensitivity`
+- `--blowout-threshold`
+- `--blowout-penalty`
+- `--distribution`
+- `--defense-severity`
+- `--minutes-penalty-severity`
+- `--sigma-severity`
+- `--correlation-severity`
+- `--volatility-severity`
 - `--plot` (single mode only)
 
 ### 2) Deterministic Smoke Tests (No Live API Required)
@@ -89,9 +109,13 @@ python3 -m nba_model.evaluation.run_batch_backtest \
   --players "LeBron James" "Stephen Curry" "Nikola Jokic" \
   --windows 5 7 10 15 \
   --stat-types points \
+  --distributions normal student_t lognormal \
   --start-date 2024-11-01 \
   --end-date 2025-03-15
 ```
+
+Notes:
+- For points backtests, minutes projection uses spread from game rows when available, then falls back to spread aliases in `betting_lines` (`spread`, `game_spread`, `line_spread`, `vegas_spread`, etc.).
 
 Artifacts are saved under `nba_model/evaluation/artifacts/` with timestamped filenames.
 

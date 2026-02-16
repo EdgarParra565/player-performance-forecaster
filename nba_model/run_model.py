@@ -3,6 +3,8 @@ import sys
 from pathlib import Path
 from typing import Optional
 
+import numpy as np
+
 # Allow direct execution via ".../nba_model/run_model.py" by ensuring the
 # project root (parent of nba_model/) is importable.
 if __package__ in {None, ""}:
@@ -18,7 +20,11 @@ from nba_model.model.minutes_projection import project_minutes
 from nba_model.model.odds import american_to_implied_prob, expected_value
 from nba_model.model.parlay_ev import calculate_parlay_ev
 from nba_model.model.parlay_simulation import simulate_multi_leg_sgp
-from nba_model.model.simulation import monte_carlo_over
+from nba_model.model.simulation import (
+    SUPPORTED_DISTRIBUTIONS,
+    monte_carlo_over,
+    normalize_distribution_name,
+)
 
 
 """
@@ -49,6 +55,12 @@ DEFAULT_POINTS_LINE = 27.5
 DEFAULT_AMERICAN_ODDS = -110
 DEFAULT_OPP_DEF_RATING = 112.5
 DEFAULT_VEGAS_SPREAD = 11.5
+DEFAULT_LEAGUE_AVG_DEF_RATING = 113.0
+DEFAULT_DEFENSE_SENSITIVITY = 0.4
+DEFAULT_BLOWOUT_THRESHOLD = 10.0
+DEFAULT_BLOWOUT_PENALTY = 0.12
+DEFAULT_SINGLE_PROP_DISTRIBUTION = "normal"
+SINGLE_PROP_DISTRIBUTION_CHOICES = list(SUPPORTED_DISTRIBUTIONS)
 DEFAULT_PARLAY_STATS = ["points", "assists", "rebounds"]
 DEFAULT_PARLAY_LINES = [27.5, 7.5, 8.5]
 
@@ -110,6 +122,41 @@ def _resolve_parlay_american_odds(
     raise ValueError(f"Unsupported parlay_odds_format: {parlay_odds_format}")
 
 
+def _clamp(value: float, min_value: float, max_value: float) -> float:
+    """Clamp numeric value to closed interval [min_value, max_value]."""
+    return max(min_value, min(float(value), max_value))
+
+
+def _apply_correlation_severity(corr_matrix, correlation_severity: float):
+    """
+    Scale off-diagonal correlation strength while preserving diagonal 1.0.
+
+    correlation_severity:
+      - 0.0 => no correlation (identity matrix)
+      - 1.0 => baseline empirical correlations
+      - >1.0 => amplified correlation impact (clipped for stability)
+    """
+    severity = max(0.0, float(correlation_severity))
+    values = corr_matrix.values.astype(float)
+    n = values.shape[0]
+    identity = np.eye(n)
+    off_diag = values - identity
+    scaled = identity + off_diag * severity
+    scaled = np.clip(scaled, -0.99, 0.99)
+    np.fill_diagonal(scaled, 1.0)
+    return corr_matrix.__class__(scaled, index=corr_matrix.index, columns=corr_matrix.columns)
+
+
+def _ensure_psd_covariance(cov_matrix: np.ndarray, eps: float = 1e-6) -> np.ndarray:
+    """
+    Ensure covariance matrix is positive semidefinite for simulation stability.
+    """
+    sym = (cov_matrix + cov_matrix.T) / 2.0
+    eigvals, eigvecs = np.linalg.eigh(sym)
+    eigvals = np.clip(eigvals, eps, None)
+    return eigvecs @ np.diag(eigvals) @ eigvecs.T
+
+
 def run_single_prop(
     player_name: str,
     line: float,
@@ -117,8 +164,16 @@ def run_single_prop(
     american_odds: int,
     opp_def_rating: float,
     vegas_spread: float,
+    league_avg_def_rating: float = DEFAULT_LEAGUE_AVG_DEF_RATING,
+    defense_sensitivity: float = DEFAULT_DEFENSE_SENSITIVITY,
+    blowout_threshold: float = DEFAULT_BLOWOUT_THRESHOLD,
+    blowout_penalty: float = DEFAULT_BLOWOUT_PENALTY,
     n_games: int = 75,
     show_plot: bool = False,
+    distribution: str = DEFAULT_SINGLE_PROP_DISTRIBUTION,
+    defense_severity: float = 1.0,
+    minutes_penalty_severity: float = 1.0,
+    sigma_severity: float = 1.0,
 ):
     """Run single-leg points model flow using unified feature columns."""
     loader = DataLoader()
@@ -139,17 +194,49 @@ def run_single_prop(
     sigma = latest["rolling_std_points"]
     avg_minutes = latest["rolling_mean_minutes"]
 
-    proj_minutes = project_minutes(avg_minutes, abs(vegas_spread))
-    mu = adjust_mu_for_defense(ppm * proj_minutes, opp_def_rating)
+    base_blowout_penalty = _clamp(float(blowout_penalty), 0.0, 0.95)
+    effective_blowout_penalty = _clamp(
+        base_blowout_penalty * max(0.0, float(minutes_penalty_severity)),
+        0.0,
+        0.95,
+    )
+    effective_defense_sensitivity = max(
+        0.0,
+        float(defense_sensitivity) * max(0.0, float(defense_severity)),
+    )
+    adjusted_sigma = max(0.01, float(sigma) * max(0.0, sigma_severity))
 
-    p_over = monte_carlo_over(mu, sigma, line)
+    proj_minutes = project_minutes(
+        avg_minutes,
+        abs(vegas_spread),
+        blowout_threshold=float(blowout_threshold),
+        blowout_penalty=effective_blowout_penalty,
+    )
+    mu = adjust_mu_for_defense(
+        ppm * proj_minutes,
+        opp_def_rating,
+        league_avg_def_rating=float(league_avg_def_rating),
+        sensitivity=effective_defense_sensitivity,
+    )
+
+    selected_distribution = normalize_distribution_name(distribution)
+    p_over = monte_carlo_over(
+        mu,
+        adjusted_sigma,
+        line,
+        distribution=selected_distribution,
+        sample_size=int(rolling_window),
+    )
     implied = american_to_implied_prob(american_odds)
     ev = expected_value(p_over, american_odds)
 
     print(f"\nSingle Prop Model: {player_name} points")
+    print(f"Distribution: {selected_distribution}")
     print(f"Projected minutes: {proj_minutes:.1f}")
     print(f"Expected points (mu): {mu:.2f}")
-    print(f"Sigma: {sigma:.2f}")
+    print(f"Defense sensitivity: {defense_sensitivity:.3f} -> effective {effective_defense_sensitivity:.3f}")
+    print(f"Blowout penalty: {base_blowout_penalty:.3f} -> effective {effective_blowout_penalty:.3f}")
+    print(f"Sigma: {sigma:.2f} -> adjusted {adjusted_sigma:.2f}")
     print(f"Model P(OVER): {p_over:.2%}")
     print(f"Book Implied P: {implied:.2%}")
     print(f"EV: {ev:.3f}")
@@ -157,16 +244,27 @@ def run_single_prop(
     if show_plot:
         from nba_model.visualization.distribution_plot import plot_distribution
 
-        plot_distribution(mu, sigma, line)
+        plot_distribution(mu, adjusted_sigma, line)
 
     return {
         "player": player_name,
         "line": line,
         "mu": float(mu),
         "sigma": float(sigma),
+        "sigma_adjusted": float(adjusted_sigma),
         "prob_over": float(p_over),
         "implied_prob": float(implied),
         "ev": float(ev),
+        "distribution": selected_distribution,
+        "league_avg_def_rating": float(league_avg_def_rating),
+        "defense_sensitivity": float(defense_sensitivity),
+        "defense_sensitivity_effective": float(effective_defense_sensitivity),
+        "blowout_threshold": float(blowout_threshold),
+        "blowout_penalty": float(base_blowout_penalty),
+        "blowout_penalty_effective": float(effective_blowout_penalty),
+        "defense_severity": float(defense_severity),
+        "minutes_penalty_severity": float(minutes_penalty_severity),
+        "sigma_severity": float(sigma_severity),
     }
 
 
@@ -178,6 +276,8 @@ def run_parlay_demo(
     sportsbook: str = "custom",
     n_games: int = 100,
     n_sims: int = 20000,
+    correlation_severity: float = 1.0,
+    volatility_severity: float = 1.0,
 ):
     """Run multi-leg SGP simulation with correlation derived from player history."""
     if len(stats_cols) != len(lines):
@@ -194,9 +294,12 @@ def run_parlay_demo(
         raise KeyError(f"Missing columns for parlay simulation: {missing_stats}")
 
     corr_matrix = calibrate_correlations(df_player, stats_cols)
-    stds = {col: float(df_player[col].dropna().std()) for col in stats_cols}
+    corr_matrix = _apply_correlation_severity(corr_matrix, correlation_severity=correlation_severity)
+    volatility_scale = max(0.01, float(volatility_severity))
+    stds = {col: float(df_player[col].dropna().std()) * volatility_scale for col in stats_cols}
     means = [float(df_player[col].dropna().tail(DEFAULT_ROLLING_WINDOW).mean()) for col in stats_cols]
     cov_matrix = covariance_matrix(corr_matrix, stds)
+    cov_matrix = _ensure_psd_covariance(cov_matrix)
 
     prob = simulate_multi_leg_sgp(means, cov_matrix, lines, n=n_sims)
     ev = calculate_parlay_ev(prob, american_odds)
@@ -207,6 +310,8 @@ def run_parlay_demo(
     print(f"Legs: {leg_desc}")
     print(f"Parlay odds: {american_odds:+d} (American)")
     print(f"Book Implied P: {implied:.2%}")
+    print(f"Correlation severity: {correlation_severity:.2f}")
+    print(f"Volatility severity: {volatility_severity:.2f}")
     print(f"Means: {[round(v, 2) for v in means]}")
     print(f"SGP probability: {prob:.2%}")
     print(f"Parlay EV: {ev:.3f}")
@@ -221,6 +326,8 @@ def run_parlay_demo(
         "implied_prob": float(implied),
         "probability": float(prob),
         "ev": float(ev),
+        "correlation_severity": float(correlation_severity),
+        "volatility_severity": float(volatility_severity),
     }
 
 
@@ -233,7 +340,20 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--window", type=int, default=DEFAULT_ROLLING_WINDOW)
     parser.add_argument("--opp-def-rating", type=float, default=DEFAULT_OPP_DEF_RATING)
     parser.add_argument("--spread", type=float, default=DEFAULT_VEGAS_SPREAD)
+    parser.add_argument("--league-avg-def-rating", type=float, default=DEFAULT_LEAGUE_AVG_DEF_RATING)
+    parser.add_argument("--defense-sensitivity", type=float, default=DEFAULT_DEFENSE_SENSITIVITY)
+    parser.add_argument("--blowout-threshold", type=float, default=DEFAULT_BLOWOUT_THRESHOLD)
+    parser.add_argument("--blowout-penalty", type=float, default=DEFAULT_BLOWOUT_PENALTY)
+    parser.add_argument(
+        "--distribution",
+        choices=SINGLE_PROP_DISTRIBUTION_CHOICES,
+        default=DEFAULT_SINGLE_PROP_DISTRIBUTION,
+        help="Distribution family for single-prop simulation.",
+    )
     parser.add_argument("--n-games", type=int, default=100)
+    parser.add_argument("--defense-severity", type=float, default=1.0)
+    parser.add_argument("--minutes-penalty-severity", type=float, default=1.0)
+    parser.add_argument("--sigma-severity", type=float, default=1.0)
     parser.add_argument("--plot", action="store_true")
     parser.add_argument("--sportsbook", choices=["custom", "prizepicks", "underdog"], default="custom")
     parser.add_argument("--parlay-stats", nargs="+", default=DEFAULT_PARLAY_STATS)
@@ -250,6 +370,8 @@ def _build_parser() -> argparse.ArgumentParser:
         default="american",
         help="Format of --parlay-odds (PrizePicks/Underdog often use multiplier style).",
     )
+    parser.add_argument("--correlation-severity", type=float, default=1.0)
+    parser.add_argument("--volatility-severity", type=float, default=1.0)
     return parser
 
 
@@ -264,8 +386,16 @@ def main():
             american_odds=args.odds,
             opp_def_rating=args.opp_def_rating,
             vegas_spread=args.spread,
+            league_avg_def_rating=args.league_avg_def_rating,
+            defense_sensitivity=args.defense_sensitivity,
+            blowout_threshold=args.blowout_threshold,
+            blowout_penalty=args.blowout_penalty,
             n_games=args.n_games,
             show_plot=args.plot,
+            distribution=args.distribution,
+            defense_severity=args.defense_severity,
+            minutes_penalty_severity=args.minutes_penalty_severity,
+            sigma_severity=args.sigma_severity,
         )
 
     if args.mode in {"parlay", "both"}:
@@ -288,6 +418,8 @@ def main():
             american_odds=parlay_american_odds,
             sportsbook=args.sportsbook,
             n_games=args.n_games,
+            correlation_severity=args.correlation_severity,
+            volatility_severity=args.volatility_severity,
         )
 
 

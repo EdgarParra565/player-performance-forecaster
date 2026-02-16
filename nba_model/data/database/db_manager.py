@@ -206,7 +206,8 @@ class DatabaseManager:
         Args:
             prediction_data: dict with keys:
                 player_id, game_date, stat_type, predicted_mean,
-                predicted_std, prob_over, line_value, expected_value
+                predicted_std, prob_over, line_value, expected_value,
+                optional model_config_json
         """
         # noinspection SqlNoDataSourceInspection
         query = """
@@ -226,8 +227,34 @@ class DatabaseManager:
             prediction_data.get('book_odds'),
             prediction_data.get('expected_value')
         )
-        self.conn.execute(query, values)
+        cursor = self.conn.execute(query, values)
+
+        model_config_json = prediction_data.get("model_config_json")
+        if model_config_json:
+            self.conn.execute(
+                """
+                INSERT INTO prediction_configs (prediction_id, config_json)
+                VALUES (?, ?)
+                """,
+                (cursor.lastrowid, model_config_json),
+            )
         self.conn.commit()
+
+    def get_prediction_config(self, prediction_id):
+        """Fetch model configuration JSON for a prediction id."""
+        if prediction_id is None:
+            return None
+        row = self.conn.execute(
+            """
+            SELECT config_json
+            FROM prediction_configs
+            WHERE prediction_id = ?
+            ORDER BY created_at DESC, config_id DESC
+            LIMIT 1
+            """,
+            (prediction_id,),
+        ).fetchone()
+        return row[0] if row else None
 
     def update_prediction_result(self, prediction_id, actual_result, outcome):
         """Update prediction with actual game result."""
@@ -302,6 +329,80 @@ class DatabaseManager:
                   AND stat_type = ?
             """
             params = (player_id, game_date, stat_type)
+
+        rows = [r[0] for r in self.conn.execute(query, params).fetchall() if r and r[0] is not None]
+        if not rows:
+            return None
+
+        series = pd.Series(rows, dtype="float64")
+        agg_key = (agg or "median").lower()
+        if agg_key == "mean":
+            return float(series.mean())
+        if agg_key == "min":
+            return float(series.min())
+        if agg_key == "max":
+            return float(series.max())
+        return float(series.median())
+
+    def get_market_spread(self, player_id, game_date, book=None, agg="median", stat_types=None):
+        """
+        Fetch pregame spread value from betting_lines for a player/date.
+
+        Args:
+            player_id: NBA player id
+            game_date: date-like value; compared on YYYY-MM-DD
+            book: optional sportsbook title filter
+            agg: one of median/mean/min/max for multi-row aggregation
+            stat_types: optional list of stat_type aliases treated as spread fields
+
+        Returns:
+            float | None
+        """
+        if not player_id:
+            return None
+
+        if isinstance(game_date, (pd.Timestamp, datetime)):
+            game_date = game_date.strftime("%Y-%m-%d")
+        else:
+            game_date = str(game_date)[:10]
+
+        spread_aliases = stat_types or [
+            "spread",
+            "game_spread",
+            "game spread",
+            "line_spread",
+            "line spread",
+            "vegas_spread",
+            "vegas spread",
+            "pregame_spread",
+            "pregame spread",
+            "closing_spread",
+            "closing spread",
+        ]
+        spread_aliases = sorted({str(alias).strip().lower() for alias in spread_aliases if str(alias).strip()})
+        if not spread_aliases:
+            return None
+
+        placeholders = ", ".join(["?"] * len(spread_aliases))
+        if book:
+            query = f"""
+                SELECT line_value
+                FROM betting_lines
+                WHERE player_id = ?
+                  AND game_date = ?
+                  AND lower(stat_type) IN ({placeholders})
+                  AND book = ?
+            """
+            params = (player_id, game_date, *spread_aliases, book)
+        else:
+            query = f"""
+                SELECT line_value
+                FROM betting_lines
+                WHERE player_id = ?
+                  AND game_date = ?
+                  AND lower(stat_type) IN ({placeholders})
+            """
+            params = (player_id, game_date, *spread_aliases)
 
         rows = [r[0] for r in self.conn.execute(query, params).fetchall() if r and r[0] is not None]
         if not rows:

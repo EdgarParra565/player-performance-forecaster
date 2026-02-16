@@ -84,7 +84,17 @@ CREATE TABLE IF NOT EXISTS predictions (
     FOREIGN KEY (player_id) REFERENCES players(player_id)
 );
 
+-- Prediction model configuration metadata (for reproducibility/auditing)
+CREATE TABLE IF NOT EXISTS prediction_configs (
+    config_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    prediction_id INTEGER NOT NULL,
+    config_json TEXT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (prediction_id) REFERENCES predictions(prediction_id)
+);
+
 -- Indexes for fast queries
 CREATE INDEX IF NOT EXISTS idx_game_logs_player_date ON game_logs(player_id, game_date DESC);
 CREATE INDEX IF NOT EXISTS idx_predictions_date ON predictions(game_date DESC);
 CREATE INDEX IF NOT EXISTS idx_betting_lines_player_date ON betting_lines(player_id, game_date);
+CREATE INDEX IF NOT EXISTS idx_prediction_configs_prediction_id ON prediction_configs(prediction_id);

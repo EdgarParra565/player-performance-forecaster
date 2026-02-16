@@ -65,14 +65,18 @@ IMPLEMENTATION UPDATE (2026-02-15)
 
 ## Future Implementation Queue (New)
 ### Near-Term (1-2 weeks)
-- [x] Batch backtest command for top scorers with one CLI run
-  - Implemented `nba_model.evaluation.run_batch_backtest` with multi-player, multi-window, multi-stat support and artifact exports.
-- [x] Statistical significance module (CI, z-test vs breakeven win rate)
-  - Implemented `nba_model.evaluation.significance` and integrated CI/z-test outputs into batch backtest results.
-- [x] Expand baseline to assists/rebounds/PRA with same evaluation template
-  - Added PRA support in feature engineering/backtest and expanded evaluation runners to include `points`, `assists`, `rebounds`, and `pra`.
-- [x] Finish docstrings in remaining model and visualization modules
-  - Completed/expanded docstrings in `defense_adjustment.py`, `minutes_projection.py`, `correlation_calibration.py`, and `distribution_plot.py`.
+- [x] Integrate distribution selection into `Backtester` + batch runner
+  - Added `distribution` support to `Backtester` probability path and `run_batch_backtest` (`--distributions`) for per-run distribution comparisons.
+- [ ] Run a distribution sweep benchmark on 10+ players (points/assists/rebounds/PRA)
+  - Export ROI, calibration, and significance by distribution so defaults can be chosen with evidence.
+- [ ] Complete `team_defense` population + verification checks
+  - Add a lightweight validation report (row count, missing teams, latest update timestamp) after ingestion.
+- [x] Wire pregame spread fields from lines data into backtest rows
+  - Backtest now resolves spread from row fields first, then `betting_lines` spread aliases (via `get_market_spread`) and records `spread_source`/`spread_value` per result row.
+- [x] Add stronger distribution tests (edge cases and parameter stability)
+  - Added smoke coverage for alias normalization and invalid distribution rejection.
+- [x] Save model configuration metadata with predictions/backtests
+  - Added `prediction_configs` table and persisted model configuration JSON on prediction writes.
 
 ### Mid-Term (1-2 months)
 - [ ] Daily ETL refresh for game logs + defense + betting lines
@@ -81,6 +85,43 @@ IMPLEMENTATION UPDATE (2026-02-15)
   - Normalize props across sportsbooks, compare best available lines/prices, and benchmark each against model fair value.
 - [ ] Monthly performance diagnostics (drift, drawdown, calibration trend)
 - [ ] Better contextual features: rest days, home/away travel, injury proxy
+
+### Future Plan: Paid Historical Data Edge Program
+- [ ] Add paid historical sportsbook data pipeline (timestamped snapshots)
+  - Required fields: `book`, `event_id`, `player_id/player_name`, `market`, `line`, `price`, `side`, `timestamp`, `is_open`, `is_close`, optional `limit`.
+  - Preserve full line-move history (not just latest) to support opening-vs-closing and pre-tip movement analysis.
+  - Normalize market naming across books into canonical stat/side formats for apples-to-apples comparison.
+- [ ] Extend database schema for historical market states + outcomes
+  - Add tables for market snapshots and final graded outcomes; index by (`event_id`, `market`, `book`, `timestamp`).
+  - Store final closing consensus and realized results so model edge can be evaluated against both close and outcome.
+  - Add quality checks (missing fields, stale timestamps, duplicated snapshots, timezone consistency).
+- [ ] Build market-aware feature layer for pricing inefficiency detection
+  - Line movement velocity, distance to close, cross-book dispersion, implied probability spread, vig-removed fair probabilities.
+  - Context joins: rest/back-to-back, defense context, minutes-risk context, injury proxies, and schedule density.
+  - Segment features by market type/stat type/book to avoid pooling structurally different markets.
+- [ ] Train calibrated probability models per market segment
+  - Start with robust baselines (regularized linear/GBM), then compare richer models only when calibration improves.
+  - Optimize for calibration + expected value stability, not just classification accuracy.
+  - Recalibrate probabilities (isotonic/platt) and track reliability curves over time.
+- [ ] Add decision engine with conservative edge gating
+  - Bet filter: only place candidates where model edge exceeds breakeven + uncertainty buffer + execution slippage.
+  - Optional stake sizing with capped Kelly fraction; enforce max exposure per player/game/book.
+  - Add "no-bet" region by confidence and liquidity constraints to reduce overtrading.
+- [ ] Validate edge with strict walk-forward protocol
+  - No look-ahead leakage; train/validate/test split by time blocks.
+  - Report ROI, CLV, hit rate, drawdown, Sharpe, and significance vs breakeven (CI + z-test).
+  - Require minimum sample thresholds and p-value/CI guardrails before promoting any strategy to live use.
+
+### Distribution Expansion (Follow-Ups)
+- [ ] Integrate new distribution families into backtest engine (currently single-prop demo/UI first)
+  - Evaluate `normal`, `student_t`, `binomial`, `poisson`, `exponential`, `uniform`, `lognormal`, and `power_law` in walk-forward backtests.
+  - Compare calibration + ROI by stat type and choose default per market segment.
+- [ ] Add distribution-specific parameter fitting from historical samples
+  - Replace purely moment-based defaults with MLE/robust fit where stable.
+  - Add guardrails for sparse samples and automatic fallback to normal when fit quality is poor.
+- [ ] Extend distribution selection to parlay leg simulation
+  - Keep correlation modeling stable while allowing heavier tails/skew where appropriate.
+  - Validate PSD covariance and tail-behavior sensitivity before production use.
 
 ### Long-Term / Portfolio Upgrades
 - [ ] Interactive analysis dashboard (Streamlit or Plotly Dash)
