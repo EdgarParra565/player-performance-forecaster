@@ -36,7 +36,7 @@ class Backtester:
             start_date: Start of backtest period (YYYY-MM-DD)
             end_date: End of backtest period (YYYY-MM-DD)
             line_value: Fixed betting line (e.g., 27.5 points). If None, uses rolling average.
-            stat_type: 'points', 'assists', or 'rebounds'
+            stat_type: 'points', 'assists', 'rebounds', or 'pra'
         """
         self.start_date = pd.to_datetime(start_date)
         self.end_date = pd.to_datetime(end_date)
@@ -62,7 +62,7 @@ class Backtester:
         if self.start_date >= self.end_date:
             raise ValueError(f"Start date must be before end date!")
 
-        valid_stats = {'points', 'assists', 'rebounds'}
+        valid_stats = {'points', 'assists', 'rebounds', 'pra'}
         if self.stat_type not in valid_stats:
             raise ValueError(f"stat_type must be one of {sorted(valid_stats)}")
 
@@ -74,11 +74,15 @@ class Backtester:
             'PTS': 'points',
             'AST': 'assists',
             'REB': 'rebounds',
+            'PRA': 'pra',
             'MIN': 'minutes',
         }
         existing = {src: dst for src, dst in rename_map.items() if src in df.columns and dst not in df.columns}
         if existing:
             df = df.rename(columns=existing)
+
+        if {'points', 'assists', 'rebounds'}.issubset(df.columns) and 'pra' not in df.columns:
+            df['pra'] = df['points'] + df['assists'] + df['rebounds']
         return df
 
     @staticmethod

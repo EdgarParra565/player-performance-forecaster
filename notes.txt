@@ -65,10 +65,14 @@ IMPLEMENTATION UPDATE (2026-02-15)
 
 ## Future Implementation Queue (New)
 ### Near-Term (1-2 weeks)
-- [ ] Batch backtest command for top scorers with one CLI run
-- [ ] Statistical significance module (CI, z-test vs breakeven win rate)
-- [ ] Expand baseline to assists/rebounds/PRA with same evaluation template
-- [ ] Finish docstrings in remaining model and visualization modules
+- [x] Batch backtest command for top scorers with one CLI run
+  - Implemented `nba_model.evaluation.run_batch_backtest` with multi-player, multi-window, multi-stat support and artifact exports.
+- [x] Statistical significance module (CI, z-test vs breakeven win rate)
+  - Implemented `nba_model.evaluation.significance` and integrated CI/z-test outputs into batch backtest results.
+- [x] Expand baseline to assists/rebounds/PRA with same evaluation template
+  - Added PRA support in feature engineering/backtest and expanded evaluation runners to include `points`, `assists`, `rebounds`, and `pra`.
+- [x] Finish docstrings in remaining model and visualization modules
+  - Completed/expanded docstrings in `defense_adjustment.py`, `minutes_projection.py`, `correlation_calibration.py`, and `distribution_plot.py`.
 
 ### Mid-Term (1-2 months)
 - [ ] Daily ETL refresh for game logs + defense + betting lines

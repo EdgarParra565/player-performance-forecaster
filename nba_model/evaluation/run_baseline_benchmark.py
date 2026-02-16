@@ -8,11 +8,24 @@ from nba_model.evaluation.backtest import Backtester
 
 
 ARTIFACT_DIR = Path("nba_model/evaluation/artifacts")
+DEFAULT_STAT_TYPES = ("points", "assists", "rebounds", "pra")
 
 PLAYER_PROFILES = {
-    "LeBron James": {"line": 25.5, "minutes": 34.5, "ppm": 0.79},
-    "Stephen Curry": {"line": 27.5, "minutes": 33.2, "ppm": 0.83},
-    "Nikola Jokic": {"line": 26.5, "minutes": 35.0, "ppm": 0.78},
+    "LeBron James": {
+        "minutes": 34.5,
+        "ppm": 0.79,
+        "lines": {"points": 25.5, "assists": 7.5, "rebounds": 7.5, "pra": 40.5},
+    },
+    "Stephen Curry": {
+        "minutes": 33.2,
+        "ppm": 0.83,
+        "lines": {"points": 27.5, "assists": 5.5, "rebounds": 4.5, "pra": 37.5},
+    },
+    "Nikola Jokic": {
+        "minutes": 35.0,
+        "ppm": 0.78,
+        "lines": {"points": 26.5, "assists": 8.5, "rebounds": 11.5, "pra": 46.5},
+    },
 }
 
 
@@ -30,6 +43,7 @@ def _build_synthetic_games(player_name: str, profile: dict, n_games: int = 180) 
     points = np.clip(ppm * minutes + rng.normal(0.0, 3.2, n_games), 0.0, None)
     assists = np.clip(rng.normal(7.0, 2.0, n_games), 0.0, None)
     rebounds = np.clip(rng.normal(7.5, 2.3, n_games), 0.0, None)
+    pra = points + assists + rebounds
 
     return pd.DataFrame(
         {
@@ -37,6 +51,7 @@ def _build_synthetic_games(player_name: str, profile: dict, n_games: int = 180) 
             "points": points,
             "assists": assists,
             "rebounds": rebounds,
+            "pra": pra,
             "minutes": minutes,
         }
     )
@@ -62,6 +77,7 @@ class _NoOpDatabase:
 
 def run_baseline_benchmark(
     windows: tuple[int, ...] = (7, 10),
+    stat_types: tuple[str, ...] = DEFAULT_STAT_TYPES,
     start_date: str = "2024-12-01",
     end_date: str = "2025-03-15",
 ):
@@ -72,60 +88,70 @@ def run_baseline_benchmark(
     loader = _SyntheticLoader(frames)
 
     rows = []
-    for window in windows:
-        for player_name, profile in PLAYER_PROFILES.items():
-            backtester = Backtester(
-                start_date=start_date,
-                end_date=end_date,
-                line_value=profile["line"],
-                stat_type="points",
-            )
-            backtester.loader = loader
-            backtester.db = _NoOpDatabase()
+    for stat_type in stat_types:
+        for window in windows:
+            for player_name, profile in PLAYER_PROFILES.items():
+                line_value = profile["lines"][stat_type]
+                backtester = Backtester(
+                    start_date=start_date,
+                    end_date=end_date,
+                    line_value=line_value,
+                    stat_type=stat_type,
+                )
+                backtester.loader = loader
+                backtester.db = _NoOpDatabase()
 
-            metrics = backtester.run_backtest(player_name, window=window)
-            rows.append(
-                {
-                    "player_name": player_name,
-                    "window": window,
-                    "line_value": profile["line"],
-                    "total_games": metrics.get("total_games", 0),
-                    "bets_made": metrics.get("bets_made", 0),
-                    "wins": metrics.get("wins", 0),
-                    "losses": metrics.get("losses", 0),
-                    "win_rate": metrics.get("win_rate", 0.0),
-                    "roi": metrics.get("roi", 0.0),
-                    "total_profit": metrics.get("total_profit", 0.0),
-                    "brier_score": metrics.get("brier_score", 0.0),
-                }
-            )
+                metrics = backtester.run_backtest(player_name, window=window)
+                rows.append(
+                    {
+                        "player_name": player_name,
+                        "stat_type": stat_type,
+                        "window": window,
+                        "line_value": line_value,
+                        "total_games": metrics.get("total_games", 0),
+                        "bets_made": metrics.get("bets_made", 0),
+                        "wins": metrics.get("wins", 0),
+                        "losses": metrics.get("losses", 0),
+                        "win_rate": metrics.get("win_rate", 0.0),
+                        "roi": metrics.get("roi", 0.0),
+                        "total_profit": metrics.get("total_profit", 0.0),
+                        "brier_score": metrics.get("brier_score", 0.0),
+                    }
+                )
 
-    results_df = pd.DataFrame(rows).sort_values(["window", "player_name"]).reset_index(drop=True)
+    results_df = (
+        pd.DataFrame(rows)
+        .sort_values(["stat_type", "window", "player_name"])
+        .reset_index(drop=True)
+    )
     ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
 
     csv_path = ARTIFACT_DIR / "baseline_benchmark.csv"
     results_df.to_csv(csv_path, index=False)
 
     summary_df = (
-        results_df.groupby("window", as_index=False)
+        results_df.groupby(["stat_type", "window"], as_index=False)
         .agg(
             avg_roi=("roi", "mean"),
             avg_win_rate=("win_rate", "mean"),
             total_bets=("bets_made", "sum"),
             total_games=("total_games", "sum"),
         )
-        .sort_values("avg_roi", ascending=False)
+        .sort_values(["stat_type", "avg_roi"], ascending=[True, False])
     )
-    best_window = int(summary_df.iloc[0]["window"])
+    best_window = (
+        summary_df.sort_values("avg_roi", ascending=False).iloc[0][["stat_type", "window", "avg_roi"]].to_dict()
+    )
 
     summary_lines = [
         "# Baseline Benchmark Summary",
         "",
         "This benchmark uses deterministic synthetic player logs to validate the end-to-end backtest pipeline offline.",
         f"- Players: {', '.join(PLAYER_PROFILES.keys())}",
+        f"- Stat types: {', '.join(stat_types)}",
         f"- Windows tested: {', '.join(str(v) for v in windows)}",
         f"- Period: {start_date} to {end_date}",
-        f"- Best window by avg ROI: {best_window}",
+        f"- Best stat/window by avg ROI: {best_window}",
         "",
         "## Window Averages",
         summary_df.to_string(index=False),

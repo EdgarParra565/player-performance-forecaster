@@ -6,6 +6,7 @@ _STAT_COLUMN_ALIASES = {
     "PTS": "points",
     "AST": "assists",
     "REB": "rebounds",
+    "PRA": "pra",
     "MIN": "minutes",
 }
 
@@ -24,6 +25,12 @@ def _standardize_columns(df: pd.DataFrame) -> pd.DataFrame:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
+    # Derived combined market used by many books.
+    if {"points", "assists", "rebounds"}.issubset(df.columns) and "pra" not in df.columns:
+        df["pra"] = df["points"] + df["assists"] + df["rebounds"]
+    if "pra" in df.columns:
+        df["pra"] = pd.to_numeric(df["pra"], errors="coerce")
+
     if "points" not in df.columns or "minutes" not in df.columns:
         raise KeyError(
             "add_rolling_stats requires 'points' and 'minutes' columns "
@@ -40,7 +47,7 @@ def add_rolling_stats(df: pd.DataFrame, window: int = 10) -> pd.DataFrame:
     df = _standardize_columns(df.copy())
     rolling_kwargs = {"window": window, "min_periods": window}
 
-    for stat in ("points", "assists", "rebounds"):
+    for stat in ("points", "assists", "rebounds", "pra"):
         if stat in df.columns:
             df[f"rolling_mean_{stat}"] = df[stat].rolling(**rolling_kwargs).mean()
             df[f"rolling_std_{stat}"] = df[stat].rolling(**rolling_kwargs).std()

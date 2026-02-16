@@ -1,3 +1,6 @@
+"""Minutes projection helpers."""
+
+
 def project_minutes(
     avg_minutes: float,
     spread: float,
@@ -5,9 +8,16 @@ def project_minutes(
     blowout_penalty: float = 0.12
 ) -> float:
     """
-    Projects expected minutes based on Vegas spread
+    Project expected minutes from baseline minutes and spread context.
 
-    spread: absolute value (e.g. -12 → 12)
+    Args:
+        avg_minutes: Baseline expected minutes.
+        spread: Absolute spread magnitude (e.g., -12 -> 12).
+        blowout_threshold: Spread threshold to treat game as potential blowout.
+        blowout_penalty: Fractional minutes reduction when blowout threshold is hit.
+
+    Returns:
+        Projected minutes after blowout-risk adjustment.
     """
     if spread >= blowout_threshold:
         return avg_minutes * (1 - blowout_penalty)

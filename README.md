@@ -75,16 +75,32 @@ Outputs:
 - `nba_model/evaluation/artifacts/baseline_benchmark.csv`
 - `nba_model/evaluation/artifacts/baseline_benchmark_summary.md`
 
+### 4) Batch Backtest (Multi-Player / Multi-Window)
+
+Run real-data batch backtests with significance stats (Wilson CI + z-test vs breakeven):
+
+```bash
+python3 -m nba_model.evaluation.run_batch_backtest \
+  --players "LeBron James" "Stephen Curry" "Nikola Jokic" \
+  --windows 5 7 10 15 \
+  --stat-types points \
+  --start-date 2024-11-01 \
+  --end-date 2025-03-15
+```
+
+Artifacts are saved under `nba_model/evaluation/artifacts/` with timestamped filenames.
+
 ## Baseline Benchmark Results
 
-These results come from deterministic synthetic game logs to validate the full backtest pipeline offline:
+Baseline benchmark now runs with the same template across:
+- `points`
+- `assists`
+- `rebounds`
+- `pra` (points + rebounds + assists)
 
-| Window | Avg ROI | Avg Win Rate | Total Bets | Total Games |
-|---|---:|---:|---:|---:|
-| 10 | 14.27% | 59.85% | 252 | 315 |
-| 7 | 10.68% | 57.97% | 256 | 315 |
-
-Per-player detail is in `nba_model/evaluation/artifacts/baseline_benchmark.csv`.
+Latest results are generated into:
+- `nba_model/evaluation/artifacts/baseline_benchmark.csv`
+- `nba_model/evaluation/artifacts/baseline_benchmark_summary.md`
 
 ## Known Limitations
 
