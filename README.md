@@ -51,6 +51,11 @@ In the Parlay tab you can input:
 - leg stats and lines
 - parlay odds and odds format (`american`, `decimal`, or `multiplier`)
 
+In the `Manual Lines Import` tab you can paste sportsbook rows and write them into
+`betting_lines` for market-line backtests. Supported row formats (pipe/csv/tab):
+- `player | stat | line | over_odds | under_odds`
+- `player | game_date | book | stat | line | over_odds | under_odds`
+
 Optional flags:
 - `--window` (rolling window)
 - `--line` (prop line)

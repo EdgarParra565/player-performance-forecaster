@@ -4,6 +4,8 @@ from pathlib import Path
 
 import pandas as pd
 
+from nba_model.data.data_loader import DataLoader
+from nba_model.data.database.db_manager import DatabaseManager
 from nba_model.evaluation.backtest import Backtester
 from nba_model.evaluation.significance import win_rate_significance_summary
 
@@ -25,6 +27,20 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--start-date", default="2024-11-01")
     parser.add_argument("--end-date", default="2025-03-15")
     parser.add_argument("--line", type=float, default=None, help="Optional fixed line for all runs")
+    parser.add_argument("--use-market-lines", action="store_true", help="Use betting_lines table values by game date.")
+    parser.add_argument(
+        "--require-market-line",
+        action="store_true",
+        help="Skip games that do not have a market line when --use-market-lines is enabled.",
+    )
+    parser.add_argument("--market-book", default=None, help="Optional sportsbook name filter for market lines.")
+    parser.add_argument("--market-line-agg", choices=["median", "mean", "min", "max"], default="median")
+    parser.add_argument(
+        "--history-games",
+        type=int,
+        default=120,
+        help="How many recent games to load per player into cache for batch runs.",
+    )
     parser.add_argument("--output-prefix", default="batch_backtest")
     parser.add_argument("--confidence", type=float, default=0.95)
     parser.add_argument("--american-odds", type=int, default=-110)
@@ -38,9 +54,71 @@ def run_batch_backtest(
     start_date: str,
     end_date: str,
     line: float = None,
+    use_market_lines: bool = False,
+    require_market_line: bool = False,
+    market_book: str = None,
+    market_line_agg: str = "median",
+    history_games: int = 120,
     confidence: float = 0.95,
     american_odds: int = -110,
 ):
+    if history_games < 20:
+        raise ValueError("history_games must be >= 20")
+
+    # Fast fail when caller requires market lines but no candidate rows exist.
+    if use_market_lines and require_market_line and line is None:
+        stat_placeholders = ",".join(["?"] * len(stat_types))
+        query = f"""
+            SELECT COUNT(*)
+            FROM betting_lines
+            WHERE game_date BETWEEN ? AND ?
+              AND stat_type IN ({stat_placeholders})
+        """
+        params = [start_date, end_date, *stat_types]
+        if market_book:
+            query += " AND book = ?"
+            params.append(market_book)
+        with DatabaseManager() as db:
+            matching_lines = db.conn.execute(query, params).fetchone()[0]
+        if matching_lines == 0:
+            raise RuntimeError(
+                "No betting_lines found for requested date/stat filters. "
+                "Run odds ingestion first or disable --require-market-line. "
+                "Note: current odds ingestion fetches upcoming markets; historical backtest windows "
+                "need historical line snapshots in betting_lines."
+            )
+
+    class _CachedLoader:
+        def __init__(self, base_loader: DataLoader, requested_games: int):
+            self.base_loader = base_loader
+            self.requested_games = requested_games
+            self.player_ids = {}
+            self.cache = {}
+
+        def warm(self, player_name: str):
+            if player_name in self.cache:
+                return
+            player_id = self.base_loader.get_player_id(player_name)
+            data = self.base_loader.load_player_data(player_name, n_games=self.requested_games)
+            self.player_ids[player_name] = player_id
+            self.cache[player_name] = data
+
+        def get_player_id(self, player_name: str):
+            if player_name not in self.player_ids:
+                self.warm(player_name)
+            return self.player_ids[player_name]
+
+        def load_player_data(self, player_name: str, n_games: int = 200, force_refresh: bool = False):
+            del force_refresh
+            if player_name not in self.cache:
+                self.warm(player_name)
+            return self.cache[player_name].tail(n_games).copy()
+
+    base_loader = DataLoader()
+    cached_loader = _CachedLoader(base_loader=base_loader, requested_games=history_games)
+    for player in players:
+        cached_loader.warm(player)
+
     rows = []
     failures = []
 
@@ -53,7 +131,12 @@ def run_batch_backtest(
                         end_date=end_date,
                         line_value=line,
                         stat_type=stat_type,
+                        use_market_lines=use_market_lines,
+                        require_market_line=require_market_line,
+                        market_book=market_book,
+                        market_line_agg=market_line_agg,
                     )
+                    backtester.loader = cached_loader
                     metrics = backtester.run_backtest(player_name, window=window)
                 except Exception as exc:
                     failures.append(
@@ -83,6 +166,10 @@ def run_batch_backtest(
                     "stat_type": stat_type,
                     "window": window,
                     "line_value": line,
+                    "use_market_lines": use_market_lines,
+                    "market_book": market_book,
+                    "market_line_agg": market_line_agg,
+                    "history_games": history_games,
                     "start_date": start_date,
                     "end_date": end_date,
                 }
@@ -143,6 +230,11 @@ def _write_artifacts(
         f"- Stat types: {', '.join(args.stat_types)}",
         f"- Windows: {', '.join(str(w) for w in args.windows)}",
         f"- Date range: {args.start_date} to {args.end_date}",
+        f"- Use market lines: {args.use_market_lines}",
+        f"- Require market line: {args.require_market_line}",
+        f"- Market book: {args.market_book or 'all books'}",
+        f"- Market line aggregation: {args.market_line_agg}",
+        f"- History games loaded per player: {args.history_games}",
         f"- Confidence level: {args.confidence}",
         f"- Breakeven odds assumption: {args.american_odds}",
         "",
@@ -174,6 +266,11 @@ def main():
         start_date=args.start_date,
         end_date=args.end_date,
         line=args.line,
+        use_market_lines=args.use_market_lines,
+        require_market_line=args.require_market_line,
+        market_book=args.market_book,
+        market_line_agg=args.market_line_agg,
+        history_games=args.history_games,
         confidence=args.confidence,
         american_odds=args.american_odds,
     )

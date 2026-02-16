@@ -41,6 +41,97 @@ class DatabaseManager:
         self.conn.execute(query, (player_id, name, team, position))
         self.conn.commit()
 
+    def insert_team_defense_records(self, records):
+        """
+        Upsert team defense records.
+
+        Args:
+            records: Iterable of dicts with keys:
+                team_abbrev, season, def_rating, opp_ppg, pace
+        """
+        if not records:
+            return
+
+        query = """
+            INSERT INTO team_defense (team_abbrev, season, def_rating, opp_ppg, pace)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(team_abbrev) DO UPDATE SET
+                season = excluded.season,
+                def_rating = excluded.def_rating,
+                opp_ppg = excluded.opp_ppg,
+                pace = excluded.pace,
+                last_updated = CURRENT_TIMESTAMP
+        """
+        payload = [
+            (
+                rec.get("team_abbrev"),
+                rec.get("season"),
+                rec.get("def_rating"),
+                rec.get("opp_ppg"),
+                rec.get("pace"),
+            )
+            for rec in records
+            if rec.get("team_abbrev")
+        ]
+        if not payload:
+            return
+        self.conn.executemany(query, payload)
+        self.conn.commit()
+        logger.info(f"✓ Upserted {len(payload)} team_defense rows")
+
+    def insert_betting_lines_records(self, records):
+        """
+        Insert betting lines while skipping exact duplicates.
+
+        Args:
+            records: Iterable of dicts with keys:
+                player_id, game_date, book, stat_type, line_value, over_odds, under_odds
+        """
+        if not records:
+            return
+
+        query = """
+            INSERT INTO betting_lines
+                (player_id, game_date, book, stat_type, line_value, over_odds, under_odds)
+            SELECT ?, ?, ?, ?, ?, ?, ?
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM betting_lines bl
+                WHERE bl.player_id = ?
+                  AND bl.game_date = ?
+                  AND bl.book = ?
+                  AND bl.stat_type = ?
+                  AND bl.line_value = ?
+                  AND IFNULL(bl.over_odds, -99999) = IFNULL(?, -99999)
+                  AND IFNULL(bl.under_odds, -99999) = IFNULL(?, -99999)
+            )
+        """
+
+        payload = []
+        for rec in records:
+            row = (
+                rec.get("player_id"),
+                rec.get("game_date"),
+                rec.get("book"),
+                rec.get("stat_type"),
+                rec.get("line_value"),
+                rec.get("over_odds"),
+                rec.get("under_odds"),
+            )
+            if not all([row[0], row[1], row[2], row[3]]) or row[4] is None:
+                continue
+            payload.append(row + row)
+
+        if not payload:
+            return
+
+        before_changes = self.conn.total_changes
+        self.conn.executemany(query, payload)
+        self.conn.commit()
+        inserted = self.conn.total_changes - before_changes
+        ignored = len(payload) - inserted
+        logger.info(f"✓ Inserted {inserted} betting_lines rows ({ignored} duplicates ignored)")
+
     def insert_game_logs(self, game_logs_df):
         """
         Bulk insert game logs from DataFrame.
@@ -172,6 +263,59 @@ class DatabaseManager:
             ORDER BY p.game_date DESC
         """
         return pd.read_sql_query(query, self.conn, params=(start_date, end_date))
+
+    def get_market_line(self, player_id, game_date, stat_type, book=None, agg="median"):
+        """
+        Fetch market line for a player/stat/date, optionally scoped to one book.
+
+        Args:
+            player_id: NBA player id
+            game_date: date-like value; compared on YYYY-MM-DD
+            stat_type: points/assists/rebounds/pra
+            book: optional sportsbook title to filter
+            agg: one of median/mean/min/max for multi-book aggregation
+
+        Returns:
+            float | None
+        """
+        if isinstance(game_date, (pd.Timestamp, datetime)):
+            game_date = game_date.strftime("%Y-%m-%d")
+        else:
+            game_date = str(game_date)[:10]
+
+        if book:
+            query = """
+                SELECT line_value
+                FROM betting_lines
+                WHERE player_id = ?
+                  AND game_date = ?
+                  AND stat_type = ?
+                  AND book = ?
+            """
+            params = (player_id, game_date, stat_type, book)
+        else:
+            query = """
+                SELECT line_value
+                FROM betting_lines
+                WHERE player_id = ?
+                  AND game_date = ?
+                  AND stat_type = ?
+            """
+            params = (player_id, game_date, stat_type)
+
+        rows = [r[0] for r in self.conn.execute(query, params).fetchall() if r and r[0] is not None]
+        if not rows:
+            return None
+
+        series = pd.Series(rows, dtype="float64")
+        agg_key = (agg or "median").lower()
+        if agg_key == "mean":
+            return float(series.mean())
+        if agg_key == "min":
+            return float(series.min())
+        if agg_key == "max":
+            return float(series.max())
+        return float(series.median())
 
     def get_team_defense(self, team_abbrev, season=None):
         """

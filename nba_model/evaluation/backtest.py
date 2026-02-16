@@ -29,7 +29,11 @@ class Backtester:
         defense_sensitivity=0.4,
         back_to_back_penalty=0.06,
         home_away_blend=0.25,
-        min_home_away_games=5
+        min_home_away_games=5,
+        use_market_lines=False,
+        require_market_line=False,
+        market_book=None,
+        market_line_agg="median",
     ):
         """
         Args:
@@ -46,6 +50,10 @@ class Backtester:
         self.back_to_back_penalty = back_to_back_penalty
         self.home_away_blend = home_away_blend
         self.min_home_away_games = min_home_away_games
+        self.use_market_lines = use_market_lines
+        self.require_market_line = require_market_line
+        self.market_book = market_book
+        self.market_line_agg = market_line_agg
         self.results = []
         self.loader = DataLoader()
         self.db = DatabaseManager()
@@ -285,7 +293,30 @@ class Backtester:
 
             # Compare to actual result
             actual_value = game[self.stat_type]
-            line = self.line_value or prediction['expected_value']
+            market_line = None
+            if self.use_market_lines:
+                getter = getattr(self.db, "get_market_line", None)
+                if callable(getter):
+                    market_line = getter(
+                        player_id=player_id,
+                        game_date=game_date,
+                        stat_type=self.stat_type,
+                        book=self.market_book,
+                        agg=self.market_line_agg,
+                    )
+
+            if self.require_market_line and market_line is None and self.line_value is None:
+                continue
+
+            if self.line_value is not None:
+                line = self.line_value
+                line_source = "fixed"
+            elif market_line is not None:
+                line = market_line
+                line_source = "market"
+            else:
+                line = prediction['expected_value']
+                line_source = "model"
 
             outcome = self._evaluate_outcome(actual_value, line, prediction['prob_over'])
 
@@ -298,6 +329,7 @@ class Backtester:
                 'predicted_std': prediction['std_dev'],
                 'prob_over': prediction['prob_over'],
                 'line': line,
+                'line_source': line_source,
                 'actual_value': actual_value,
                 'outcome': outcome['result'],  # 'over', 'under', 'push'
                 'bet_recommendation': outcome['bet'],  # 'over', 'under', 'none'
@@ -480,6 +512,9 @@ class Backtester:
             'sharpe_ratio': sharpe,
             'brier_score': brier_score,
             'avg_prob_over': df['prob_over'].mean(),
+            'market_line_games': int((df['line_source'] == 'market').sum()) if 'line_source' in df.columns else 0,
+            'fixed_line_games': int((df['line_source'] == 'fixed').sum()) if 'line_source' in df.columns else 0,
+            'model_line_games': int((df['line_source'] == 'model').sum()) if 'line_source' in df.columns else 0,
         }
 
         return metrics
