@@ -42,3 +42,6 @@ data/raw/
 # Logs
 *.log
 logs/
+
+# Environment variables
+.env

@@ -86,9 +86,16 @@ class DatabaseManager:
         Args:
             records: Iterable of dicts with keys:
                 player_id, game_date, book, stat_type, line_value, over_odds, under_odds
+
+        Returns:
+            dict: Insert summary with keys inserted, duplicates_ignored, attempted.
         """
         if not records:
-            return
+            return {
+                "inserted": 0,
+                "duplicates_ignored": 0,
+                "attempted": 0,
+            }
 
         query = """
             INSERT INTO betting_lines
@@ -123,7 +130,11 @@ class DatabaseManager:
             payload.append(row + row)
 
         if not payload:
-            return
+            return {
+                "inserted": 0,
+                "duplicates_ignored": 0,
+                "attempted": 0,
+            }
 
         before_changes = self.conn.total_changes
         self.conn.executemany(query, payload)
@@ -131,6 +142,11 @@ class DatabaseManager:
         inserted = self.conn.total_changes - before_changes
         ignored = len(payload) - inserted
         logger.info(f"✓ Inserted {inserted} betting_lines rows ({ignored} duplicates ignored)")
+        return {
+            "inserted": int(inserted),
+            "duplicates_ignored": int(ignored),
+            "attempted": int(len(payload)),
+        }
 
     def insert_game_logs(self, game_logs_df):
         """

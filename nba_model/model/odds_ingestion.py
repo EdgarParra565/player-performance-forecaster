@@ -1,6 +1,7 @@
 """Sportsbook odds ingestion utilities (The Odds API)."""
 
 import argparse
+from collections import Counter
 import logging
 import os
 import time
@@ -16,12 +17,17 @@ from nba_model.data.database.db_manager import DatabaseManager
 logger = logging.getLogger(__name__)
 
 BASE_URL = "https://api.the-odds-api.com/v4"
+DEFAULT_REQUEST_TIMEOUT = 25
+DEFAULT_REQUEST_RETRIES = 2
+DEFAULT_REQUEST_RETRY_DELAY_SECONDS = 0.75
+DEFAULT_REQUEST_RETRY_BACKOFF = 2.0
 PLAYER_PROP_MARKETS = {
     "player_points": "points",
     "player_assists": "assists",
     "player_rebounds": "rebounds",
     "player_points_rebounds_assists": "pra",
 }
+VALID_STAT_TYPES = set(PLAYER_PROP_MARKETS.values())
 
 
 def _default_api_key() -> Optional[str]:
@@ -37,15 +43,165 @@ def _are_player_prop_markets(markets: List[str]) -> bool:
     return all(m in allowed for m in markets)
 
 
-def _get_json(url: str, params: dict, timeout: int = 25):
-    """Execute GET request and return JSON payload with basic error handling."""
-    response = requests.get(url, params=params, timeout=timeout)
+def _coerce_int(value) -> Optional[int]:
+    """Safely coerce value to int."""
+    if value is None:
+        return None
     try:
-        response.raise_for_status()
-    except requests.HTTPError as exc:
-        snippet = response.text[:500] if response.text else ""
-        raise requests.HTTPError(f"{exc} | response={snippet}") from exc
-    return response.json()
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _coerce_float(value) -> Optional[float]:
+    """Safely coerce value to float."""
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _normalize_game_date(value) -> Optional[str]:
+    """Normalize candidate date input to YYYY-MM-DD."""
+    if value is None:
+        return None
+    ts = pd.to_datetime(value, errors="coerce", utc=True)
+    if pd.isna(ts):
+        return None
+    return ts.strftime("%Y-%m-%d")
+
+
+def _dedupe_records(records: List[dict]) -> Tuple[List[dict], int]:
+    """Deduplicate betting-line records and return (records, duplicates_removed)."""
+    deduped = []
+    seen = set()
+    duplicates_removed = 0
+
+    for rec in records:
+        key = (
+            rec.get("player_id"),
+            rec.get("game_date"),
+            rec.get("book"),
+            rec.get("stat_type"),
+            rec.get("line_value"),
+            rec.get("over_odds"),
+            rec.get("under_odds"),
+        )
+        if key in seen:
+            duplicates_removed += 1
+            continue
+        seen.add(key)
+        deduped.append(rec)
+
+    return deduped, duplicates_removed
+
+
+def validate_betting_line_records(records: List[dict]) -> Tuple[List[dict], dict]:
+    """
+    Validate and sanitize normalized betting-line records.
+
+    Returns:
+        valid_records, validation_summary
+    """
+    valid_records = []
+    invalid_reasons = Counter()
+
+    for rec in records:
+        if not isinstance(rec, dict):
+            invalid_reasons["invalid_record_type"] += 1
+            continue
+
+        player_id = _coerce_int(rec.get("player_id"))
+        game_date = _normalize_game_date(rec.get("game_date"))
+        book = str(rec.get("book", "")).strip()
+        stat_type = str(rec.get("stat_type", "")).strip().lower()
+        line_value = _coerce_float(rec.get("line_value"))
+        over_odds = _coerce_int(rec.get("over_odds"))
+        under_odds = _coerce_int(rec.get("under_odds"))
+        player_name = str(rec.get("player_name", "")).strip() or None
+
+        row_errors = []
+        if player_id is None or player_id <= 0:
+            row_errors.append("invalid_player_id")
+        if game_date is None:
+            row_errors.append("invalid_game_date")
+        if not book:
+            row_errors.append("invalid_book")
+        if stat_type not in VALID_STAT_TYPES:
+            row_errors.append("invalid_stat_type")
+        if line_value is None:
+            row_errors.append("invalid_line_value")
+        if rec.get("over_odds") is not None and over_odds is None:
+            row_errors.append("invalid_over_odds")
+        if rec.get("under_odds") is not None and under_odds is None:
+            row_errors.append("invalid_under_odds")
+
+        if row_errors:
+            for reason in row_errors:
+                invalid_reasons[reason] += 1
+            continue
+
+        valid_records.append(
+            {
+                "player_id": int(player_id),
+                "player_name": player_name,
+                "game_date": game_date,
+                "book": book,
+                "stat_type": stat_type,
+                "line_value": float(line_value),
+                "over_odds": over_odds,
+                "under_odds": under_odds,
+            }
+        )
+
+    summary = {
+        "records_received": int(len(records)),
+        "records_valid": int(len(valid_records)),
+        "records_invalid": int(len(records) - len(valid_records)),
+        "invalid_reason_counts": dict(invalid_reasons),
+    }
+    return valid_records, summary
+
+
+def _get_json(
+    url: str,
+    params: dict,
+    timeout: int = DEFAULT_REQUEST_TIMEOUT,
+    retries: int = DEFAULT_REQUEST_RETRIES,
+    retry_delay_seconds: float = DEFAULT_REQUEST_RETRY_DELAY_SECONDS,
+    retry_backoff: float = DEFAULT_REQUEST_RETRY_BACKOFF,
+):
+    """Execute GET request with retry policy and return parsed JSON payload."""
+    attempts = max(1, int(retries) + 1)
+    base_delay = max(0.0, float(retry_delay_seconds))
+    backoff = max(1.0, float(retry_backoff))
+    last_exc: Optional[Exception] = None
+
+    for attempt in range(1, attempts + 1):
+        try:
+            response = requests.get(url, params=params, timeout=timeout)
+            response.raise_for_status()
+            return response.json()
+        except requests.HTTPError as exc:
+            snippet = exc.response.text[:500] if getattr(exc, "response", None) is not None else ""
+            last_exc = requests.HTTPError(f"{exc} | response={snippet}")
+        except (requests.RequestException, ValueError) as exc:
+            last_exc = exc
+
+        if attempt < attempts:
+            delay = base_delay * (backoff ** (attempt - 1))
+            logger.warning(
+                f"Request failed ({attempt}/{attempts}) for {url}: {last_exc}. "
+                f"Retrying in {delay:.2f}s."
+            )
+            if delay > 0:
+                time.sleep(delay)
+
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("Unknown request error without captured exception")
 
 
 def _extract_api_message(payload) -> Optional[str]:
@@ -59,11 +215,25 @@ def _extract_api_message(payload) -> Optional[str]:
     return None
 
 
-def fetch_events(api_key: str, sport: str = "basketball_nba") -> list:
+def fetch_events(
+    api_key: str,
+    sport: str = "basketball_nba",
+    request_timeout: int = DEFAULT_REQUEST_TIMEOUT,
+    request_retries: int = DEFAULT_REQUEST_RETRIES,
+    request_retry_delay_seconds: float = DEFAULT_REQUEST_RETRY_DELAY_SECONDS,
+    request_retry_backoff: float = DEFAULT_REQUEST_RETRY_BACKOFF,
+) -> list:
     """Fetch upcoming events for a sport from The Odds API."""
     url = f"{BASE_URL}/sports/{sport}/events"
     params = {"apiKey": api_key, "dateFormat": "iso"}
-    data = _get_json(url, params)
+    data = _get_json(
+        url,
+        params,
+        timeout=request_timeout,
+        retries=request_retries,
+        retry_delay_seconds=request_retry_delay_seconds,
+        retry_backoff=request_retry_backoff,
+    )
     if isinstance(data, list):
         return data
     message = _extract_api_message(data)
@@ -76,6 +246,10 @@ def fetch_events_from_sport_odds(
     api_key: str,
     sport: str = "basketball_nba",
     regions: str = "us",
+    request_timeout: int = DEFAULT_REQUEST_TIMEOUT,
+    request_retries: int = DEFAULT_REQUEST_RETRIES,
+    request_retry_delay_seconds: float = DEFAULT_REQUEST_RETRY_DELAY_SECONDS,
+    request_retry_backoff: float = DEFAULT_REQUEST_RETRY_BACKOFF,
 ) -> list:
     """
     Fallback event discovery using sport odds endpoint with h2h market.
@@ -90,7 +264,14 @@ def fetch_events_from_sport_odds(
         "oddsFormat": "american",
         "dateFormat": "iso",
     }
-    data = _get_json(url, params)
+    data = _get_json(
+        url,
+        params,
+        timeout=request_timeout,
+        retries=request_retries,
+        retry_delay_seconds=request_retry_delay_seconds,
+        retry_backoff=request_retry_backoff,
+    )
     if isinstance(data, list):
         return data
     message = _extract_api_message(data)
@@ -105,6 +286,10 @@ def fetch_sport_player_props(
     regions: str = "us",
     markets: Optional[List[str]] = None,
     bookmakers: Optional[List[str]] = None,
+    request_timeout: int = DEFAULT_REQUEST_TIMEOUT,
+    request_retries: int = DEFAULT_REQUEST_RETRIES,
+    request_retry_delay_seconds: float = DEFAULT_REQUEST_RETRY_DELAY_SECONDS,
+    request_retry_backoff: float = DEFAULT_REQUEST_RETRY_BACKOFF,
 ) -> list:
     """
     Fetch sport-level odds payload for requested player prop markets.
@@ -121,7 +306,14 @@ def fetch_sport_player_props(
     }
     if bookmakers:
         params["bookmakers"] = ",".join(bookmakers)
-    data = _get_json(url, params)
+    data = _get_json(
+        url,
+        params,
+        timeout=request_timeout,
+        retries=request_retries,
+        retry_delay_seconds=request_retry_delay_seconds,
+        retry_backoff=request_retry_backoff,
+    )
     if isinstance(data, list):
         return data
     message = _extract_api_message(data)
@@ -137,6 +329,10 @@ def fetch_event_player_props(
     regions: str = "us",
     markets: Optional[List[str]] = None,
     bookmakers: Optional[List[str]] = None,
+    request_timeout: int = DEFAULT_REQUEST_TIMEOUT,
+    request_retries: int = DEFAULT_REQUEST_RETRIES,
+    request_retry_delay_seconds: float = DEFAULT_REQUEST_RETRY_DELAY_SECONDS,
+    request_retry_backoff: float = DEFAULT_REQUEST_RETRY_BACKOFF,
 ) -> dict:
     """Fetch player-prop odds for one event."""
     url = f"{BASE_URL}/sports/{sport}/events/{event_id}/odds"
@@ -149,7 +345,14 @@ def fetch_event_player_props(
     }
     if bookmakers:
         params["bookmakers"] = ",".join(bookmakers)
-    data = _get_json(url, params)
+    data = _get_json(
+        url,
+        params,
+        timeout=request_timeout,
+        retries=request_retries,
+        retry_delay_seconds=request_retry_delay_seconds,
+        retry_backoff=request_retry_backoff,
+    )
     if isinstance(data, dict):
         message = _extract_api_message(data)
         # Event payloads are dicts as well; only raise when API explicitly reports an error.
@@ -278,6 +481,10 @@ def fetch_and_store_betting_lines(
     db_path: str = "data/database/nba_data.db",
     max_events: Optional[int] = None,
     sleep_seconds: float = 0.15,
+    request_timeout: int = DEFAULT_REQUEST_TIMEOUT,
+    request_retries: int = DEFAULT_REQUEST_RETRIES,
+    request_retry_delay_seconds: float = DEFAULT_REQUEST_RETRY_DELAY_SECONDS,
+    request_retry_backoff: float = DEFAULT_REQUEST_RETRY_BACKOFF,
 ) -> dict:
     """Fetch upcoming player props and store normalized rows in betting_lines table."""
     selected_markets = markets or list(PLAYER_PROP_MARKETS.keys())
@@ -301,6 +508,10 @@ def fetch_and_store_betting_lines(
                 regions=regions,
                 markets=selected_markets,
                 bookmakers=bookmakers,
+                request_timeout=request_timeout,
+                request_retries=request_retries,
+                request_retry_delay_seconds=request_retry_delay_seconds,
+                request_retry_backoff=request_retry_backoff,
             )
         except Exception as exc:
             logger.warning(f"Sport-level odds fetch failed: {exc}")
@@ -320,14 +531,29 @@ def fetch_and_store_betting_lines(
     else:
         # Fallback path: get event ids then pull per-event odds payloads.
         try:
-            events = fetch_events(api_key=api_key, sport=sport)
+            events = fetch_events(
+                api_key=api_key,
+                sport=sport,
+                request_timeout=request_timeout,
+                request_retries=request_retries,
+                request_retry_delay_seconds=request_retry_delay_seconds,
+                request_retry_backoff=request_retry_backoff,
+            )
         except Exception as exc:
             logger.warning(f"Direct events fetch failed: {exc}")
             events = []
 
         if not events:
             try:
-                events = fetch_events_from_sport_odds(api_key=api_key, sport=sport, regions=regions)
+                events = fetch_events_from_sport_odds(
+                    api_key=api_key,
+                    sport=sport,
+                    regions=regions,
+                    request_timeout=request_timeout,
+                    request_retries=request_retries,
+                    request_retry_delay_seconds=request_retry_delay_seconds,
+                    request_retry_backoff=request_retry_backoff,
+                )
                 if events:
                     logger.info("Discovered events via sport odds fallback (h2h).")
             except Exception as exc:
@@ -354,6 +580,10 @@ def fetch_and_store_betting_lines(
                     regions=regions,
                     markets=selected_markets,
                     bookmakers=bookmakers,
+                    request_timeout=request_timeout,
+                    request_retries=request_retries,
+                    request_retry_delay_seconds=request_retry_delay_seconds,
+                    request_retry_backoff=request_retry_backoff,
                 )
             except Exception as exc:
                 logger.warning(f"Skipping event {event_id}: {exc}")
@@ -368,14 +598,23 @@ def fetch_and_store_betting_lines(
             if sleep_seconds > 0:
                 time.sleep(sleep_seconds)
 
+    valid_records, validation_summary = validate_betting_line_records(all_records)
+    deduped_records, duplicates_in_payload = _dedupe_records(valid_records)
+
+    db_insert_summary = {
+        "inserted": 0,
+        "duplicates_ignored": 0,
+        "attempted": 0,
+    }
     with DatabaseManager(db_path=db_path) as db:
         seen_players = {}
-        for row in all_records:
+        for row in deduped_records:
             pid = row["player_id"]
-            if pid not in seen_players:
+            player_name = row.get("player_name")
+            if pid not in seen_players and player_name:
                 seen_players[pid] = row["player_name"]
                 db.insert_player(pid, row["player_name"])
-        db.insert_betting_lines_records(all_records)
+        db_insert_summary = db.insert_betting_lines_records(deduped_records)
 
     events_with_books = sum(1 for event in events if isinstance(event, dict) and event.get("bookmakers"))
 
@@ -388,7 +627,14 @@ def fetch_and_store_betting_lines(
         "diagnostic": diagnostic,
         "markets_requested": selected_markets,
         "records_parsed": len(all_records),
-        "distinct_players": len({r["player_id"] for r in all_records}),
+        "records_valid": validation_summary["records_valid"],
+        "records_invalid": validation_summary["records_invalid"],
+        "invalid_reason_counts": validation_summary["invalid_reason_counts"],
+        "duplicates_in_payload": duplicates_in_payload,
+        "db_attempted": db_insert_summary.get("attempted", 0),
+        "db_inserted": db_insert_summary.get("inserted", 0),
+        "db_duplicates_ignored": db_insert_summary.get("duplicates_ignored", 0),
+        "distinct_players": len({r["player_id"] for r in deduped_records}),
         "unresolved_player_names": sorted(unresolved_names),
     }
 
@@ -408,6 +654,14 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--db-path", default="data/database/nba_data.db")
     parser.add_argument("--max-events", type=int, default=None)
     parser.add_argument("--sleep-seconds", type=float, default=0.15)
+    parser.add_argument("--request-timeout", type=int, default=DEFAULT_REQUEST_TIMEOUT)
+    parser.add_argument("--request-retries", type=int, default=DEFAULT_REQUEST_RETRIES)
+    parser.add_argument(
+        "--request-retry-delay-seconds",
+        type=float,
+        default=DEFAULT_REQUEST_RETRY_DELAY_SECONDS,
+    )
+    parser.add_argument("--request-retry-backoff", type=float, default=DEFAULT_REQUEST_RETRY_BACKOFF)
     return parser
 
 
@@ -428,6 +682,10 @@ def main():
         db_path=args.db_path,
         max_events=args.max_events,
         sleep_seconds=args.sleep_seconds,
+        request_timeout=args.request_timeout,
+        request_retries=args.request_retries,
+        request_retry_delay_seconds=args.request_retry_delay_seconds,
+        request_retry_backoff=args.request_retry_backoff,
     )
     print("Odds ingestion summary:")
     for key, value in summary.items():

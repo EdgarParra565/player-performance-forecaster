@@ -1,4 +1,4 @@
-"""Populate team_defense table from NBA API team stats."""
+"""Populate and validate team_defense table from NBA API team stats."""
 
 import argparse
 import logging
@@ -11,6 +11,8 @@ from nba_api.stats.static import teams as static_teams
 from nba_model.data.database.db_manager import DatabaseManager
 
 logger = logging.getLogger(__name__)
+DEFAULT_SEASON = "2024-25"
+DEFAULT_DB_PATH = "data/database/nba_data.db"
 
 
 def _find_col(df: pd.DataFrame, candidates: list[str]) -> Optional[str]:
@@ -38,6 +40,16 @@ def _team_mappings():
         if nickname and abbr:
             by_name[nickname] = abbr
     return by_id, by_name
+
+
+def _expected_team_abbrevs() -> set[str]:
+    """Return expected NBA team abbreviation set from static metadata."""
+    teams_data = static_teams.get_teams()
+    return {
+        str(team.get("abbreviation", "")).strip().upper()
+        for team in teams_data
+        if str(team.get("abbreviation", "")).strip()
+    }
 
 
 def _resolve_team_abbrev_series(df: pd.DataFrame) -> pd.Series:
@@ -69,7 +81,7 @@ def _resolve_team_abbrev_series(df: pd.DataFrame) -> pd.Series:
     raise KeyError(f"Unable to resolve team abbreviation from columns: {list(df.columns)}")
 
 
-def fetch_team_defense_df(season: str = "2024-25") -> pd.DataFrame:
+def fetch_team_defense_df(season: str = DEFAULT_SEASON) -> pd.DataFrame:
     """
     Fetch NBA team defensive metrics for a season.
 
@@ -106,7 +118,7 @@ def fetch_team_defense_df(season: str = "2024-25") -> pd.DataFrame:
     return rows
 
 
-def populate_team_defense(season: str = "2024-25", db_path: str = "data/database/nba_data.db") -> int:
+def populate_team_defense(season: str = DEFAULT_SEASON, db_path: str = DEFAULT_DB_PATH) -> int:
     """Fetch and upsert team defense rows into SQLite."""
     rows = fetch_team_defense_df(season=season)
     records = rows.to_dict(orient="records")
@@ -116,17 +128,112 @@ def populate_team_defense(season: str = "2024-25", db_path: str = "data/database
     return len(records)
 
 
+def build_team_defense_validation_report(
+    season: Optional[str] = DEFAULT_SEASON,
+    db_path: str = DEFAULT_DB_PATH,
+) -> dict:
+    """
+    Build lightweight integrity report for team_defense coverage.
+
+    Report fields include row count, unique teams present, missing teams and
+    latest update timestamp for the requested season.
+    """
+    where_clause = "WHERE season = ?" if season else ""
+    params = (season,) if season else ()
+
+    with DatabaseManager(db_path=db_path) as db:
+        row_count = db.conn.execute(
+            f"SELECT COUNT(*) FROM team_defense {where_clause}",
+            params,
+        ).fetchone()[0]
+        latest_updated = db.conn.execute(
+            f"SELECT MAX(last_updated) FROM team_defense {where_clause}",
+            params,
+        ).fetchone()[0]
+        rows = db.conn.execute(
+            f"SELECT team_abbrev FROM team_defense {where_clause}",
+            params,
+        ).fetchall()
+
+    loaded_teams = {
+        str(row[0]).strip().upper()
+        for row in rows
+        if row and row[0] and str(row[0]).strip()
+    }
+    expected_teams = _expected_team_abbrevs()
+    missing_teams = sorted(expected_teams - loaded_teams)
+    unexpected_teams = sorted(loaded_teams - expected_teams)
+
+    return {
+        "season": season,
+        "row_count": int(row_count or 0),
+        "team_count": len(loaded_teams),
+        "expected_team_count": len(expected_teams),
+        "missing_teams": missing_teams,
+        "unexpected_teams": unexpected_teams,
+        "latest_updated": latest_updated,
+        "is_complete": (
+            len(loaded_teams) == len(expected_teams)
+            and not missing_teams
+            and not unexpected_teams
+        ),
+    }
+
+
+def print_team_defense_validation_report(report: dict) -> None:
+    """Print a concise validation report for team_defense coverage."""
+    season_label = report.get("season") or "all seasons"
+    print("\nTeam defense validation")
+    print(f"Season: {season_label}")
+    print(f"Rows: {report.get('row_count', 0)}")
+    print(
+        "Teams present: "
+        f"{report.get('team_count', 0)}/{report.get('expected_team_count', 0)}"
+    )
+    print(f"Latest update: {report.get('latest_updated') or 'N/A'}")
+    missing_teams = report.get("missing_teams") or []
+    unexpected_teams = report.get("unexpected_teams") or []
+    print(f"Missing teams: {', '.join(missing_teams) if missing_teams else 'none'}")
+    print(f"Unexpected teams: {', '.join(unexpected_teams) if unexpected_teams else 'none'}")
+    print(f"Coverage complete: {'yes' if report.get('is_complete') else 'no'}")
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Populate team_defense table from NBA API.")
-    parser.add_argument("--season", default="2024-25")
-    parser.add_argument("--db-path", default="data/database/nba_data.db")
+    parser.add_argument("--season", default=DEFAULT_SEASON)
+    parser.add_argument("--db-path", default=DEFAULT_DB_PATH)
+    parser.add_argument(
+        "--validate-only",
+        action="store_true",
+        help="Skip ingestion and only run validation report.",
+    )
+    parser.add_argument(
+        "--skip-validation",
+        action="store_true",
+        help="Skip post-ingestion validation report.",
+    )
+    parser.add_argument(
+        "--fail-on-missing",
+        action="store_true",
+        help="Exit with code 1 when validation finds missing/unexpected teams.",
+    )
     return parser
 
 
 def main():
     args = _build_parser().parse_args()
-    count = populate_team_defense(season=args.season, db_path=args.db_path)
-    print(f"Inserted/updated team_defense rows: {count}")
+    if not args.validate_only:
+        count = populate_team_defense(season=args.season, db_path=args.db_path)
+        print(f"Inserted/updated team_defense rows: {count}")
+
+    if args.skip_validation:
+        return
+
+    report = build_team_defense_validation_report(season=args.season, db_path=args.db_path)
+    print_team_defense_validation_report(report)
+
+    if args.fail_on_missing and (report["missing_teams"] or report["unexpected_teams"]):
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

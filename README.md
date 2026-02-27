@@ -119,6 +119,70 @@ Notes:
 
 Artifacts are saved under `nba_model/evaluation/artifacts/` with timestamped filenames.
 
+### 5) Daily ETL Runner (Game Logs + Defense + Odds)
+
+Run a single daily pipeline job with retry + JSON report output:
+
+```bash
+python3 -m nba_model.data.daily_etl \
+  --players "LeBron James" "Stephen Curry" \
+  --season 2024-25 \
+  --retries 2 \
+  --retry-delay-seconds 1 \
+  --report-dir nba_model/data/artifacts
+```
+
+Notes:
+- By default, it force-refreshes game logs, updates `team_defense`, and attempts odds ingestion.
+- Odds step auto-skips when no API key is set (`ODDS_API_KEY`/`THE_ODDS_API_KEY`).
+- Use `--strict` for cron jobs to return non-zero exit code on failed/partial runs.
+
+### 6) Real-Data Multi-Player Benchmark (Player/Window CIs)
+
+```bash
+python3 -m nba_model.evaluation.run_real_data_benchmark \
+  --players "LeBron James" "Stephen Curry" "Nikola Jokic" "Luka Doncic" \
+           "Jayson Tatum" "Giannis Antetokounmpo" "Shai Gilgeous-Alexander" \
+           "Kevin Durant" "Anthony Edwards" "Damian Lillard" \
+  --windows 5 7 10 15 \
+  --stat-types points \
+  --distributions normal \
+  --start-date 2024-11-01 \
+  --end-date 2025-03-15
+```
+
+Exports include per-player/window confidence interval artifacts.
+
+### 7) Distribution Sweep Benchmark (ROI + Calibration + Significance)
+
+```bash
+python3 -m nba_model.evaluation.run_distribution_sweep \
+  --windows 5 7 10 15 \
+  --stat-types points assists rebounds pra \
+  --distributions normal student_t binomial poisson exponential uniform lognormal power_law \
+  --start-date 2024-11-01 \
+  --end-date 2025-03-15
+```
+
+Exports include distribution/stat summaries for ROI, Brier score, and significance.
+
+### 8) Line Comparison + Monthly Diagnostics
+
+```bash
+# Cross-book and model-vs-book value comparison
+python3 -m nba_model.evaluation.line_comparison \
+  --start-date 2024-11-01 \
+  --end-date 2025-03-15 \
+  --stat-types points assists rebounds pra \
+  --edge-threshold 0.02
+
+# Monthly drift, drawdown, and calibration diagnostics
+python3 -m nba_model.evaluation.monthly_diagnostics \
+  --start-date 2024-11-01 \
+  --end-date 2025-03-15 \
+  --stat-types points assists rebounds pra
+```
+
 ## Baseline Benchmark Results
 
 Baseline benchmark now runs with the same template across:
@@ -135,11 +199,11 @@ Latest results are generated into:
 
 - Benchmark metrics are synthetic and validate pipeline behavior, not live betting edge.
 - Live NBA API calls require network access when cache/database does not already contain player games.
-- Defense and minutes adjustments are available in model modules, but can still be expanded in backtest logic.
-- Odds ingestion is currently a placeholder integration and not yet productionized.
+- Cross-book/model-vs-book and monthly diagnostics depend on having populated `betting_lines` and `predictions` data.
+- Historical open/close line snapshots are not yet stored, so line-move analysis is still limited.
 
 ## Next Expansion Targets
 
 - Add real multi-player historical benchmarks from cached/live NBA data.
-- Integrate richer context features (rest, home/away, opponent splits, injuries).
-- Expand from points-only baseline to assists/rebounds/PRA evaluation.
+- Expand contextual modeling beyond current rest/travel/injury-proxy heuristics.
+- Extend line comparison to include richer execution constraints and portfolio-level filters.

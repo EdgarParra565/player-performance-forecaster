@@ -7,7 +7,7 @@ import pandas as pd
 
 from nba_model.data.data_loader import DataLoader
 from nba_model.data.database.db_manager import DatabaseManager
-from nba_model.model.feature_engineering import add_rolling_stats
+from nba_model.model.feature_engineering import add_context_features, add_rolling_stats
 from nba_model.model.defense_adjustment import adjust_mu_for_defense
 from nba_model.model.minutes_projection import project_minutes
 from nba_model.model.probability import prob_over_distribution
@@ -283,6 +283,21 @@ class Backtester:
                 projected_minutes *= (1 - self.back_to_back_penalty)
             expected_value = ppm * projected_minutes
 
+        rest_days = self._safe_float(upcoming_game.get('rest_days'))
+        if rest_days is not None:
+            if rest_days >= 3:
+                expected_value *= 1.02
+            elif rest_days >= 2:
+                expected_value *= 1.01
+
+        travel_flag = self._safe_float(upcoming_game.get('travel_flag'))
+        if travel_flag is not None and travel_flag >= 1:
+            expected_value *= 0.99
+
+        injury_proxy = self._safe_float(upcoming_game.get('injury_proxy'))
+        if injury_proxy is not None and injury_proxy > 0:
+            expected_value *= max(0.80, 1.0 - (0.04 * min(injury_proxy, 3.0)))
+
         def_rating = self._get_opponent_def_rating(upcoming_game)
         if def_rating is not None:
             expected_value = adjust_mu_for_defense(
@@ -317,6 +332,7 @@ class Backtester:
             raise KeyError(f"Missing stat column '{self.stat_type}' in loaded game logs")
         all_games['game_date'] = pd.to_datetime(all_games['game_date'])
         all_games = all_games.sort_values('game_date')
+        all_games = add_context_features(all_games)
 
         # Filter to backtest period
         test_games = all_games[
@@ -388,6 +404,9 @@ class Backtester:
                 'line_source': line_source,
                 'spread_value': spread_value,
                 'spread_source': spread_source,
+                'rest_days': self._safe_float(upcoming_game.get('rest_days')),
+                'travel_flag': int(self._safe_float(upcoming_game.get('travel_flag')) or 0),
+                'injury_proxy': self._safe_float(upcoming_game.get('injury_proxy')) or 0.0,
                 'actual_value': actual_value,
                 'outcome': outcome['result'],  # 'over', 'under', 'push'
                 'bet_recommendation': outcome['bet'],  # 'over', 'under', 'none'
@@ -607,6 +626,7 @@ class Backtester:
                 'back_to_back_penalty': float(self.back_to_back_penalty),
                 'home_away_blend': float(self.home_away_blend),
                 'min_home_away_games': int(self.min_home_away_games),
+                'context_features_enabled': True,
             }
             prediction_data = {
                 'player_id': result['player_id'],
