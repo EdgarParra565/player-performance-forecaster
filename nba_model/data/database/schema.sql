@@ -66,6 +66,24 @@ CREATE TABLE IF NOT EXISTS betting_lines (
     FOREIGN KEY (player_id) REFERENCES players(player_id)
 );
 
+-- Betting line snapshots (historical open/close timeline with timestamps)
+CREATE TABLE IF NOT EXISTS betting_line_snapshots (
+    snapshot_id     INTEGER PRIMARY KEY AUTOINCREMENT,
+    snapshot_ts_utc TIMESTAMP NOT NULL,
+    event_id        TEXT,
+    game_date       DATE NOT NULL,
+    player_id       INTEGER NOT NULL,
+    book            TEXT NOT NULL,
+    market_key      TEXT NOT NULL,
+    stat_type       TEXT NOT NULL,
+    line_value      REAL NOT NULL,
+    over_odds       INTEGER,
+    under_odds      INTEGER,
+    raw_payload     TEXT,
+    created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (player_id) REFERENCES players(player_id)
+);
+
 -- Model predictions (for evaluation)
 CREATE TABLE IF NOT EXISTS predictions (
     prediction_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -98,3 +116,6 @@ CREATE INDEX IF NOT EXISTS idx_game_logs_player_date ON game_logs(player_id, gam
 CREATE INDEX IF NOT EXISTS idx_predictions_date ON predictions(game_date DESC);
 CREATE INDEX IF NOT EXISTS idx_betting_lines_player_date ON betting_lines(player_id, game_date);
 CREATE INDEX IF NOT EXISTS idx_prediction_configs_prediction_id ON prediction_configs(prediction_id);
+CREATE INDEX IF NOT EXISTS idx_snapshots_game_book_stat ON betting_line_snapshots(game_date, book, stat_type);
+CREATE INDEX IF NOT EXISTS idx_snapshots_player_date ON betting_line_snapshots(player_id, game_date, stat_type);
+CREATE INDEX IF NOT EXISTS idx_snapshots_event_book ON betting_line_snapshots(event_id, book, market_key, snapshot_ts_utc);

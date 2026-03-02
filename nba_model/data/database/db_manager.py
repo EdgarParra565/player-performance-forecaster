@@ -148,6 +148,75 @@ class DatabaseManager:
             "attempted": int(len(payload)),
         }
 
+    def insert_betting_line_snapshots(self, records):
+        """
+        Insert betting line snapshots (no de-duplication; time-series storage).
+
+        Args:
+            records: Iterable of dicts with keys:
+                snapshot_ts_utc, event_id, game_date, player_id,
+                book, market_key, stat_type, line_value,
+                over_odds, under_odds, raw_payload (optional)
+        """
+        if not records:
+            return {
+                "inserted": 0,
+                "attempted": 0,
+            }
+
+        query = """
+            INSERT INTO betting_line_snapshots (
+                snapshot_ts_utc,
+                event_id,
+                game_date,
+                player_id,
+                book,
+                market_key,
+                stat_type,
+                line_value,
+                over_odds,
+                under_odds,
+                raw_payload
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """
+
+        payload = []
+        for rec in records:
+            row = (
+                rec.get("snapshot_ts_utc"),
+                rec.get("event_id"),
+                rec.get("game_date"),
+                rec.get("player_id"),
+                rec.get("book"),
+                rec.get("market_key"),
+                rec.get("stat_type"),
+                rec.get("line_value"),
+                rec.get("over_odds"),
+                rec.get("under_odds"),
+                rec.get("raw_payload"),
+            )
+            # Require minimal core fields.
+            if not all([row[0], row[2], row[3], row[4], row[5], row[6]]) or row[7] is None:
+                continue
+            payload.append(row)
+
+        if not payload:
+            return {
+                "inserted": 0,
+                "attempted": 0,
+            }
+
+        before_changes = self.conn.total_changes
+        self.conn.executemany(query, payload)
+        self.conn.commit()
+        inserted = self.conn.total_changes - before_changes
+        logger.info(f"✓ Inserted {inserted} betting_line_snapshots rows")
+        return {
+            "inserted": int(inserted),
+            "attempted": int(len(payload)),
+        }
+
     def insert_game_logs(self, game_logs_df):
         """
         Bulk insert game logs from DataFrame.

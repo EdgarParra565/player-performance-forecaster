@@ -153,6 +153,8 @@ def validate_betting_line_records(records: List[dict]) -> Tuple[List[dict], dict
                 "line_value": float(line_value),
                 "over_odds": over_odds,
                 "under_odds": under_odds,
+                "event_id": rec.get("event_id"),
+                "market_key": rec.get("market_key"),
             }
         )
 
@@ -416,11 +418,13 @@ def normalize_event_player_props(
     records = []
     missing_players = []
     game_date = _parse_game_date(event_payload.get("commence_time", ""))
+    event_id = event_payload.get("id")
 
     for bookmaker in event_payload.get("bookmakers", []):
         book_name = bookmaker.get("title") or bookmaker.get("key")
         for market in bookmaker.get("markets", []):
-            stat_type = PLAYER_PROP_MARKETS.get(market.get("key"))
+            market_key = market.get("key")
+            stat_type = PLAYER_PROP_MARKETS.get(market_key)
             if not stat_type:
                 continue
 
@@ -467,6 +471,8 @@ def normalize_event_player_props(
                         "line_value": row["line_value"],
                         "over_odds": row["over_odds"],
                         "under_odds": row["under_odds"],
+                        "event_id": event_id,
+                        "market_key": market_key,
                     }
                 )
     return records, sorted(set(missing_players))
@@ -485,6 +491,7 @@ def fetch_and_store_betting_lines(
     request_retries: int = DEFAULT_REQUEST_RETRIES,
     request_retry_delay_seconds: float = DEFAULT_REQUEST_RETRY_DELAY_SECONDS,
     request_retry_backoff: float = DEFAULT_REQUEST_RETRY_BACKOFF,
+    write_snapshots: bool = True,
 ) -> dict:
     """Fetch upcoming player props and store normalized rows in betting_lines table."""
     selected_markets = markets or list(PLAYER_PROP_MARKETS.keys())
@@ -601,9 +608,15 @@ def fetch_and_store_betting_lines(
     valid_records, validation_summary = validate_betting_line_records(all_records)
     deduped_records, duplicates_in_payload = _dedupe_records(valid_records)
 
+    snapshot_ts_utc = datetime.now(timezone.utc).isoformat()
+
     db_insert_summary = {
         "inserted": 0,
         "duplicates_ignored": 0,
+        "attempted": 0,
+    }
+    snapshot_insert_summary = {
+        "inserted": 0,
         "attempted": 0,
     }
     with DatabaseManager(db_path=db_path) as db:
@@ -615,6 +628,26 @@ def fetch_and_store_betting_lines(
                 seen_players[pid] = row["player_name"]
                 db.insert_player(pid, row["player_name"])
         db_insert_summary = db.insert_betting_lines_records(deduped_records)
+
+        if write_snapshots and valid_records:
+            snapshot_records = []
+            for rec in valid_records:
+                snapshot_records.append(
+                    {
+                        "snapshot_ts_utc": snapshot_ts_utc,
+                        "event_id": rec.get("event_id"),
+                        "game_date": rec.get("game_date"),
+                        "player_id": rec.get("player_id"),
+                        "book": rec.get("book"),
+                        "market_key": rec.get("market_key") or "",
+                        "stat_type": rec.get("stat_type"),
+                        "line_value": rec.get("line_value"),
+                        "over_odds": rec.get("over_odds"),
+                        "under_odds": rec.get("under_odds"),
+                        "raw_payload": None,
+                    }
+                )
+            snapshot_insert_summary = db.insert_betting_line_snapshots(snapshot_records)
 
     events_with_books = sum(1 for event in events if isinstance(event, dict) and event.get("bookmakers"))
 
@@ -636,6 +669,8 @@ def fetch_and_store_betting_lines(
         "db_duplicates_ignored": db_insert_summary.get("duplicates_ignored", 0),
         "distinct_players": len({r["player_id"] for r in deduped_records}),
         "unresolved_player_names": sorted(unresolved_names),
+        "snapshots_attempted": snapshot_insert_summary.get("attempted", 0),
+        "snapshots_inserted": snapshot_insert_summary.get("inserted", 0),
     }
 
 

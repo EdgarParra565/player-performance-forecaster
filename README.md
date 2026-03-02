@@ -137,6 +137,19 @@ Notes:
 - Odds step auto-skips when no API key is set (`ODDS_API_KEY`/`THE_ODDS_API_KEY`).
 - Use `--strict` for cron jobs to return non-zero exit code on failed/partial runs.
 
+#### 5b) Automated Daily ETL (GitHub Actions)
+
+This repository includes a scheduled GitHub Actions workflow (`.github/workflows/daily_etl.yml`) that runs the daily ETL once per day:
+
+- **Schedule**: 08:00 UTC (configurable via the `cron` line in the workflow).
+- **Command**: `python -m nba_model.data.daily_etl --strict`
+- **Required secret**: `ODDS_API_KEY` (configure in your GitHub repository Settings → Secrets and variables → Actions).
+
+Daily ETL runs emit:
+
+- A structured JSON report under `nba_model/data/artifacts/`.
+- A timestamped log file under `nba_model/data/logs/` (e.g. `daily_etl_YYYYMMDD_HHMMSS.log`).
+
 ### 6) Real-Data Multi-Player Benchmark (Player/Window CIs)
 
 ```bash
@@ -183,6 +196,51 @@ python3 -m nba_model.evaluation.monthly_diagnostics \
   --stat-types points assists rebounds pra
 ```
 
+### 9) Prop Board Generator (All Player Props for a Game)
+
+Generate a prop-style board for all available player props (both teams) for a given game/date, using rolling-history projections and the per-stat default distributions:
+
+```bash
+python3 -m nba_model.model.prop_board \
+  --game-date 2025-03-01 \
+  --home-team LAL \
+  --away-team BOS \
+  --stat-types points assists rebounds pra \
+  --db-path data/database/nba_data.db
+```
+
+Outputs a CSV (to stdout by default) with one row per player/stat/line, including:
+
+- projected `mu` and `sigma`
+- chosen `distribution` (from `DEFAULT_DISTRIBUTION_BY_STAT`)
+- model `prob_over`
+- implied probabilities from book odds
+- EV for both over and under.
+
+### 10) Market Data Quality + CLV Proxy
+
+Run basic data-quality checks on `betting_lines` and `betting_line_snapshots`:
+
+```bash
+python3 -m nba_model.evaluation.market_data_quality \
+  --db-path data/database/nba_data.db \
+  --max-snapshot-age-hours 6
+```
+
+This produces a JSON summary under `nba_model/evaluation/artifacts/` with counts of missing fields, duplicate snapshots, and a simple snapshot freshness flag.
+
+Compute a simple CLV-style proxy from historical line snapshots:
+
+```bash
+python3 -m nba_model.evaluation.clv_proxy \
+  --db-path data/database/nba_data.db \
+  --start-date 2024-11-01 \
+  --end-date 2025-03-15 \
+  --stat-types points assists rebounds pra
+```
+
+This exports a CSV with open/close line/odds and implied-prob changes per `(player, game_date, stat_type, book, market_key)` that can be joined with model signals offline.
+
 ## Production defaults (from benchmarks)
 
 Default distribution per stat type is defined in `nba_model/model/simulation.py` as `DEFAULT_DISTRIBUTION_BY_STAT`. These should be set after running the real-data benchmark and distribution sweep and reviewing artifacts:
@@ -227,6 +285,22 @@ Latest results are generated into:
 - Live NBA API calls require network access when cache/database does not already contain player games.
 - Cross-book/model-vs-book and monthly diagnostics depend on having populated `betting_lines` and `predictions` data.
 - Historical open/close line snapshots are not yet stored, so line-move analysis is still limited.
+
+## Operational Runbook (ETL & Odds Ingestion)
+
+- **Check scheduler health**:
+  - Verify the `Daily NBA ETL` GitHub Actions workflow is running on schedule and succeeding.
+  - On failures, inspect the workflow logs and the local ETL log file path printed at the end of the run.
+- **Inspect ETL artifacts**:
+  - JSON ETL reports are stored under `nba_model/data/artifacts/` and include per-step statuses and errors.
+  - Detailed ETL logs are stored under `nba_model/data/logs/`.
+- **Handling Odds API issues**:
+  - Confirm `ODDS_API_KEY` is present and valid (locally via environment variable; in CI via GitHub secret).
+  - Review ETL report `steps["odds"]` payload for API error messages and retry behavior.
+  - If The Odds API is unavailable, rerun ETL later; game logs and team defense can still be refreshed with `--skip-odds`.
+- **Recovering from partial/failed runs**:
+  - Use `--strict` in automated contexts so failures surface as non-zero exit codes.
+  - For manual recovery, rerun ETL for a narrower player set or with `--use-cache-for-game-logs` to reduce load.
 
 ## Next Expansion Targets
 

@@ -1,0 +1,57 @@
+name: Daily NBA ETL
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Run once per day at 08:00 UTC (adjust as needed)
+    - cron: "0 8 * * *"
+
+jobs:
+  daily-etl:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m venv .venv
+          source .venv/bin/activate
+          pip install --upgrade pip
+          pip install -e .
+
+      - name: Run daily ETL
+        env:
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+        run: |
+          source .venv/bin/activate
+          python -m nba_model.data.daily_etl --strict
+
+      - name: Notify on failure (optional Slack/email webhook)
+        if: failure()
+        env:
+          ETL_ALERT_WEBHOOK: ${{ secrets.ETL_ALERT_WEBHOOK }}
+        run: |
+          if [ -n "$ETL_ALERT_WEBHOOK" ]; then
+            payload=$(jq -n \
+              --arg status "failed" \
+              --arg workflow "$GITHUB_WORKFLOW" \
+              --arg job "$GITHUB_JOB" \
+              --arg run_id "$GITHUB_RUN_ID" \
+              --arg repo "$GITHUB_REPOSITORY" \
+              --arg url "https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+              '{text: ("Daily ETL job \($status) for \($repo). Run: \($url)")}')
+            curl -X POST -H 'Content-type: application/json' --data "$payload" "$ETL_ALERT_WEBHOOK" || true
+          else
+            echo "ETL_ALERT_WEBHOOK not set; skipping external alert."
+          fi
+

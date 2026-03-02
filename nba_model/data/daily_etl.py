@@ -6,9 +6,9 @@ import logging
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Optional
-
 from nba_model.data.data_loader import DataLoader
+from typing import Callable, Optional
+
 from nba_model.data.database.db_manager import DatabaseManager
 from nba_model.data.team_defense_ingestion import (
     build_team_defense_validation_report,
@@ -28,6 +28,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_DB_PATH = "data/database/nba_data.db"
 DEFAULT_REPORT_DIR = "nba_model/data/artifacts"
+DEFAULT_LOG_DIR = "nba_model/data/logs"
 DEFAULT_PLAYERS = [
     "LeBron James",
     "Stephen Curry",
@@ -40,6 +41,33 @@ DEFAULT_PLAYERS = [
 def _utc_now_iso() -> str:
     """Return current UTC timestamp in ISO format."""
     return datetime.now(timezone.utc).isoformat()
+
+
+def configure_logging(log_dir: str = DEFAULT_LOG_DIR, level: int = logging.INFO) -> str:
+    """
+    Configure basic ETL logging to console + file and return log file path.
+    Safe to call multiple times; only the first call configures handlers.
+    """
+    if logging.getLogger().handlers:
+        # Assume logging already configured by caller (tests or application).
+        return ""
+
+    output_dir = Path(log_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    log_path = output_dir / f"daily_etl_{ts}.log"
+
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
+        handlers=[
+            logging.StreamHandler(),
+            logging.FileHandler(log_path, encoding="utf-8"),
+        ],
+    )
+    logger.info("Daily ETL logging initialized",
+                extra={"log_path": str(log_path)})
+    return str(log_path)
 
 
 def _default_nba_season(reference_time: Optional[datetime] = None) -> str:
@@ -228,7 +256,8 @@ def _refresh_game_logs_for_players(
 def _run_team_defense_step(season: str, db_path: str) -> dict:
     """Populate and validate team defense table."""
     rows_upserted = populate_team_defense(season=season, db_path=db_path)
-    validation = build_team_defense_validation_report(season=season, db_path=db_path)
+    validation = build_team_defense_validation_report(
+        season=season, db_path=db_path)
     return {
         "rows_upserted": int(rows_upserted),
         "validation": validation,
@@ -281,7 +310,8 @@ def _write_report(report: dict, report_dir: str = DEFAULT_REPORT_DIR) -> str:
     output_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     path = output_dir / f"daily_etl_report_{ts}.json"
-    path.write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")
+    path.write_text(json.dumps(report, indent=2,
+                    sort_keys=True), encoding="utf-8")
     return str(path)
 
 
@@ -328,7 +358,8 @@ def run_daily_etl(
     steps = {}
 
     if skip_game_logs:
-        steps["game_logs"] = {"status": "skipped", "reason": "Step disabled by flag."}
+        steps["game_logs"] = {"status": "skipped",
+                              "reason": "Step disabled by flag."}
     else:
         def _game_logs_step():
             return _refresh_game_logs_for_players(
@@ -356,11 +387,13 @@ def run_daily_etl(
         steps["game_logs"] = game_logs_step
 
     if skip_team_defense:
-        steps["team_defense"] = {"status": "skipped", "reason": "Step disabled by flag."}
+        steps["team_defense"] = {"status": "skipped",
+                                 "reason": "Step disabled by flag."}
     else:
         team_defense_step = run_with_retry(
             step_name="team_defense",
-            func=lambda: _run_team_defense_step(season=season, db_path=db_path),
+            func=lambda: _run_team_defense_step(
+                season=season, db_path=db_path),
             retries=max(0, retries),
             retry_delay_seconds=retry_delay_seconds,
             retry_backoff=retry_backoff,
@@ -368,7 +401,8 @@ def run_daily_etl(
         steps["team_defense"] = team_defense_step
 
     if skip_odds:
-        steps["odds"] = {"status": "skipped", "reason": "Step disabled by flag."}
+        steps["odds"] = {"status": "skipped",
+                         "reason": "Step disabled by flag."}
     else:
         odds_step = run_with_retry(
             step_name="odds",
@@ -396,9 +430,11 @@ def run_daily_etl(
                 odds_step["status"] = "skipped"
         steps["odds"] = odds_step
 
-    step_statuses = {name: payload.get("status") for name, payload in steps.items()}
+    step_statuses = {name: payload.get("status")
+                     for name, payload in steps.items()}
     has_failures = any(status == "failed" for status in step_statuses.values())
-    has_partial = any(status == "partial_success" for status in step_statuses.values())
+    has_partial = any(
+        status == "partial_success" for status in step_statuses.values())
 
     if has_failures:
         overall_status = "failed"
@@ -428,14 +464,17 @@ def run_daily_etl(
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Run daily ETL for NBA data pipeline.")
-    parser.add_argument("--players", nargs="*", default=None, help="Optional explicit player names.")
+    parser = argparse.ArgumentParser(
+        description="Run daily ETL for NBA data pipeline.")
+    parser.add_argument("--players", nargs="*", default=None,
+                        help="Optional explicit player names.")
     parser.add_argument(
         "--skip-db-players",
         action="store_true",
         help="Do not add players currently stored in the local players table.",
     )
-    parser.add_argument("--player-limit", type=int, default=None, help="Optional cap on total players refreshed.")
+    parser.add_argument("--player-limit", type=int, default=None,
+                        help="Optional cap on total players refreshed.")
     parser.add_argument("--skip-game-logs", action="store_true")
     parser.add_argument("--skip-team-defense", action="store_true")
     parser.add_argument("--skip-odds", action="store_true")
@@ -445,7 +484,8 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Use cached data when available instead of force-refreshing NBA API data.",
     )
-    parser.add_argument("--season", default=None, help="NBA season string (e.g., 2024-25). Defaults from current date.")
+    parser.add_argument("--season", default=None,
+                        help="NBA season string (e.g., 2024-25). Defaults from current date.")
     parser.add_argument("--db-path", default=DEFAULT_DB_PATH)
     parser.add_argument("--odds-api-key", default=None)
     parser.add_argument("--sport", default="basketball_nba")
@@ -459,14 +499,17 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--max-events", type=int, default=None)
     parser.add_argument("--sleep-seconds", type=float, default=0.15)
-    parser.add_argument("--request-timeout", type=int, default=DEFAULT_REQUEST_TIMEOUT)
-    parser.add_argument("--request-retries", type=int, default=DEFAULT_REQUEST_RETRIES)
+    parser.add_argument("--request-timeout", type=int,
+                        default=DEFAULT_REQUEST_TIMEOUT)
+    parser.add_argument("--request-retries", type=int,
+                        default=DEFAULT_REQUEST_RETRIES)
     parser.add_argument(
         "--request-retry-delay-seconds",
         type=float,
         default=DEFAULT_REQUEST_RETRY_DELAY_SECONDS,
     )
-    parser.add_argument("--request-retry-backoff", type=float, default=DEFAULT_REQUEST_RETRY_BACKOFF)
+    parser.add_argument("--request-retry-backoff", type=float,
+                        default=DEFAULT_REQUEST_RETRY_BACKOFF)
     parser.add_argument("--retries", type=int, default=2)
     parser.add_argument("--retry-delay-seconds", type=float, default=1.0)
     parser.add_argument("--retry-backoff", type=float, default=2.0)
@@ -481,6 +524,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def main():
+    log_path = configure_logging()
     args = _build_parser().parse_args()
     report = run_daily_etl(
         players=args.players,
@@ -520,6 +564,8 @@ def main():
     print(f"- players_selected: {len(report['players_selected'])}")
     if report.get("report_path"):
         print(f"- report_path: {report['report_path']}")
+    if log_path:
+        print(f"- log_path: {log_path}")
 
     for step_name, payload in report["steps"].items():
         print(f"- step[{step_name}]: {payload.get('status')}")
