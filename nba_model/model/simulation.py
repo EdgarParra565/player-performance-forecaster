@@ -1,5 +1,21 @@
 import numpy as np
 
+# -----------------------------------------------------------------------------
+# Production defaults by stat type (from distribution_sweep review).
+# Update after running:
+#   python3 -m nba_model.evaluation.run_distribution_sweep \
+#     --windows 5 7 10 15 --stat-types points assists rebounds pra \
+#     --start-date 2024-11-01 --end-date 2025-03-15
+# and choosing best distribution per stat (e.g. by avg_roi or significance).
+# See README "Production defaults (from benchmarks)".
+# -----------------------------------------------------------------------------
+DEFAULT_DISTRIBUTION_BY_STAT = {
+    "points": "normal",
+    "assists": "normal",
+    "rebounds": "normal",
+    "pra": "normal",
+}
+
 SUPPORTED_DISTRIBUTIONS = [
     "normal",
     "student_t",
@@ -41,6 +57,14 @@ def normalize_distribution_name(distribution: str) -> str:
             f"Supported: {SUPPORTED_DISTRIBUTIONS}"
         )
     return mapped
+
+
+def get_default_distribution(stat_type: str) -> str:
+    """Return the production default distribution for a stat type.
+    Uses DEFAULT_DISTRIBUTION_BY_STAT; falls back to 'normal' for unknown stats.
+    """
+    key = (str(stat_type or "").strip().lower()) or "points"
+    return DEFAULT_DISTRIBUTION_BY_STAT.get(key, "normal")
 
 
 def _draw_samples(
@@ -94,7 +118,8 @@ def _draw_samples(
         positive_mean = max(mean, 1e-3)
         variance = max(std * std, 1e-6)
         phi = np.sqrt(variance + positive_mean * positive_mean)
-        log_sigma = np.sqrt(max(np.log((phi * phi) / (positive_mean * positive_mean)), 1e-9))
+        log_sigma = np.sqrt(
+            max(np.log((phi * phi) / (positive_mean * positive_mean)), 1e-9))
         log_mu = np.log((positive_mean * positive_mean) / phi)
         return rng.lognormal(mean=log_mu, sigma=log_sigma, size=n)
 

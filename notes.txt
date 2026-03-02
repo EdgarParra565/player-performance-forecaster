@@ -88,7 +88,7 @@ player-performance-forecaster/
 - [ ] Run `run_real_data_benchmark.py` on 10+ players with windows `5/7/10/15`
 - [ ] Run `run_distribution_sweep.py` on `points/assists/rebounds/pra`
 - [ ] Review artifacts and pick default distribution by stat type
-- [ ] Record selected defaults in README and code comments
+- [x] Record selected defaults in README and code comments (DEFAULT_DISTRIBUTION_BY_STAT + get_default_distribution in simulation.py; README "Production defaults (from benchmarks)")
 
 ### B. Productionize scheduling/ops
 - [ ] Wire `daily_etl.py` into cron (or GitHub Actions)

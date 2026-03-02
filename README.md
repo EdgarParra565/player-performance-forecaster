@@ -183,6 +183,32 @@ python3 -m nba_model.evaluation.monthly_diagnostics \
   --stat-types points assists rebounds pra
 ```
 
+## Production defaults (from benchmarks)
+
+Default distribution per stat type is defined in `nba_model/model/simulation.py` as `DEFAULT_DISTRIBUTION_BY_STAT`. These should be set after running the real-data benchmark and distribution sweep and reviewing artifacts:
+
+1. **Real-data benchmark** (player/window CIs):
+   ```bash
+   python3 -m nba_model.evaluation.run_real_data_benchmark \
+     --windows 5 7 10 15 \
+     --stat-types points \
+     --distributions normal \
+     --start-date 2024-11-01 \
+     --end-date 2025-03-15
+   ```
+
+2. **Distribution sweep** (ROI/calibration/significance by distribution and stat):
+   ```bash
+   python3 -m nba_model.evaluation.run_distribution_sweep \
+     --windows 5 7 10 15 \
+     --stat-types points assists rebounds pra \
+     --start-date 2024-11-01 \
+     --end-date 2025-03-15
+   ```
+
+3. Review artifacts in `nba_model/evaluation/artifacts/` (e.g. `distribution_sweep_distribution_summary_*.csv`, `distribution_sweep_summary_*.md`).
+4. Pick the best distribution per stat (e.g. by `avg_roi` or significance) and update `DEFAULT_DISTRIBUTION_BY_STAT` in `nba_model/model/simulation.py`. Use `get_default_distribution(stat_type)` in code when a single default is needed for a given stat.
+
 ## Baseline Benchmark Results
 
 Baseline benchmark now runs with the same template across:
