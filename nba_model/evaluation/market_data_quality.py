@@ -9,8 +9,6 @@ Runs lightweight diagnostics for:
 import argparse
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
-
 import pandas as pd
 
 from nba_model.data.database.db_manager import DatabaseManager
@@ -19,7 +17,8 @@ ARTIFACT_DIR = Path("nba_model/evaluation/artifacts")
 
 
 def _utc_now() -> datetime:
-  return datetime.now(timezone.utc)
+    """Return current UTC time."""
+    return datetime.now(timezone.utc)
 
 
 def run_market_data_quality_checks(
@@ -30,7 +29,8 @@ def run_market_data_quality_checks(
     """Run basic data-quality checks on betting lines and snapshots."""
     with DatabaseManager(db_path=db_path) as db:
         lines_df = pd.read_sql_query("SELECT * FROM betting_lines", db.conn)
-        snapshots_df = pd.read_sql_query("SELECT * FROM betting_line_snapshots", db.conn)
+        snapshots_df = pd.read_sql_query(
+            "SELECT * FROM betting_line_snapshots", db.conn)
 
     summary: dict = {
         "betting_lines_rows": int(len(lines_df)),
@@ -39,10 +39,14 @@ def run_market_data_quality_checks(
 
     # Missing field checks on betting_lines.
     if not lines_df.empty:
-        summary["betting_lines_missing_player_id"] = int(lines_df["player_id"].isna().sum())
-        summary["betting_lines_missing_game_date"] = int(lines_df["game_date"].isna().sum())
-        summary["betting_lines_missing_stat_type"] = int(lines_df["stat_type"].isna().sum())
-        summary["betting_lines_missing_line_value"] = int(lines_df["line_value"].isna().sum())
+        summary["betting_lines_missing_player_id"] = int(
+            lines_df["player_id"].isna().sum())
+        summary["betting_lines_missing_game_date"] = int(
+            lines_df["game_date"].isna().sum())
+        summary["betting_lines_missing_stat_type"] = int(
+            lines_df["stat_type"].isna().sum())
+        summary["betting_lines_missing_line_value"] = int(
+            lines_df["line_value"].isna().sum())
     else:
         summary.update(
             {
@@ -58,11 +62,16 @@ def run_market_data_quality_checks(
         snapshots_df["snapshot_ts_utc"] = pd.to_datetime(
             snapshots_df["snapshot_ts_utc"], errors="coerce", utc=True
         )
-        summary["snapshots_missing_timestamp"] = int(snapshots_df["snapshot_ts_utc"].isna().sum())
-        summary["snapshots_missing_player_id"] = int(snapshots_df["player_id"].isna().sum())
-        summary["snapshots_missing_book"] = int(snapshots_df["book"].isna().sum())
-        summary["snapshots_missing_stat_type"] = int(snapshots_df["stat_type"].isna().sum())
-        summary["snapshots_missing_line_value"] = int(snapshots_df["line_value"].isna().sum())
+        summary["snapshots_missing_timestamp"] = int(
+            snapshots_df["snapshot_ts_utc"].isna().sum())
+        summary["snapshots_missing_player_id"] = int(
+            snapshots_df["player_id"].isna().sum())
+        summary["snapshots_missing_book"] = int(
+            snapshots_df["book"].isna().sum())
+        summary["snapshots_missing_stat_type"] = int(
+            snapshots_df["stat_type"].isna().sum())
+        summary["snapshots_missing_line_value"] = int(
+            snapshots_df["line_value"].isna().sum())
 
         # Potential duplicate snapshots: same key within identical timestamp.
         dup_key_cols = [
@@ -120,13 +129,15 @@ def run_market_data_quality_checks(
     ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_path = ARTIFACT_DIR / f"{output_prefix}_{ts}.json"
-    output_path.write_text(pd.Series(summary).to_json(indent=2), encoding="utf-8")
+    output_path.write_text(
+        pd.Series(summary).to_json(indent=2), encoding="utf-8")
     summary["report_path"] = str(output_path)
     return summary
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Run market data quality checks.")
+    parser = argparse.ArgumentParser(
+        description="Run market data quality checks.")
     parser.add_argument("--db-path", default="data/database/nba_data.db")
     parser.add_argument(
         "--max-snapshot-age-hours",
@@ -138,7 +149,8 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main():
+def main() -> None:
+    """CLI entry point: run market data quality checks and print summary."""
     args = _build_parser().parse_args()
     summary = run_market_data_quality_checks(
         db_path=args.db_path,
@@ -152,4 +164,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

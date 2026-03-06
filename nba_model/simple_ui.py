@@ -1,3 +1,4 @@
+"""Desktop UI for single-prop and parlay NBA props model."""
 import csv
 import json
 import re
@@ -56,6 +57,41 @@ _MANUAL_STAT_ALIASES = {
     "playerpointsreboundsassists": "pra",
 }
 
+# Sportsbook presets: dropdown list; "Custom" allows typing a different name in the combobox.
+SPORTSBOOK_PRESETS = [
+    "PrizePicks",
+    "Underdog",
+    "DraftKings",
+    "FanDuel",
+    "BetMGM",
+    "Fliff",
+    "Betr",
+    "Fanatics",
+    "Caesars",
+    "BetRivers",
+    "Custom",
+]
+
+# Parlay leg presets: label -> (stats list, lines list). User can still edit after selecting.
+PARLAY_LEG_PRESETS = {
+    "Custom (edit below)": (None, None),
+    "PRA (points, rebounds, assists)": (["points", "rebounds", "assists"], [25.5, 8.5, 5.5]),
+    "Points + Assists": (["points", "assists"], [25.5, 5.5]),
+    "Points + Rebounds": (["points", "rebounds"], [25.5, 8.5]),
+    "Assists + Rebounds": (["assists", "rebounds"], [5.5, 8.5]),
+    "2-leg PRA (pts, reb)": (["points", "rebounds"], [25.5, 8.5]),
+    "2-leg PRA (pts, ast)": (["points", "assists"], [25.5, 5.5]),
+    "2-leg PRA (reb, ast)": (["rebounds", "assists"], [8.5, 5.5]),
+}
+
+# Single-prop stat type -> default line when user picks that stat.
+SINGLE_STAT_DEFAULT_LINES = {
+    "points": 25.5,
+    "assists": 5.5,
+    "rebounds": 8.5,
+    "pra": 35.5,
+}
+
 
 class SimpleModelUI:
     """Small desktop UI to run single-prop and parlay workflows."""
@@ -77,7 +113,7 @@ class SimpleModelUI:
         parlay_tab = ttk.Frame(notebook)
         manual_tab = ttk.Frame(notebook)
         notebook.add(single_tab, text="Single Prop")
-        notebook.add(parlay_tab, text="Parlay (PrizePicks/Underdog)")
+        notebook.add(parlay_tab, text="Parlay")
         notebook.add(manual_tab, text="Manual Lines Import")
 
         self._build_single_tab(single_tab)
@@ -86,7 +122,8 @@ class SimpleModelUI:
 
     @staticmethod
     def _add_labeled_entry(parent, row, label, default):
-        ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", padx=6, pady=6)
+        ttk.Label(parent, text=label).grid(
+            row=row, column=0, sticky="w", padx=6, pady=6)
         var = tk.StringVar(value=str(default))
         entry = ttk.Entry(parent, textvariable=var, width=28)
         entry.grid(row=row, column=1, sticky="w", padx=6, pady=6)
@@ -103,7 +140,8 @@ class SimpleModelUI:
         resolution: float = 0.01,
         length: int = 280,
     ):
-        ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", padx=6, pady=6)
+        ttk.Label(parent, text=label).grid(
+            row=row, column=0, sticky="w", padx=6, pady=6)
         container = ttk.Frame(parent)
         container.grid(row=row, column=1, sticky="w", padx=6, pady=6)
 
@@ -132,7 +170,8 @@ class SimpleModelUI:
             length=length,
         )
         slider.pack(side="left")
-        ttk.Label(container, textvariable=value_text, width=7, anchor="e").pack(side="left", padx=(8, 0))
+        ttk.Label(container, textvariable=value_text, width=7,
+                  anchor="e").pack(side="left", padx=(8, 0))
         var.trace_add("write", _sync_from_var)
         _sync_from_var()
         return var
@@ -166,7 +205,8 @@ class SimpleModelUI:
 
     @staticmethod
     def _slug_stat_type(value: str) -> str:
-        slug = re.sub(r"[^a-z0-9]+", "_", str(value).strip().lower()).strip("_")
+        slug = re.sub(r"[^a-z0-9]+", "_",
+                      str(value).strip().lower()).strip("_")
         return slug or "custom_stat"
 
     def _normalize_stat_type(self, value: str, allow_custom: bool = False) -> str:
@@ -176,7 +216,8 @@ class SimpleModelUI:
             if allow_custom:
                 return self._slug_stat_type(value)
             supported = sorted(set(_MANUAL_STAT_ALIASES.values()))
-            raise ValueError(f"Unsupported stat '{value}'. Supported: {supported}")
+            raise ValueError(
+                f"Unsupported stat '{value}'. Supported: {supported}")
         return stat_type
 
     @staticmethod
@@ -242,7 +283,8 @@ class SimpleModelUI:
         try:
             return datetime.fromisoformat(token.replace("Z", "+00:00")).strftime("%Y-%m-%d")
         except ValueError as exc:
-            raise ValueError(f"Invalid date '{value}'. Use YYYY-MM-DD format.") from exc
+            raise ValueError(
+                f"Invalid date '{value}'. Use YYYY-MM-DD format.") from exc
 
     @staticmethod
     def _synthetic_player_id(player_name: str) -> int:
@@ -252,7 +294,8 @@ class SimpleModelUI:
         Keeps manual import usable for non-NBA boards while avoiding collisions
         with normal NBA IDs by using a high numeric range.
         """
-        digest = sha1(player_name.strip().lower().encode("utf-8")).hexdigest()[:10]
+        digest = sha1(player_name.strip().lower().encode(
+            "utf-8")).hexdigest()[:10]
         return 900_000_000 + (int(digest, 16) % 99_000_000)
 
     @staticmethod
@@ -329,16 +372,21 @@ class SimpleModelUI:
 
         candidates = static_players.find_players_by_full_name(raw_name)
         if not candidates:
-            candidates = static_players.find_players_by_full_name(raw_name.replace(".", ""))
+            candidates = static_players.find_players_by_full_name(
+                raw_name.replace(".", ""))
         if not candidates:
             if allow_synthetic:
-                resolved = {"player_id": self._synthetic_player_id(raw_name), "player_name": raw_name}
+                resolved = {"player_id": self._synthetic_player_id(
+                    raw_name), "player_name": raw_name}
                 self._player_lookup_cache[raw_name] = resolved
                 return resolved
-            raise ValueError(f"Player '{raw_name}' not found in NBA player list")
+            raise ValueError(
+                f"Player '{raw_name}' not found in NBA player list")
 
-        exact = next((c for c in candidates if c.get("full_name", "").lower() == raw_name.lower()), candidates[0])
-        resolved = {"player_id": int(exact["id"]), "player_name": exact["full_name"]}
+        exact = next((c for c in candidates if c.get(
+            "full_name", "").lower() == raw_name.lower()), candidates[0])
+        resolved = {"player_id": int(
+            exact["id"]), "player_name": exact["full_name"]}
         self._player_lookup_cache[raw_name] = resolved
         return resolved
 
@@ -376,7 +424,8 @@ class SimpleModelUI:
         except ValueError as exc:
             raise ValueError(f"Invalid line value '{line_token}'") from exc
 
-        player = self._resolve_player_identity(player_name, allow_synthetic=True)
+        player = self._resolve_player_identity(
+            player_name, allow_synthetic=True)
         stat_type = self._normalize_stat_type(stat_token, allow_custom=True)
         over_odds = self._parse_optional_american_odds(over_token)
         under_odds = self._parse_optional_american_odds(under_token)
@@ -410,7 +459,11 @@ class SimpleModelUI:
                 continue
 
             stat_token = lines[idx + 1].strip()
-            if not stat_token or self._is_noise_line(stat_token) or self._is_matchup_line(stat_token):
+            if (
+                not stat_token
+                or self._is_noise_line(stat_token)
+                or self._is_matchup_line(stat_token)
+            ):
                 continue
 
             matchup_idx = None
@@ -432,18 +485,22 @@ class SimpleModelUI:
                     or number_re.match(candidate)
                 ):
                     continue
-                player_name = re.sub(r"(Goblin|Demon)+$", "", candidate, flags=re.IGNORECASE).strip()
+                player_name = re.sub(
+                    r"(Goblin|Demon)+$", "", candidate, flags=re.IGNORECASE).strip()
                 if player_name:
                     break
             if not player_name:
                 continue
 
             try:
-                player = self._resolve_player_identity(player_name, allow_synthetic=True)
-                stat_type = self._normalize_stat_type(stat_token, allow_custom=True)
+                player = self._resolve_player_identity(
+                    player_name, allow_synthetic=True)
+                stat_type = self._normalize_stat_type(
+                    stat_token, allow_custom=True)
                 line_value = float(line_value_token)
             except Exception as exc:
-                errors.append(f"board parse near '{player_name}' / '{stat_token}': {exc}")
+                errors.append(
+                    f"board parse near '{player_name}' / '{stat_token}': {exc}")
                 continue
 
             record = {
@@ -482,7 +539,8 @@ class SimpleModelUI:
             stripped = raw_line.strip()
             if not stripped or stripped.startswith("#"):
                 continue
-            has_structured_delimiter = ("|" in stripped) or ("\t" in stripped) or (stripped.count(",") >= 2)
+            has_structured_delimiter = ("|" in stripped) or (
+                "\t" in stripped) or (stripped.count(",") >= 2)
             if not has_structured_delimiter:
                 unstructured_lines.append(stripped)
                 continue
@@ -534,8 +592,8 @@ class SimpleModelUI:
 
         if not records and unstructured_lines and not errors:
             errors.append(
-                "No parseable props found. Use delimiter format or paste full board text that includes "
-                "player + matchup + line + stat blocks."
+                "No parseable props. Use delimiter format or paste board text "
+                "with player + matchup + line + stat."
             )
         return records, errors
 
@@ -571,7 +629,8 @@ class SimpleModelUI:
         """Delete selected rows from parsed manual records table."""
         selected = list(self.manual_table.selection())
         if not selected:
-            messagebox.showinfo("Manual Lines", "Select one or more parsed rows to delete.")
+            messagebox.showinfo(
+                "Manual Lines", "Select one or more parsed rows to delete.")
             return
         indexes = sorted((int(iid) for iid in selected), reverse=True)
         for idx in indexes:
@@ -592,15 +651,44 @@ class SimpleModelUI:
         controls.pack(fill="x", padx=8, pady=8)
         controls.columnconfigure(1, weight=1)
 
-        self.single_player = self._add_labeled_entry(controls, 0, "Player", DEFAULT_PLAYER_NAME)
-        self.single_line = self._add_labeled_entry(controls, 1, "Line", DEFAULT_POINTS_LINE)
-        self.single_odds = self._add_labeled_entry(controls, 2, "American Odds", DEFAULT_AMERICAN_ODDS)
-        self.single_window = self._add_labeled_entry(controls, 3, "Rolling Window", DEFAULT_ROLLING_WINDOW)
-        self.single_opp_def = self._add_labeled_entry(controls, 4, "Opponent Def Rating", DEFAULT_OPP_DEF_RATING)
-        self.single_spread = self._add_labeled_entry(controls, 5, "Vegas Spread", DEFAULT_VEGAS_SPREAD)
-        self.single_n_games = self._add_labeled_entry(controls, 6, "History Games", 100)
-        ttk.Label(controls, text="Distribution").grid(row=7, column=0, sticky="w", padx=6, pady=6)
-        self.single_distribution = tk.StringVar(value=DEFAULT_SINGLE_PROP_DISTRIBUTION)
+        self.single_player = self._add_labeled_entry(
+            controls, 0, "Player", DEFAULT_PLAYER_NAME)
+
+        ttk.Label(controls, text="Stat type").grid(
+            row=1, column=0, sticky="w", padx=6, pady=6)
+        self.single_stat_type = tk.StringVar(value="points")
+
+        def _on_single_stat_change(*_):
+            st = self.single_stat_type.get().strip().lower()
+            if st in SINGLE_STAT_DEFAULT_LINES:
+                self.single_line.set(str(SINGLE_STAT_DEFAULT_LINES[st]))
+
+        single_stat_box = ttk.Combobox(
+            controls,
+            textvariable=self.single_stat_type,
+            values=list(SINGLE_STAT_DEFAULT_LINES.keys()),
+            state="readonly",
+            width=25,
+        )
+        single_stat_box.grid(row=1, column=1, sticky="w", padx=6, pady=6)
+        self.single_stat_type.trace_add("write", _on_single_stat_change)
+
+        self.single_line = self._add_labeled_entry(
+            controls, 2, "Line", DEFAULT_POINTS_LINE)
+        self.single_odds = self._add_labeled_entry(
+            controls, 3, "American Odds", DEFAULT_AMERICAN_ODDS)
+        self.single_window = self._add_labeled_entry(
+            controls, 4, "Rolling Window", DEFAULT_ROLLING_WINDOW)
+        self.single_opp_def = self._add_labeled_entry(
+            controls, 5, "Opponent Def Rating", DEFAULT_OPP_DEF_RATING)
+        self.single_spread = self._add_labeled_entry(
+            controls, 6, "Vegas Spread", DEFAULT_VEGAS_SPREAD)
+        self.single_n_games = self._add_labeled_entry(
+            controls, 7, "History Games", 100)
+        ttk.Label(controls, text="Distribution").grid(
+            row=8, column=0, sticky="w", padx=6, pady=6)
+        self.single_distribution = tk.StringVar(
+            value=DEFAULT_SINGLE_PROP_DISTRIBUTION)
         distribution_box = ttk.Combobox(
             controls,
             textvariable=self.single_distribution,
@@ -608,10 +696,10 @@ class SimpleModelUI:
             state="readonly",
             width=25,
         )
-        distribution_box.grid(row=7, column=1, sticky="w", padx=6, pady=6)
+        distribution_box.grid(row=8, column=1, sticky="w", padx=6, pady=6)
         self.single_league_avg_def = self._add_labeled_slider(
             controls,
-            8,
+            9,
             "League Avg Def Rating",
             DEFAULT_LEAGUE_AVG_DEF_RATING,
             min_value=105.0,
@@ -620,7 +708,7 @@ class SimpleModelUI:
         )
         self.single_defense_sensitivity = self._add_labeled_slider(
             controls,
-            9,
+            10,
             "Defense Sensitivity",
             DEFAULT_DEFENSE_SENSITIVITY,
             min_value=0.0,
@@ -629,7 +717,7 @@ class SimpleModelUI:
         )
         self.single_blowout_threshold = self._add_labeled_slider(
             controls,
-            10,
+            11,
             "Blowout Threshold",
             DEFAULT_BLOWOUT_THRESHOLD,
             min_value=0.0,
@@ -638,7 +726,7 @@ class SimpleModelUI:
         )
         self.single_blowout_penalty = self._add_labeled_slider(
             controls,
-            11,
+            12,
             "Blowout Penalty",
             DEFAULT_BLOWOUT_PENALTY,
             min_value=0.0,
@@ -647,7 +735,7 @@ class SimpleModelUI:
         )
         self.single_defense_severity = self._add_labeled_slider(
             controls,
-            12,
+            13,
             "Defense Severity",
             1.0,
             min_value=0.0,
@@ -656,7 +744,7 @@ class SimpleModelUI:
         )
         self.single_minutes_severity = self._add_labeled_slider(
             controls,
-            13,
+            14,
             "Minutes Penalty Severity",
             1.0,
             min_value=0.0,
@@ -665,7 +753,7 @@ class SimpleModelUI:
         )
         self.single_sigma_severity = self._add_labeled_slider(
             controls,
-            14,
+            15,
             "Volatility (Sigma) Severity",
             1.0,
             min_value=0.0,
@@ -677,18 +765,21 @@ class SimpleModelUI:
             controls,
             text="Reset Single Tuning Defaults",
             command=self._reset_single_tuning_defaults,
-        ).grid(row=15, column=0, sticky="w", padx=6, pady=6)
+        ).grid(row=16, column=0, sticky="w", padx=6, pady=6)
 
         self.single_show_plot = tk.BooleanVar(value=False)
-        ttk.Checkbutton(controls, text="Show Distribution Plot", variable=self.single_show_plot).grid(
-            row=16, column=0, sticky="w", padx=6, pady=6
-        )
+        ttk.Checkbutton(
+            controls,
+            text="Show Distribution Plot",
+            variable=self.single_show_plot,
+        ).grid(row=17, column=0, sticky="w", padx=6, pady=6)
 
         ttk.Button(controls, text="Run Single Prop", command=self._run_single).grid(
-            row=16, column=1, sticky="w", padx=6, pady=6
+            row=17, column=1, sticky="w", padx=6, pady=6
         )
 
-        self.single_output = scrolledtext.ScrolledText(tab, height=18, wrap=tk.WORD, state="disabled")
+        self.single_output = scrolledtext.ScrolledText(
+            tab, height=18, wrap=tk.WORD, state="disabled")
         self.single_output.pack(fill="both", expand=True, padx=8, pady=(0, 8))
 
     def _build_parlay_tab(self, tab):
@@ -696,27 +787,57 @@ class SimpleModelUI:
         controls.pack(fill="x", padx=8, pady=8)
         controls.columnconfigure(1, weight=1)
 
-        self.parlay_player = self._add_labeled_entry(controls, 0, "Player", DEFAULT_PLAYER_NAME)
+        self.parlay_player = self._add_labeled_entry(
+            controls, 0, "Player", DEFAULT_PLAYER_NAME)
 
-        ttk.Label(controls, text="Sportsbook").grid(row=1, column=0, sticky="w", padx=6, pady=6)
-        self.parlay_sportsbook = tk.StringVar(value="prizepicks")
+        ttk.Label(controls, text="Sportsbook").grid(
+            row=1, column=0, sticky="w", padx=6, pady=6)
+        self.parlay_sportsbook = tk.StringVar(value="PrizePicks")
         sportsbook_box = ttk.Combobox(
             controls,
             textvariable=self.parlay_sportsbook,
-            values=["custom", "prizepicks", "underdog"],
-            state="readonly",
+            values=SPORTSBOOK_PRESETS,
+            state="normal",
             width=25,
         )
         sportsbook_box.grid(row=1, column=1, sticky="w", padx=6, pady=6)
 
+        ttk.Label(controls, text="Leg preset").grid(
+            row=2, column=0, sticky="w", padx=6, pady=6)
+        self.parlay_leg_preset = tk.StringVar(
+            value="PRA (points, rebounds, assists)")
+
+        def _on_parlay_preset_change(*_):
+            key = self.parlay_leg_preset.get()
+            preset = PARLAY_LEG_PRESETS.get(key)
+            if preset and preset[0] is not None and preset[1] is not None:
+                self.parlay_stats.set(", ".join(preset[0]))
+                self.parlay_lines.set(", ".join(str(x) for x in preset[1]))
+
+        parlay_preset_box = ttk.Combobox(
+            controls,
+            textvariable=self.parlay_leg_preset,
+            values=list(PARLAY_LEG_PRESETS.keys()),
+            state="readonly",
+            width=28,
+        )
+        parlay_preset_box.grid(row=2, column=1, sticky="w", padx=6, pady=6)
+        self.parlay_leg_preset.trace_add("write", _on_parlay_preset_change)
+
+        stats_default, lines_default = PARLAY_LEG_PRESETS["PRA (points, rebounds, assists)"]
         self.parlay_stats = self._add_labeled_entry(
-            controls, 2, "Leg Stats (csv)", ", ".join(DEFAULT_PARLAY_STATS)
+            controls, 3, "Leg Stats (csv)",
+            ", ".join(stats_default) if stats_default else ", ".join(
+                DEFAULT_PARLAY_STATS),
         )
         self.parlay_lines = self._add_labeled_entry(
-            controls, 3, "Leg Lines (csv)", ", ".join(str(x) for x in DEFAULT_PARLAY_LINES)
+            controls, 4, "Leg Lines (csv)",
+            ", ".join(str(x) for x in lines_default) if lines_default else ", ".join(
+                str(x) for x in DEFAULT_PARLAY_LINES),
         )
 
-        ttk.Label(controls, text="Parlay Odds Format").grid(row=4, column=0, sticky="w", padx=6, pady=6)
+        ttk.Label(controls, text="Parlay Odds Format").grid(
+            row=5, column=0, sticky="w", padx=6, pady=6)
         self.parlay_odds_format = tk.StringVar(value="multiplier")
         odds_format_box = ttk.Combobox(
             controls,
@@ -725,14 +846,17 @@ class SimpleModelUI:
             state="readonly",
             width=25,
         )
-        odds_format_box.grid(row=4, column=1, sticky="w", padx=6, pady=6)
+        odds_format_box.grid(row=5, column=1, sticky="w", padx=6, pady=6)
 
-        self.parlay_odds = self._add_labeled_entry(controls, 5, "Parlay Odds", 3.0)
-        self.parlay_n_games = self._add_labeled_entry(controls, 6, "History Games", 100)
-        self.parlay_n_sims = self._add_labeled_entry(controls, 7, "Simulation Runs", 20000)
+        self.parlay_odds = self._add_labeled_entry(
+            controls, 6, "Parlay Odds", 3.0)
+        self.parlay_n_games = self._add_labeled_entry(
+            controls, 7, "History Games", 100)
+        self.parlay_n_sims = self._add_labeled_entry(
+            controls, 8, "Simulation Runs", 20000)
         self.parlay_corr_severity = self._add_labeled_slider(
             controls,
-            8,
+            9,
             "Correlation Severity",
             1.0,
             min_value=0.0,
@@ -741,7 +865,7 @@ class SimpleModelUI:
         )
         self.parlay_vol_severity = self._add_labeled_slider(
             controls,
-            9,
+            10,
             "Volatility Severity",
             1.0,
             min_value=0.0,
@@ -753,13 +877,14 @@ class SimpleModelUI:
             controls,
             text="Reset Parlay Tuning Defaults",
             command=self._reset_parlay_tuning_defaults,
-        ).grid(row=10, column=0, sticky="w", padx=6, pady=6)
+        ).grid(row=11, column=0, sticky="w", padx=6, pady=6)
 
         ttk.Button(controls, text="Run Parlay", command=self._run_parlay).grid(
-            row=10, column=1, sticky="w", padx=6, pady=6
+            row=11, column=1, sticky="w", padx=6, pady=6
         )
 
-        self.parlay_output = scrolledtext.ScrolledText(tab, height=16, wrap=tk.WORD, state="disabled")
+        self.parlay_output = scrolledtext.ScrolledText(
+            tab, height=16, wrap=tk.WORD, state="disabled")
         self.parlay_output.pack(fill="both", expand=True, padx=8, pady=(0, 8))
 
     def _build_manual_tab(self, tab):
@@ -767,32 +892,52 @@ class SimpleModelUI:
         controls.pack(fill="x", padx=8, pady=8)
 
         self.manual_default_date = self._add_labeled_entry(
-            controls, 0, "Default Game Date (YYYY-MM-DD)", datetime.utcnow().strftime("%Y-%m-%d")
+            controls, 0, "Default Game Date (YYYY-MM-DD)", datetime.utcnow().strftime(
+                "%Y-%m-%d")
         )
-        self.manual_default_book = self._add_labeled_entry(controls, 1, "Default Sportsbook", "manual_ui")
-        self.manual_db_path = self._add_labeled_entry(controls, 2, "DB Path", "data/database/nba_data.db")
+        ttk.Label(controls, text="Default Sportsbook").grid(
+            row=1, column=0, sticky="w", padx=6, pady=6)
+        self.manual_default_book = tk.StringVar(value="Manual import")
+        manual_book_box = ttk.Combobox(
+            controls,
+            textvariable=self.manual_default_book,
+            values=SPORTSBOOK_PRESETS + ["Manual import"],
+            state="normal",
+            width=28,
+        )
+        manual_book_box.grid(row=1, column=1, sticky="w", padx=6, pady=6)
+        self.manual_db_path = self._add_labeled_entry(
+            controls, 2, "DB Path", "data/database/nba_data.db")
 
         ttk.Button(controls, text="Parse Lines", command=self._parse_manual_lines).grid(
             row=3, column=0, sticky="w", padx=6, pady=6
         )
-        ttk.Button(controls, text="Save Parsed Lines to DB", command=self._save_manual_lines).grid(
-            row=3, column=1, sticky="w", padx=6, pady=6
-        )
-        ttk.Button(controls, text="Delete Selected Parsed Row(s)", command=self._delete_selected_manual_rows).grid(
-            row=3, column=2, sticky="w", padx=6, pady=6
-        )
+        ttk.Button(
+            controls,
+            text="Save Parsed Lines to DB",
+            command=self._save_manual_lines,
+        ).grid(row=3, column=1, sticky="w", padx=6, pady=6)
+        ttk.Button(
+            controls,
+            text="Delete Selected Parsed Row(s)",
+            command=self._delete_selected_manual_rows,
+        ).grid(row=3, column=2, sticky="w", padx=6, pady=6)
 
         help_text = (
             "Paste one prop per line (pipe, csv, or tab-delimited).\n"
             "Formats:\n"
             "  1) player | stat | line | over_odds | under_odds\n"
             "  2) player | game_date | book | stat | line | over_odds | under_odds\n"
-            "  3) Raw board dump (auto-extract from blocks containing player + matchup + line + stat)\n"
-            "Notes: stats accept aliases (pts/ast/reb/pra). Unknown stats become snake_case. Odds are optional."
+            "  3) Raw board dump (auto-extract from blocks: player + matchup "
+            "+ line + stat)\n"
+            "Notes: stats accept aliases (pts/ast/reb/pra). "
+            "Unknown stats become snake_case. Odds are optional."
         )
-        ttk.Label(tab, text=help_text, justify="left").pack(anchor="w", padx=8, pady=(0, 6))
+        ttk.Label(tab, text=help_text, justify="left").pack(
+            anchor="w", padx=8, pady=(0, 6))
 
-        self.manual_input = scrolledtext.ScrolledText(tab, height=12, wrap=tk.WORD)
+        self.manual_input = scrolledtext.ScrolledText(
+            tab, height=12, wrap=tk.WORD)
         self.manual_input.pack(fill="x", expand=False, padx=8, pady=(0, 8))
         self.manual_input.insert(
             tk.END,
@@ -804,8 +949,10 @@ class SimpleModelUI:
         table_frame = ttk.Frame(tab)
         table_frame.pack(fill="both", expand=True, padx=8, pady=(0, 8))
 
-        columns = ("row", "player", "date", "book", "stat", "line", "over", "under")
-        self.manual_table = ttk.Treeview(table_frame, columns=columns, show="headings", height=10)
+        columns = ("row", "player", "date", "book",
+                   "stat", "line", "over", "under")
+        self.manual_table = ttk.Treeview(
+            table_frame, columns=columns, show="headings", height=10)
         self.manual_table.heading("row", text="#")
         self.manual_table.heading("player", text="Player")
         self.manual_table.heading("date", text="Game Date")
@@ -824,12 +971,14 @@ class SimpleModelUI:
         self.manual_table.column("over", width=90, anchor="center")
         self.manual_table.column("under", width=90, anchor="center")
 
-        yscroll = ttk.Scrollbar(table_frame, orient="vertical", command=self.manual_table.yview)
+        yscroll = ttk.Scrollbar(
+            table_frame, orient="vertical", command=self.manual_table.yview)
         self.manual_table.configure(yscrollcommand=yscroll.set)
         self.manual_table.pack(side="left", fill="both", expand=True)
         yscroll.pack(side="right", fill="y")
 
-        self.manual_output = scrolledtext.ScrolledText(tab, height=12, wrap=tk.WORD, state="disabled")
+        self.manual_output = scrolledtext.ScrolledText(
+            tab, height=12, wrap=tk.WORD, state="disabled")
         self.manual_output.pack(fill="both", expand=False, padx=8, pady=(0, 8))
 
     def _parse_manual_lines(self):
@@ -851,26 +1000,31 @@ class SimpleModelUI:
             if errors:
                 messagebox.showwarning(
                     "Manual Lines Parse",
-                    f"Parsed {len(records)} line(s) with {len(errors)} error(s). Review output for details.",
+                    "Parsed %s line(s) with %s error(s). Review output for details."
+                    % (len(records), len(errors)),
                 )
             elif records:
                 messagebox.showinfo(
                     "Manual Lines Parse",
-                    f"Parsed {len(records)} line(s). Click 'Save Parsed Lines to DB' to store them.",
+                    "Parsed %s line(s). Click 'Save Parsed Lines to DB' to store."
+                    % len(records),
                 )
             else:
-                messagebox.showinfo("Manual Lines Parse", "No valid lines were found in the input box.")
+                messagebox.showinfo(
+                    "Manual Lines Parse", "No valid lines were found in the input box.")
         except Exception as exc:
             messagebox.showerror("Manual Lines Parse Error", str(exc))
 
     def _save_manual_lines(self):
         try:
             if not self.manual_records:
-                raise ValueError("No parsed lines available. Click 'Parse Lines' first.")
+                raise ValueError(
+                    "No parsed lines available. Click 'Parse Lines' first.")
 
             db_path = self.manual_db_path.get().strip() or "data/database/nba_data.db"
             with DatabaseManager(db_path=db_path) as db:
-                before_count = db.conn.execute("SELECT COUNT(*) FROM betting_lines").fetchone()[0]
+                before_count = db.conn.execute(
+                    "SELECT COUNT(*) FROM betting_lines").fetchone()[0]
                 seen = {}
                 for row in self.manual_records:
                     player_id = row["player_id"]
@@ -878,7 +1032,8 @@ class SimpleModelUI:
                         seen[player_id] = row["player_name"]
                         db.insert_player(player_id, row["player_name"])
                 db.insert_betting_lines_records(self.manual_records)
-                after_count = db.conn.execute("SELECT COUNT(*) FROM betting_lines").fetchone()[0]
+                after_count = db.conn.execute(
+                    "SELECT COUNT(*) FROM betting_lines").fetchone()[0]
 
             inserted = after_count - before_count
             payload = {
@@ -888,10 +1043,11 @@ class SimpleModelUI:
                 "total_betting_lines_rows": after_count,
             }
             self._render_output(self.manual_output, payload)
-            messagebox.showinfo(
-                "Manual Lines Save",
-                f"Saved {len(self.manual_records)} parsed row(s). Inserted {inserted} new betting_lines row(s).",
+            msg = (
+                "Saved %s parsed row(s). Inserted %s new betting_lines row(s)."
+                % (len(self.manual_records), inserted)
             )
+            messagebox.showinfo("Manual Lines Save", msg)
         except Exception as exc:
             messagebox.showerror("Manual Lines Save Error", str(exc))
 
@@ -915,20 +1071,28 @@ class SimpleModelUI:
         try:
             result = run_single_prop(
                 player_name=self.single_player.get().strip(),
-                line=self._parse_float_or_default(self.single_line.get(), DEFAULT_POINTS_LINE),
-                rolling_window=self._parse_int_or_default(self.single_window.get(), DEFAULT_ROLLING_WINDOW),
-                american_odds=self._parse_int_or_default(self.single_odds.get(), DEFAULT_AMERICAN_ODDS),
-                opp_def_rating=self._parse_float_or_default(self.single_opp_def.get(), DEFAULT_OPP_DEF_RATING),
-                vegas_spread=self._parse_float_or_default(self.single_spread.get(), DEFAULT_VEGAS_SPREAD),
+                line=self._parse_float_or_default(
+                    self.single_line.get(), DEFAULT_POINTS_LINE),
+                rolling_window=self._parse_int_or_default(
+                    self.single_window.get(), DEFAULT_ROLLING_WINDOW),
+                american_odds=self._parse_int_or_default(
+                    self.single_odds.get(), DEFAULT_AMERICAN_ODDS),
+                opp_def_rating=self._parse_float_or_default(
+                    self.single_opp_def.get(), DEFAULT_OPP_DEF_RATING),
+                vegas_spread=self._parse_float_or_default(
+                    self.single_spread.get(), DEFAULT_VEGAS_SPREAD),
                 league_avg_def_rating=float(self.single_league_avg_def.get()),
-                defense_sensitivity=float(self.single_defense_sensitivity.get()),
+                defense_sensitivity=float(
+                    self.single_defense_sensitivity.get()),
                 blowout_threshold=float(self.single_blowout_threshold.get()),
                 blowout_penalty=float(self.single_blowout_penalty.get()),
-                n_games=self._parse_int_or_default(self.single_n_games.get(), 100),
+                n_games=self._parse_int_or_default(
+                    self.single_n_games.get(), 100),
                 show_plot=self.single_show_plot.get(),
                 distribution=self.single_distribution.get().strip().lower(),
                 defense_severity=float(self.single_defense_severity.get()),
-                minutes_penalty_severity=float(self.single_minutes_severity.get()),
+                minutes_penalty_severity=float(
+                    self.single_minutes_severity.get()),
                 sigma_severity=float(self.single_sigma_severity.get()),
             )
             self._render_output(self.single_output, result)
@@ -937,14 +1101,17 @@ class SimpleModelUI:
 
     def _run_parlay(self):
         try:
-            stats = _normalize_parlay_stats(self._parse_csv_strings(self.parlay_stats.get()))
+            stats = _normalize_parlay_stats(
+                self._parse_csv_strings(self.parlay_stats.get()))
             lines = self._parse_csv_floats(self.parlay_lines.get())
             if len(stats) != len(lines):
-                raise ValueError("Parlay stats count must match parlay lines count.")
+                raise ValueError(
+                    "Parlay stats count must match parlay lines count.")
 
             sportsbook = self.parlay_sportsbook.get().strip().lower()
             odds_format = self.parlay_odds_format.get().strip().lower()
-            odds_value = self._parse_float_or_default(self.parlay_odds.get(), 3.0)
+            odds_value = self._parse_float_or_default(
+                self.parlay_odds.get(), 3.0)
             american_odds = _resolve_parlay_american_odds(
                 parlay_odds=odds_value,
                 parlay_odds_format=odds_format,
@@ -957,8 +1124,10 @@ class SimpleModelUI:
                 lines=lines,
                 american_odds=american_odds,
                 sportsbook=sportsbook,
-                n_games=self._parse_int_or_default(self.parlay_n_games.get(), 100),
-                n_sims=self._parse_int_or_default(self.parlay_n_sims.get(), 20000),
+                n_games=self._parse_int_or_default(
+                    self.parlay_n_games.get(), 100),
+                n_sims=self._parse_int_or_default(
+                    self.parlay_n_sims.get(), 20000),
                 correlation_severity=float(self.parlay_corr_severity.get()),
                 volatility_severity=float(self.parlay_vol_severity.get()),
             )
@@ -967,7 +1136,8 @@ class SimpleModelUI:
             messagebox.showerror("Parlay Error", str(exc))
 
 
-def main():
+def main() -> None:
+    """Launch the desktop UI."""
     root = tk.Tk()
     app = SimpleModelUI(root)
     del app

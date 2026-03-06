@@ -19,6 +19,7 @@ The current baseline is designed to be reproducible offline (synthetic benchmark
 - `nba_model/evaluation/` - backtesting and benchmark runners
 - `nba_model/tests/` - smoke and integration-style tests
 - `nba_model/visualization/` - distribution plotting
+- `docs/API_TO_DATABASE.md` - how data flows from APIs to SQLite and how we clean it
 
 ## Setup
 
@@ -196,6 +197,35 @@ python3 -m nba_model.evaluation.monthly_diagnostics \
   --end-date 2025-03-15 \
   --stat-types points assists rebounds pra
 ```
+
+#### Comparing to “the market” vs other forecasting models
+
+- **Model-vs-market**: The pipeline compares **this model** to **sportsbook lines** (the “market”). `line_comparison` produces model-vs-book and book-vs-book outputs; backtests can use market lines via `--use-market-lines` and `--market-book`. So you are checking your forecasts against whatever books you ingest (DraftKings, FanDuel, etc.).
+- **Other forecasting models**: There is no built-in comparison to named external models (e.g. ESPN, FiveThirtyEight, or other projection systems). To do that you would need to ingest those models’ predictions into the DB (or a separate table) and add a small comparison script that computes differences vs your model.
+
+#### Using smaller or alternate books (e.g. Fliff, Kalshi)
+
+Odds come from **The Odds API**, which supports many bookmakers (including Fliff, Kalshi, and other smaller or regional books). The code does not hardcode book names; it stores whatever `book` the API returns.
+
+- **Ingest specific books**: In daily ETL or odds ingestion, pass the bookmaker keys the API expects (e.g. `fliff`, `kalshi`):
+  ```bash
+  python3 -m nba_model.data.daily_etl --strict --skip-game-logs --skip-team-defense \
+    --bookmakers fliff kalshi
+  ```
+  Or with the standalone odds module:
+  ```bash
+  python3 -m nba_model.model.odds_ingestion \
+    --db-path data/database/nba_data.db \
+    --bookmakers fliff kalshi
+  ```
+- **Backtest / comparison using one book**: Use `--market-book` to restrict to that book’s lines:
+  ```bash
+  python3 -m nba_model.evaluation.run_batch_backtest \
+    --use-market-lines --market-book fliff \
+    --players "LeBron James" ... --stat-types points ...
+  ```
+  `line_comparison` uses all books present in `betting_lines`; filter by date/stat and optionally by book in downstream analysis.
+- **Caveats**: (1) The Odds API’s list of bookmakers and keys can change; confirm keys (e.g. `fliff`, `kalshi`) in the API docs. (2) Kalshi is prediction-exchange style; their NBA coverage may be event-based rather than traditional player over/under lines, so availability may differ from FanDuel/DraftKings.
 
 ### 9) Prop Board Generator (All Player Props for a Game)
 

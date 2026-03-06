@@ -23,6 +23,7 @@ ARTIFACT_DIR = Path("nba_model/evaluation/artifacts")
 
 
 def _safe_implied_prob(odds) -> Optional[float]:
+    """Convert American odds to implied probability; return None if invalid."""
     if odds is None or (isinstance(odds, float) and np.isnan(odds)):
         return None
     try:
@@ -37,6 +38,7 @@ def load_snapshots(
     end_date: Optional[str],
     stat_types: Optional[list[str]],
 ) -> pd.DataFrame:
+    """Load betting_line_snapshots from DB, optionally filtered by date and stat_type."""
     with DatabaseManager(db_path=db_path) as db:
         df = pd.read_sql_query("SELECT * FROM betting_line_snapshots", db.conn)
 
@@ -44,7 +46,8 @@ def load_snapshots(
         return df
 
     df["game_date"] = pd.to_datetime(df["game_date"], errors="coerce").dt.date
-    df["snapshot_ts_utc"] = pd.to_datetime(df["snapshot_ts_utc"], errors="coerce", utc=True)
+    df["snapshot_ts_utc"] = pd.to_datetime(
+        df["snapshot_ts_utc"], errors="coerce", utc=True)
     if start_date:
         start = pd.to_datetime(start_date).date()
         df = df[df["game_date"] >= start]
@@ -63,6 +66,7 @@ def build_clv_proxy(
     snapshots_df: pd.DataFrame,
     min_snapshots_per_market: int = 2,
 ) -> pd.DataFrame:
+    """Build open/close CLV-style metrics per (player, game_date, stat_type, book, market)."""
     if snapshots_df.empty:
         return pd.DataFrame()
 
@@ -73,7 +77,8 @@ def build_clv_proxy(
         "book",
         "market_key",
     ]
-    snapshots_df = snapshots_df.dropna(subset=key_cols + ["snapshot_ts_utc"]).copy()
+    snapshots_df = snapshots_df.dropna(
+        subset=key_cols + ["snapshot_ts_utc"]).copy()
     if snapshots_df.empty:
         return pd.DataFrame()
 
@@ -123,7 +128,10 @@ def build_clv_proxy(
 
     if not rows:
         return pd.DataFrame()
-    return pd.DataFrame(rows).sort_values(["game_date", "player_id", "stat_type", "book"]).reset_index(drop=True)
+    out = pd.DataFrame(rows).sort_values(
+        ["game_date", "player_id", "stat_type", "book"]
+    ).reset_index(drop=True)
+    return out
 
 
 def run_clv_proxy(
@@ -134,6 +142,7 @@ def run_clv_proxy(
     min_snapshots_per_market: int = 2,
     output_prefix: str = "clv_proxy",
 ) -> dict:
+    """Load snapshots, build CLV proxy table, write CSV and return summary."""
     snapshots_df = load_snapshots(
         db_path=db_path,
         start_date=start_date,
@@ -157,7 +166,9 @@ def run_clv_proxy(
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Compute simple CLV-style proxies from line snapshots.")
+    parser = argparse.ArgumentParser(
+        description="Compute simple CLV-style proxies from line snapshots."
+    )
     parser.add_argument("--db-path", default="data/database/nba_data.db")
     parser.add_argument("--start-date", default=None)
     parser.add_argument("--end-date", default=None)
@@ -167,7 +178,8 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main():
+def main() -> None:
+    """CLI entry point: run CLV proxy and print summary."""
     args = _build_parser().parse_args()
     result = run_clv_proxy(
         db_path=args.db_path,
@@ -184,4 +196,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

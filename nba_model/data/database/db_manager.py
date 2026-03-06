@@ -1,8 +1,10 @@
-import sqlite3
-import pandas as pd
-from pathlib import Path
-from datetime import datetime
+"""SQLite database manager for NBA data, betting lines, and predictions."""
 import logging
+import sqlite3
+from datetime import datetime
+from pathlib import Path
+
+import pandas as pd
 
 logger = logging.getLogger(__name__)
 
@@ -21,11 +23,11 @@ class DatabaseManager:
         self.conn = sqlite3.connect(self.db_path)
 
         # Read and execute schema
-        schema_path = Path(__file__).parent / 'schema.sql'
-        with open(schema_path, 'r') as f:
+        schema_path = Path(__file__).parent / "schema.sql"
+        with open(schema_path, "r", encoding="utf-8") as f:
             self.conn.executescript(f.read())
 
-        logger.info(f"Database initialized at {self.db_path}")
+        logger.info("Database initialized at %s", self.db_path)
 
     def insert_player(self, player_id, name, team=None, position=None):
         """Insert or update player record."""
@@ -77,7 +79,7 @@ class DatabaseManager:
             return
         self.conn.executemany(query, payload)
         self.conn.commit()
-        logger.info(f"✓ Upserted {len(payload)} team_defense rows")
+        logger.info("Upserted %s team_defense rows", len(payload))
 
     def insert_betting_lines_records(self, records):
         """
@@ -141,7 +143,11 @@ class DatabaseManager:
         self.conn.commit()
         inserted = self.conn.total_changes - before_changes
         ignored = len(payload) - inserted
-        logger.info(f"✓ Inserted {inserted} betting_lines rows ({ignored} duplicates ignored)")
+        logger.info(
+            "Inserted %s betting_lines rows (%s duplicates ignored)",
+            inserted,
+            ignored,
+        )
         return {
             "inserted": int(inserted),
             "duplicates_ignored": int(ignored),
@@ -211,7 +217,7 @@ class DatabaseManager:
         self.conn.executemany(query, payload)
         self.conn.commit()
         inserted = self.conn.total_changes - before_changes
-        logger.info(f"✓ Inserted {inserted} betting_line_snapshots rows")
+        logger.info("Inserted %s betting_line_snapshots rows", inserted)
         return {
             "inserted": int(inserted),
             "attempted": int(len(payload)),
@@ -229,7 +235,8 @@ class DatabaseManager:
                 return
 
             # Remove duplicates before inserting
-            game_logs_df = game_logs_df.drop_duplicates(subset=['player_id', 'game_id'])
+            game_logs_df = game_logs_df.drop_duplicates(
+                subset=['player_id', 'game_id'])
 
             # Keep only actual table columns and rely on INSERT OR IGNORE for
             # existing rows already present in SQLite.
@@ -238,25 +245,32 @@ class DatabaseManager:
                 for row in self.conn.execute("PRAGMA table_info(game_logs)").fetchall()
             }
             blocked_columns = {'game_log_id', 'created_at'}
-            columns = [col for col in game_logs_df.columns if col in table_columns and col not in blocked_columns]
+            columns = [
+                col for col in game_logs_df.columns
+                if col in table_columns and col not in blocked_columns
+            ]
             if not columns:
                 logger.warning("No valid game_logs columns to insert")
                 return
 
-            payload = game_logs_df[columns].where(pd.notna(game_logs_df[columns]), None)
+            payload = game_logs_df[columns].where(
+                pd.notna(game_logs_df[columns]), None)
             query = f"""
                 INSERT OR IGNORE INTO game_logs ({", ".join(columns)})
                 VALUES ({", ".join(["?"] * len(columns))})
             """
 
             before_changes = self.conn.total_changes
-            self.conn.executemany(query, payload.itertuples(index=False, name=None))
+            self.conn.executemany(
+                query, payload.itertuples(index=False, name=None))
             self.conn.commit()
             inserted = self.conn.total_changes - before_changes
             ignored = len(payload) - inserted
-            logger.info(f"✓ Inserted {inserted} game logs ({ignored} duplicates ignored)")
+            logger.info(
+                "Inserted %s game logs (%s duplicates ignored)", inserted, ignored
+            )
         except Exception as e:
-            logger.error(f"Error inserting game logs: {e}")
+            logger.error("Error inserting game logs: %s", e)
             self.conn.rollback()
             raise
 
@@ -415,7 +429,8 @@ class DatabaseManager:
             """
             params = (player_id, game_date, stat_type)
 
-        rows = [r[0] for r in self.conn.execute(query, params).fetchall() if r and r[0] is not None]
+        rows = [r[0] for r in self.conn.execute(
+            query, params).fetchall() if r and r[0] is not None]
         if not rows:
             return None
 
@@ -464,7 +479,13 @@ class DatabaseManager:
             "closing_spread",
             "closing spread",
         ]
-        spread_aliases = sorted({str(alias).strip().lower() for alias in spread_aliases if str(alias).strip()})
+        spread_aliases = sorted(
+            {
+                str(alias).strip().lower()
+                for alias in spread_aliases
+                if str(alias).strip()
+            }
+        )
         if not spread_aliases:
             return None
 
@@ -489,7 +510,8 @@ class DatabaseManager:
             """
             params = (player_id, game_date, *spread_aliases)
 
-        rows = [r[0] for r in self.conn.execute(query, params).fetchall() if r and r[0] is not None]
+        rows = [r[0] for r in self.conn.execute(
+            query, params).fetchall() if r and r[0] is not None]
         if not rows:
             return None
 

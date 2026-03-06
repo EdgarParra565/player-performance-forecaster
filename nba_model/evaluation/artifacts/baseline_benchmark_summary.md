@@ -11,8 +11,8 @@ This benchmark uses deterministic synthetic player logs to validate the end-to-e
 stat_type  window   avg_roi  avg_win_rate  total_bets  total_games
   assists      10 32.052233      0.691702         281          315
   assists       7 26.783022      0.664102         279          315
-   points      10  1.099578      0.529569         233          315
-   points       7 -0.260349      0.522446         255          315
+   points      10  0.969962      0.528890         230          315
+   points       7  0.097438      0.524320         243          315
       pra      10 36.559910      0.715314         299          315
       pra       7 35.396824      0.709221         293          315
  rebounds      10 44.422348      0.756498         274          315
@@ -26,12 +26,12 @@ Stephen Curry   assists       7         5.5          105         95    68      2
  LeBron James   assists      10         7.5          105         85    54      31  0.635294  21.283422        1990.0     0.243598
  Nikola Jokic   assists      10         8.5          105        101    71      30  0.702970  34.203420        3800.0     0.211578
 Stephen Curry   assists      10         5.5          105         95    70      25  0.736842  40.669856        4250.0     0.219822
- LeBron James    points       7        25.5          105         78    50      28  0.641026  22.377622        1920.0     0.236606
- Nikola Jokic    points       7        26.5          105         81    32      49  0.395062 -24.579125       -2190.0     0.296868
-Stephen Curry    points       7        27.5          105         96    51      45  0.531250   1.420455         150.0     0.293746
- LeBron James    points      10        25.5          105         74    51      23  0.689189  31.572482        2570.0     0.228668
- Nikola Jokic    points      10        26.5          105         70    26      44  0.371429 -29.090909       -2240.0     0.285626
-Stephen Curry    points      10        27.5          105         89    47      42  0.528090   0.817160          80.0     0.281897
+ LeBron James    points       7        25.5          105         72    47      25  0.652778  24.621212        1950.0     0.239948
+ Nikola Jokic    points       7        26.5          105         78    29      49  0.371795 -29.020979       -2490.0     0.294985
+Stephen Curry    points       7        27.5          105         93    51      42  0.548387   4.692082         480.0     0.290648
+ LeBron James    points      10        25.5          105         68    45      23  0.661765  26.336898        1970.0     0.232133
+ Nikola Jokic    points      10        26.5          105         68    26      42  0.382353 -27.005348       -2020.0     0.283991
+Stephen Curry    points      10        27.5          105         94    51      43  0.542553   3.578337         370.0     0.280046
  LeBron James       pra       7        40.5          105         93    63      30  0.677419  29.325513        3000.0     0.242549
  Nikola Jokic       pra       7        46.5          105         99    73      26  0.737374  40.771350        4440.0     0.206054
 Stephen Curry       pra       7        37.5          105        101    72      29  0.712871  36.093609        4010.0     0.214878

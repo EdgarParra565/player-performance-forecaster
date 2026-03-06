@@ -74,11 +74,13 @@ def _resolve_team_abbrev_series(df: pd.DataFrame) -> pd.Series:
 
     team_name_col = _find_col(df, ["TEAM_NAME", "TEAM"])
     if team_name_col:
-        mapped = df[team_name_col].astype(str).str.strip().str.lower().map(by_name)
+        mapped = df[team_name_col].astype(
+            str).str.strip().str.lower().map(by_name)
         if mapped.notna().any():
             return mapped
 
-    raise KeyError(f"Unable to resolve team abbreviation from columns: {list(df.columns)}")
+    raise KeyError(
+        f"Unable to resolve team abbreviation from columns: {list(df.columns)}")
 
 
 def fetch_team_defense_df(season: str = DEFAULT_SEASON) -> pd.DataFrame:
@@ -103,7 +105,8 @@ def fetch_team_defense_df(season: str = DEFAULT_SEASON) -> pd.DataFrame:
     pace_col = _find_col(df, ["PACE"])
 
     if not def_col:
-        raise KeyError(f"Expected DEF_RATING column missing in API response: {list(df.columns)}")
+        raise KeyError(
+            f"Expected DEF_RATING column missing in API response: {list(df.columns)}")
 
     rows = pd.DataFrame(
         {
@@ -114,7 +117,8 @@ def fetch_team_defense_df(season: str = DEFAULT_SEASON) -> pd.DataFrame:
             "pace": pd.to_numeric(df[pace_col], errors="coerce") if pace_col else None,
         }
     )
-    rows = rows.dropna(subset=["team_abbrev", "def_rating"]).reset_index(drop=True)
+    rows = rows.dropna(
+        subset=["team_abbrev", "def_rating"]).reset_index(drop=True)
     return rows
 
 
@@ -124,7 +128,10 @@ def populate_team_defense(season: str = DEFAULT_SEASON, db_path: str = DEFAULT_D
     records = rows.to_dict(orient="records")
     with DatabaseManager(db_path=db_path) as db:
         db.insert_team_defense_records(records)
-    logger.info(f"Populated team_defense for season={season} with {len(records)} rows")
+    logger.info(
+        "Populated team_defense for season=%s with %s rows", season, len(
+            records)
+    )
     return len(records)
 
 
@@ -193,13 +200,16 @@ def print_team_defense_validation_report(report: dict) -> None:
     print(f"Latest update: {report.get('latest_updated') or 'N/A'}")
     missing_teams = report.get("missing_teams") or []
     unexpected_teams = report.get("unexpected_teams") or []
-    print(f"Missing teams: {', '.join(missing_teams) if missing_teams else 'none'}")
-    print(f"Unexpected teams: {', '.join(unexpected_teams) if unexpected_teams else 'none'}")
+    print(
+        f"Missing teams: {', '.join(missing_teams) if missing_teams else 'none'}")
+    print(
+        f"Unexpected teams: {', '.join(unexpected_teams) if unexpected_teams else 'none'}")
     print(f"Coverage complete: {'yes' if report.get('is_complete') else 'no'}")
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Populate team_defense table from NBA API.")
+    parser = argparse.ArgumentParser(
+        description="Populate team_defense table from NBA API.")
     parser.add_argument("--season", default=DEFAULT_SEASON)
     parser.add_argument("--db-path", default=DEFAULT_DB_PATH)
     parser.add_argument(
@@ -220,7 +230,8 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main():
+def main() -> None:
+    """CLI entry point: populate team_defense and optionally run validation."""
     args = _build_parser().parse_args()
     if not args.validate_only:
         count = populate_team_defense(season=args.season, db_path=args.db_path)
@@ -229,7 +240,8 @@ def main():
     if args.skip_validation:
         return
 
-    report = build_team_defense_validation_report(season=args.season, db_path=args.db_path)
+    report = build_team_defense_validation_report(
+        season=args.season, db_path=args.db_path)
     print_team_defense_validation_report(report)
 
     if args.fail_on_missing and (report["missing_teams"] or report["unexpected_teams"]):

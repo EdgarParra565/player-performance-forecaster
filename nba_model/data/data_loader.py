@@ -1,10 +1,14 @@
-from nba_api.stats.endpoints import playergamelogs
-from nba_api.stats.static import players
-import pandas as pd
+"""Load NBA game logs with DB, file cache, and NBA API."""
+import json
 import time
 from pathlib import Path
-import json
+
+import pandas as pd
+from nba_api.stats.endpoints import playergamelogs
+from nba_api.stats.static import players
+
 from nba_model.data.database.db_manager import DatabaseManager
+
 
 class DataLoader:
     """Load NBA data with local caching."""
@@ -42,21 +46,21 @@ class DataLoader:
         if not force_refresh:
             df = self.db.get_player_games(player_id, n_games)
             if not df.empty and len(df) >= n_games:
-                print(f"✓ Loaded {len(df)} games from database")
+                print(f"[OK] Loaded {len(df)} games from database")
                 return df
 
         # Check file cache
         cache_file = self.cache_dir / f"{player_id}_gamelogs.json"
         if cache_file.exists() and not force_refresh:
-            with open(cache_file, 'r') as f:
+            with open(cache_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
                 df = pd.DataFrame(data)
                 if len(df) >= n_games:
-                    print(f"✓ Loaded {len(df)} games from cache")
+                    print(f"[OK] Loaded {len(df)} games from cache")
                     return df.head(n_games)
 
         # Fetch from API
-        print(f"→ Fetching fresh data from NBA API for {player_name}...")
+        print(f"Fetching fresh data from NBA API for {player_name}...")
         time.sleep(0.6)  # Rate limiting
 
         gamelog = playergamelogs.PlayerGameLogs(
@@ -74,7 +78,7 @@ class DataLoader:
         # Save to database
         self.db.insert_game_logs(df)
 
-        print(f"✓ Fetched and cached {len(df)} games")
+        print(f"[OK] Fetched and cached {len(df)} games")
         return df.head(n_games)
 
     def _clean_game_logs(self, df, player_id):
@@ -109,7 +113,8 @@ class DataLoader:
         }
 
         # Only rename columns that exist in the dataframe
-        existing_cols = {k: v for k, v in column_mapping.items() if k in df.columns}
+        existing_cols = {k: v for k,
+                         v in column_mapping.items() if k in df.columns}
         df = df.rename(columns=existing_cols)
 
         # Ensure player_id is set
@@ -128,7 +133,8 @@ class DataLoader:
             df['minutes'] = df['minutes'].apply(self._convert_minutes)
 
         # Return only columns that exist (to avoid KeyError)
-        return_cols = [v for v in column_mapping.values() if v in df.columns] + ['home_away']
+        return_cols = [v for v in column_mapping.values(
+        ) if v in df.columns] + ['home_away']
         return df[return_cols]
 
     def _convert_minutes(self, time_str):
@@ -163,4 +169,6 @@ def load_player_logs(player, season=None, n_games=50, force_refresh=False):
     else:
         player_name = player
 
-    return loader.load_player_data(player_name=player_name, n_games=n_games, force_refresh=force_refresh)
+    return loader.load_player_data(
+        player_name=player_name, n_games=n_games, force_refresh=force_refresh
+    )

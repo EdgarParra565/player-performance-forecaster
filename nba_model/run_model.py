@@ -1,3 +1,4 @@
+"""CLI and helpers for single-prop and parlay NBA props model demos."""
 import argparse
 import sys
 from pathlib import Path
@@ -27,27 +28,8 @@ from nba_model.model.simulation import (
 )
 
 
-"""
-python3 -m nba_model.run_model \
-  --mode parlay \
-  --sportsbook prizepicks \
-  --player "LeBron James" \
-  --parlay-stats pts ast reb \
-  --parlay-lines 27.5 7.5 8.5 \
-  --parlay-odds 3.0 \
-  --parlay-odds-format multiplier
-
-python3 -m nba_model.run_model \
-  --mode parlay \
-  --sportsbook underdog \
-  --player "LeBron James" \
-  --parlay-stats points assists rebounds \
-  --parlay-lines 27.5 7.5 8.5 \
-  --parlay-odds 2.85 \
-  --parlay-odds-format decimal
-
-python3 -m nba_model.simple_ui
-"""
+# Example: python3 -m nba_model.run_model --mode parlay --sportsbook prizepicks ...
+# Example: python3 -m nba_model.simple_ui
 
 DEFAULT_PLAYER_NAME = "LeBron James"
 DEFAULT_ROLLING_WINDOW = 10
@@ -187,7 +169,8 @@ def run_single_prop(
     ]
     latest = df.dropna(subset=required_cols)
     if latest.empty:
-        raise ValueError("Insufficient data after rolling window; increase n_games or reduce window.")
+        raise ValueError(
+            "Insufficient data after rolling window; increase n_games or reduce window.")
     latest = latest.iloc[-1]
 
     ppm = latest["rolling_mean_points_per_minute"]
@@ -234,8 +217,12 @@ def run_single_prop(
     print(f"Distribution: {selected_distribution}")
     print(f"Projected minutes: {proj_minutes:.1f}")
     print(f"Expected points (mu): {mu:.2f}")
-    print(f"Defense sensitivity: {defense_sensitivity:.3f} -> effective {effective_defense_sensitivity:.3f}")
-    print(f"Blowout penalty: {base_blowout_penalty:.3f} -> effective {effective_blowout_penalty:.3f}")
+    print(
+        "Defense sensitivity: %.3f -> effective %.3f"
+        % (defense_sensitivity, effective_defense_sensitivity)
+    )
+    print(
+        f"Blowout penalty: {base_blowout_penalty:.3f} -> effective {effective_blowout_penalty:.3f}")
     print(f"Sigma: {sigma:.2f} -> adjusted {adjusted_sigma:.2f}")
     print(f"Model P(OVER): {p_over:.2%}")
     print(f"Book Implied P: {implied:.2%}")
@@ -291,20 +278,25 @@ def run_parlay_demo(
 
     missing_stats = [col for col in stats_cols if col not in df_player.columns]
     if missing_stats:
-        raise KeyError(f"Missing columns for parlay simulation: {missing_stats}")
+        raise KeyError(
+            f"Missing columns for parlay simulation: {missing_stats}")
 
     corr_matrix = calibrate_correlations(df_player, stats_cols)
-    corr_matrix = _apply_correlation_severity(corr_matrix, correlation_severity=correlation_severity)
+    corr_matrix = _apply_correlation_severity(
+        corr_matrix, correlation_severity=correlation_severity)
     volatility_scale = max(0.01, float(volatility_severity))
-    stds = {col: float(df_player[col].dropna().std()) * volatility_scale for col in stats_cols}
-    means = [float(df_player[col].dropna().tail(DEFAULT_ROLLING_WINDOW).mean()) for col in stats_cols]
+    stds = {col: float(df_player[col].dropna().std())
+            * volatility_scale for col in stats_cols}
+    means = [float(df_player[col].dropna().tail(
+        DEFAULT_ROLLING_WINDOW).mean()) for col in stats_cols]
     cov_matrix = covariance_matrix(corr_matrix, stds)
     cov_matrix = _ensure_psd_covariance(cov_matrix)
 
     prob = simulate_multi_leg_sgp(means, cov_matrix, lines, n=n_sims)
     ev = calculate_parlay_ev(prob, american_odds)
     implied = american_to_implied_prob(american_odds)
-    leg_desc = ", ".join(f"{stat} > {line}" for stat, line in zip(stats_cols, lines))
+    leg_desc = ", ".join(f"{stat} > {line}" for stat,
+                         line in zip(stats_cols, lines))
 
     print(f"\nParlay Demo: {player_name} ({sportsbook})")
     print(f"Legs: {leg_desc}")
@@ -332,18 +324,25 @@ def run_parlay_demo(
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Run NBA player props model demos.")
-    parser.add_argument("--mode", choices=["single", "parlay", "both"], default="single")
+    parser = argparse.ArgumentParser(
+        description="Run NBA player props model demos.")
+    parser.add_argument(
+        "--mode", choices=["single", "parlay", "both"], default="single")
     parser.add_argument("--player", default=DEFAULT_PLAYER_NAME)
     parser.add_argument("--line", type=float, default=DEFAULT_POINTS_LINE)
     parser.add_argument("--odds", type=int, default=DEFAULT_AMERICAN_ODDS)
     parser.add_argument("--window", type=int, default=DEFAULT_ROLLING_WINDOW)
-    parser.add_argument("--opp-def-rating", type=float, default=DEFAULT_OPP_DEF_RATING)
+    parser.add_argument("--opp-def-rating", type=float,
+                        default=DEFAULT_OPP_DEF_RATING)
     parser.add_argument("--spread", type=float, default=DEFAULT_VEGAS_SPREAD)
-    parser.add_argument("--league-avg-def-rating", type=float, default=DEFAULT_LEAGUE_AVG_DEF_RATING)
-    parser.add_argument("--defense-sensitivity", type=float, default=DEFAULT_DEFENSE_SENSITIVITY)
-    parser.add_argument("--blowout-threshold", type=float, default=DEFAULT_BLOWOUT_THRESHOLD)
-    parser.add_argument("--blowout-penalty", type=float, default=DEFAULT_BLOWOUT_PENALTY)
+    parser.add_argument("--league-avg-def-rating", type=float,
+                        default=DEFAULT_LEAGUE_AVG_DEF_RATING)
+    parser.add_argument("--defense-sensitivity", type=float,
+                        default=DEFAULT_DEFENSE_SENSITIVITY)
+    parser.add_argument("--blowout-threshold", type=float,
+                        default=DEFAULT_BLOWOUT_THRESHOLD)
+    parser.add_argument("--blowout-penalty", type=float,
+                        default=DEFAULT_BLOWOUT_PENALTY)
     parser.add_argument(
         "--distribution",
         choices=SINGLE_PROP_DISTRIBUTION_CHOICES,
@@ -355,9 +354,16 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--minutes-penalty-severity", type=float, default=1.0)
     parser.add_argument("--sigma-severity", type=float, default=1.0)
     parser.add_argument("--plot", action="store_true")
-    parser.add_argument("--sportsbook", choices=["custom", "prizepicks", "underdog"], default="custom")
-    parser.add_argument("--parlay-stats", nargs="+", default=DEFAULT_PARLAY_STATS)
-    parser.add_argument("--parlay-lines", nargs="+", type=float, default=DEFAULT_PARLAY_LINES)
+    parser.add_argument(
+        "--sportsbook",
+        type=str,
+        default="custom",
+        help="Sportsbook label (e.g. prizepicks, underdog, draftkings, fanduel, custom).",
+    )
+    parser.add_argument("--parlay-stats", nargs="+",
+                        default=DEFAULT_PARLAY_STATS)
+    parser.add_argument("--parlay-lines", nargs="+",
+                        type=float, default=DEFAULT_PARLAY_LINES)
     parser.add_argument(
         "--parlay-odds",
         type=float,
@@ -375,7 +381,8 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main():
+def main() -> None:
+    """Parse CLI and run single-prop and/or parlay demo."""
     args = _build_parser().parse_args()
 
     if args.mode in {"single", "both"}:

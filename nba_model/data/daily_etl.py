@@ -123,8 +123,12 @@ def run_with_retry(
                 break
             delay = base_delay * (backoff ** (attempt - 1))
             logger.warning(
-                f"{step_name} attempt {attempt}/{retries + 1} failed: {exc}. "
-                f"Retrying in {delay:.2f}s."
+                "%s attempt %s/%s failed: %s. Retrying in %.2fs.",
+                step_name,
+                attempt,
+                retries + 1,
+                exc,
+                delay,
             )
             if delay > 0:
                 time.sleep(delay)
@@ -135,7 +139,11 @@ def run_with_retry(
         "step": step_name,
         "attempts": attempt,
         "elapsed_ms": elapsed_ms,
-        "error": _serialize_error(last_error) if last_error else {"type": "UnknownError", "message": ""},
+        "error": (
+            _serialize_error(last_error)
+            if last_error
+            else {"type": "UnknownError", "message": ""}
+        ),
     }
 
 
@@ -523,7 +531,8 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main():
+def main() -> None:
+    """CLI entry point: run daily ETL and write report."""
     log_path = configure_logging()
     args = _build_parser().parse_args()
     report = run_daily_etl(

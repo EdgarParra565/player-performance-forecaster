@@ -167,7 +167,6 @@ TECHNICAL DEBT / KNOWN ISSUES
 - Some modules still use `print()` instead of structured logging.
 - DB path/config is still mostly default-arg based; centralized env config is incomplete.
 - No explicit handling for player trades/team-context shifts mid-season.
-- Legacy utility files remain (`nba_model/data/nba_data_fetcher.py`, `nba_model/data/database_utils.py`) and should be consolidated or retired.
 
 ================================================================================
 RESOURCES & REFERENCES

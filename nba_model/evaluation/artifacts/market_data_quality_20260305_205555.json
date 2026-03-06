@@ -1,0 +1,17 @@
+{
+  "betting_lines_rows":0,
+  "snapshots_rows":0,
+  "betting_lines_missing_player_id":0,
+  "betting_lines_missing_game_date":0,
+  "betting_lines_missing_stat_type":0,
+  "betting_lines_missing_line_value":0,
+  "snapshots_missing_timestamp":0,
+  "snapshots_missing_player_id":0,
+  "snapshots_missing_book":0,
+  "snapshots_missing_stat_type":0,
+  "snapshots_missing_line_value":0,
+  "snapshots_exact_duplicate_rows":0,
+  "latest_snapshot_ts_utc":null,
+  "hours_since_latest_snapshot":null,
+  "snapshots_stale_flag":false
+}

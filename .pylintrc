@@ -1,0 +1,28 @@
+# Pylint config for player-performance-forecaster
+# Disable refactor-heavy or optional checks; fix style/convention in code.
+
+[MESSAGES CONTROL]
+# Refactor: allow many args/locals/branches (avoid large signature refactors)
+disable=
+    R0913,
+    R0914,
+    R0917,
+    R0912,
+    R0911,
+    R0902,
+    R0903,
+    W0201,
+    C0302,
+    C0413,
+    C0415,
+    W0718,
+    C0209,
+    C0411,
+    W0640,
+
+[BASIC]
+# Allow short names common in math/UI
+good-names=i,j,k,df,id,x,y,e,f,_
+
+[FORMAT]
+max-line-length=100
