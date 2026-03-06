@@ -142,8 +142,9 @@ Notes:
 This repository includes a scheduled GitHub Actions workflow (`.github/workflows/daily_etl.yml`) that runs the daily ETL once per day:
 
 - **Schedule**: 08:00 UTC (configurable via the `cron` line in the workflow).
-- **Command**: `python -m nba_model.data.daily_etl --strict`
-- **Required secret**: `ODDS_API_KEY` (configure in your GitHub repository Settings → Secrets and variables → Actions).
+- **Command in CI**: `python -m nba_model.data.daily_etl --strict --skip-game-logs --skip-team-defense` (stats.nba.com times out from GitHub’s network; game logs and team defense are for local or self-hosted runs).
+- **Full ETL locally**: `python -m nba_model.data.daily_etl --strict`
+- **Required secret**: `ODDS_API_KEY` (configure in your GitHub repository Settings → Secrets and variables → Actions). Without it, the odds step is skipped and the run still succeeds.
 
 Daily ETL runs emit:
 
@@ -290,7 +291,11 @@ Latest results are generated into:
 
 - **Check scheduler health**:
   - Verify the `Daily NBA ETL` GitHub Actions workflow is running on schedule and succeeding.
-  - On failures, inspect the workflow logs and the local ETL log file path printed at the end of the run.
+  - On failures, inspect the workflow logs and the **"Show ETL failure summary"** step (which prints per-step status from the last report).
+- **When daily ETL fails in GitHub Actions**:
+  - Download the **etl-artifacts-** artifact from the failed run; it contains the latest ETL report JSON and logs.
+  - In CI, **game_logs** and **team_defense** are skipped by design (stats.nba.com times out from GitHub runners). If the run still fails, the cause is usually the **odds** step (e.g. invalid or missing `ODDS_API_KEY`). Fix odds config or run ETL locally for full data.
+  - For full ETL (game logs + team defense), run locally: `python -m nba_model.data.daily_etl --strict`.
 - **Inspect ETL artifacts**:
   - JSON ETL reports are stored under `nba_model/data/artifacts/` and include per-step statuses and errors.
   - Detailed ETL logs are stored under `nba_model/data/logs/`.

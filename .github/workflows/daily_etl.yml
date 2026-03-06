@@ -30,11 +30,36 @@ jobs:
           pip install -e .
 
       - name: Run daily ETL
+        id: etl
         env:
           ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
         run: |
           source .venv/bin/activate
-          python -m nba_model.data.daily_etl --strict
+          # stats.nba.com times out from GitHub Actions (data-center IPs). Skip game_logs and team_defense in CI.
+          # Run full ETL locally: python -m nba_model.data.daily_etl --strict
+          python -m nba_model.data.daily_etl --strict --skip-game-logs --skip-team-defense
+
+      - name: Show ETL failure summary
+        if: failure()
+        run: |
+          echo "=== ETL step failed. Step statuses ==="
+          if ls nba_model/data/artifacts/daily_etl_report_*.json 1>/dev/null 2>&1; then
+            latest=$(ls -t nba_model/data/artifacts/daily_etl_report_*.json 2>/dev/null | head -1)
+            echo "Report: $latest"
+            jq -r '.steps | to_entries[] | "  \(.key): \(.value.status)"' "$latest" 2>/dev/null || cat "$latest"
+          else
+            echo "No ETL report file found (ETL may have failed before writing)."
+          fi
+
+      - name: Upload ETL artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: etl-artifacts-${{ github.run_number }}
+          path: |
+            nba_model/data/artifacts
+            nba_model/data/logs
+          if-no-files-found: ignore
 
       - name: Notify on failure (optional Slack/email webhook)
         if: failure()
