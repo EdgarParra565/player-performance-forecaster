@@ -1,0 +1,912 @@
+{
+  "db_path": "data/database/nba_data.db",
+  "elapsed_ms": 311136,
+  "finished_at_utc": "2026-03-14T17:55:18.701013+00:00",
+  "player_selection_summary": {
+    "db_count": 94,
+    "default_seed_count": 0,
+    "explicit_count": 0,
+    "limit_applied": false,
+    "min_topup_count": 0,
+    "player_limit": null,
+    "total_before_limit": 94,
+    "total_selected": 94
+  },
+  "players_selected": [
+    "Aaron Gordon",
+    "Adem Bona",
+    "Alex Sarr",
+    "Austin Reaves",
+    "Bam Adebayo",
+    "Baylor Scheierman",
+    "Ben Saraf",
+    "Bennedict Mathurin",
+    "Bilal Coulibaly",
+    "Brandon Miller",
+    "Brook Lopez",
+    "Bruce Brown",
+    "C.J. McCollum",
+    "Cameron Johnson",
+    "Cameron Payne",
+    "Christian Braun",
+    "Coby White",
+    "Corey Kispert",
+    "Danny Wolf",
+    "Darius Garland",
+    "Davion Mitchell",
+    "De'Aaron Fox",
+    "DeMar DeRozan",
+    "Deandre Ayton",
+    "Derrick Jones",
+    "Derrick White",
+    "Desmond Bane",
+    "Devin Vassell",
+    "Dominick Barlow",
+    "Dylan Cardwell",
+    "Dylan Harper",
+    "Dyson Daniels",
+    "Jaime Jaquez Jr",
+    "Jalen Johnson",
+    "Jalen Suggs",
+    "Jamal Murray",
+    "Jaxson Hayes",
+    "Jaylen Brown",
+    "Jayson Tatum",
+    "Jett Howard",
+    "Jevon Carter",
+    "Jock Landale",
+    "Jonas Valanciunas",
+    "Julian Champagnie",
+    "Justin Edwards",
+    "Kawhi Leonard",
+    "Kel'el Ware",
+    "Kevin Porter Jr.",
+    "Kon Knueppel",
+    "Kris Dunn",
+    "Kyle Kuzma",
+    "LaMelo Ball",
+    "LeBron James",
+    "Luka Doncic",
+    "Luke Kennard",
+    "Malik Monk",
+    "Marcus Smart",
+    "Maxime Raynaud",
+    "Miles Bridges",
+    "Moussa Diabate",
+    "Myles Turner",
+    "Neemias Queta",
+    "Nickeil Alexander-Walker",
+    "Nikola Jokic",
+    "Nique Clifford",
+    "Noah Clowney",
+    "Nolan Traore",
+    "Norman Powell",
+    "Onyeka Okongwu",
+    "Paolo Banchero",
+    "Payton Pritchard",
+    "Pelle Larsson",
+    "Precious Achiuwa",
+    "Quentin Grimes",
+    "Rui Hachimura",
+    "Russell Westbrook",
+    "Ryan Kalkbrenner",
+    "Ryan Rollins",
+    "Sam Hauser",
+    "Sion James",
+    "Stephon Castle",
+    "Terance Mann",
+    "Tim Hardaway Jr",
+    "Trae Young",
+    "Tre Johnson",
+    "Trendon Watford",
+    "Tristan da Silva",
+    "Tyler Herro",
+    "VJ Edgecombe",
+    "Victor Wembanyama",
+    "Wendell Carter Jr",
+    "Will Riley",
+    "Zaccharie Risacher",
+    "Ziaire Williams"
+  ],
+  "season": "2025-26",
+  "started_at_utc": "2026-03-14T17:50:07.560050+00:00",
+  "status": "partial_success",
+  "steps": {
+    "game_logs": {
+      "attempts": 1,
+      "elapsed_ms": 310947,
+      "result": {
+        "failed_players": 1,
+        "players": [
+          {
+            "attempts": 1,
+            "elapsed_ms": 771,
+            "error": null,
+            "player_name": "Aaron Gordon",
+            "rows_loaded": 69,
+            "status": "success"
+          },
+          {
+            "attempts": 1,
+            "elapsed_ms": 655,
+            "error": null,
+            "player_name": "Adem Bona",
+            "rows_loaded": 64,
+            "status": "success"
+          },
+          {
+            "attempts": 1,
+            "elapsed_ms": 665,
+            "error": null,
+            "player_name": "Alex Sarr",
+            "rows_loaded": 71,
+            "status": "success"
+          },
+          {
+            "attempts": 1,
+            "elapsed_ms": 666,
+            "error": null,
+            "player_name": "Austin Reaves",
+            "rows_loaded": 82,
+            "status": "success"
+          },
+          {
+            "attempts": 1,
+            "elapsed_ms": 652,
+            "error": null,
+            "player_name": "Bam Adebayo",
+            "rows_loaded": 88,
+            "status": "success"
+          },
+          {
+            "attempts": 1,
+            "elapsed_ms": 655,
+            "error": null,
+            "player_name": "Baylor Scheierman",
+            "rows_loaded": 40,
+            "status": "success"
+          },
+          {
+            "attempts": 1,
+            "elapsed_ms": 649,
+            "error": null,
+            "player_name": "Ben Saraf",
+            "rows_loaded": 0,
+            "status": "success"
+          },
+          {
+            "attempts": 1,
+            "elapsed_ms": 676,
+            "error": null,
+            "player_name": "Bennedict Mathurin",
+            "rows_loaded": 98,
+            "status": "success"
+          },
+          {
+            "attempts": 1,
+            "elapsed_ms": 662,
+            "error": null,
+            "player_name": "Bilal Coulibaly",
+            "rows_loaded": 63,
+            "status": "success"
+          },
+          {
+            "attempts": 1,
+            "elapsed_ms": 662,
+            "error": null,
+            "player_name": "Brandon Miller",
+            "rows_loaded": 32,
+            "status": "success"
+          },
+          {
+            "attempts": 1,
+            "elapsed_ms": 662,
+            "error": null,
+            "player_name": "Brook Lopez",
+            "rows_loaded": 89,
+            "status": "success"
+          },
+          {
+            "attempts": 1,
+            "elapsed_ms": 660,
+            "error": null,
+            "player_name": "Bruce Brown",
+            "rows_loaded": 41,
+            "status": "success"
+          },
+          {
+            "attempts": 4,
+            "elapsed_ms": 7103,
+            "error": {
+              "message": "Player 'C.J. McCollum' not found",
+              "type": "ValueError"
+            },
+            "player_name": "C.J. McCollum",
+            "rows_loaded": 0,
+            "status": "failed"
+          },
+          {
+            "attempts": 1,
+            "elapsed_ms": 663,
+            "error": null,
+            "player_name": "Cameron Johnson",
+            "rows_loaded": 61,
+            "status": "success"
+          },
+          {
+            "attempts": 1,
+            "elapsed_ms": 3316,
+            "error": null,
+            "player_name": "Cameron Payne",
+            "rows_loaded": 91,
+            "status": "success"
+          },
+          {
+            "attempts": 1,
+            "elapsed_ms": 653,
+            "error": null,
+            "player_name": "Christian Braun",
+            "rows_loaded": 98,
+            "status": "success"
+          },
+          {
+            "attempts": 1,
+            "elapsed_ms": 658,
+            "error": null,
+            "player_name": "Coby White",
+            "rows_loaded": 78,
+            "status": "success"
+          },
+          {
+            "attempts": 1,
+            "elapsed_ms": 663,
+            "error": null,
+            "player_name": "Corey Kispert",
+            "rows_loaded": 65,
+            "status": "success"
+          },
+          {
+            "attempts": 1,
+            "elapsed_ms": 654,
+            "error": null,
+            "player_name": "Danny Wolf",
+            "rows_loaded": 0,
+            "status": "success"
+          },
+          {
+            "attempts": 1,
+            "elapsed_ms": 657,
+            "error": null,
+            "player_name": "Darius Garland",
+            "rows_loaded": 84,
+            "status": "success"
+          },
+          {
+            "attempts": 1,
+            "elapsed_ms": 646,
+            "error": null,
+            "player_name": "Davion Mitchell",
+            "rows_loaded": 85,
+            "status": "success"
+          },
+          {
+            "attempts": 1,
+            "elapsed_ms": 647,
+            "error": null,
+            "player_name": "De'Aaron Fox",
+            "rows_loaded": 66,
+            "status": "success"
+          },
+          {
+            "attempts": 1,
+            "elapsed_ms": 657,
+            "error": null,
+            "player_name": "DeMar DeRozan",
+            "rows_loaded": 83,
+            "status": "success"
+          },
+          {
+            "attempts": 1,
+            "elapsed_ms": 655,
+            "error": null,
+            "player_name": "Deandre Ayton",
+            "rows_loaded": 43,
+            "status": "success"
+          },
+          {
+            "attempts": 1,
+            "elapsed_ms": 652,
+            "error": null,
+            "player_name": "Derrick Jones",
+            "rows_loaded": 88,
+            "status": "success"
+          },
+          {
+            "attempts": 1,
+            "elapsed_ms": 638,
+            "error": null,
+            "player_name": "Derrick White",
+            "rows_loaded": 91,
+            "status": "success"
+          },
+          {
+            "attempts": 1,
+            "elapsed_ms": 651,
+            "error": null,
+            "player_name": "Desmond Bane",
+            "rows_loaded": 79,
+            "status": "success"
+          },
+          {
+            "attempts": 1,
+            "elapsed_ms": 651,
+            "error": null,
+            "player_name": "Devin Vassell",
+            "rows_loaded": 64,
+            "status": "success"
+          },
+          {
+            "attempts": 1,
+            "elapsed_ms": 645,
+            "error": null,
+            "player_name": "Dominick Barlow",
+            "rows_loaded": 37,
+            "status": "success"
+          },
+          {
+            "attempts": 1,
+            "elapsed_ms": 3488,
+            "error": null,
+            "player_name": "Dylan Cardwell",
+            "rows_loaded": 0,
+            "status": "success"
+          },
+          {
+            "attempts": 1,
+            "elapsed_ms": 4593,
+            "error": null,
+            "player_name": "Dylan Harper",
+            "rows_loaded": 0,
+            "status": "success"
+          },
+          {
+            "attempts": 1,
+            "elapsed_ms": 5224,
+            "error": null,
+            "player_name": "Dyson Daniels",
+            "rows_loaded": 82,
+            "status": "success"
+          },
+          {
+            "attempts": 1,
+            "elapsed_ms": 3645,
+            "error": null,
+            "player_name": "Jaime Jaquez Jr",
+            "rows_loaded": 74,
+            "status": "success"
+          },
+          {
+            "attempts": 1,
+            "elapsed_ms": 3311,
+            "error": null,
+            "player_name": "Jalen Johnson",
+            "rows_loaded": 39,
+            "status": "success"
+          },
+          {
+            "attempts": 1,
+            "elapsed_ms": 3132,
+            "error": null,
+            "player_name": "Jalen Suggs",
+            "rows_loaded": 38,
+            "status": "success"
+          },
+          {
+            "attempts": 1,
+            "elapsed_ms": 4834,
+            "error": null,
+            "player_name": "Jamal Murray",
+            "rows_loaded": 85,
+            "status": "success"
+          },
+          {
+            "attempts": 1,
+            "elapsed_ms": 4448,
+            "error": null,
+            "player_name": "Jaxson Hayes",
+            "rows_loaded": 66,
+            "status": "success"
+          },
+          {
+            "attempts": 1,
+            "elapsed_ms": 5769,
+            "error": null,
+            "player_name": "Jaylen Brown",
+            "rows_loaded": 80,
+            "status": "success"
+          },
+          {
+            "attempts": 1,
+            "elapsed_ms": 655,
+            "error": null,
+            "player_name": "Jayson Tatum",
+            "rows_loaded": 86,
+            "status": "success"
+          },
+          {
+            "attempts": 1,
+            "elapsed_ms": 4151,
+            "error": null,
+            "player_name": "Jett Howard",
+            "rows_loaded": 65,
+            "status": "success"
+          },
+          {
+            "attempts": 1,
+            "elapsed_ms": 3799,
+            "error": null,
+            "player_name": "Jevon Carter",
+            "rows_loaded": 40,
+            "status": "success"
+          },
+          {
+            "attempts": 1,
+            "elapsed_ms": 3159,
+            "error": null,
+            "player_name": "Jock Landale",
+            "rows_loaded": 44,
+            "status": "success"
+          },
+          {
+            "attempts": 1,
+            "elapsed_ms": 3581,
+            "error": null,
+            "player_name": "Jonas Valanciunas",
+            "rows_loaded": 86,
+            "status": "success"
+          },
+          {
+            "attempts": 1,
+            "elapsed_ms": 5171,
+            "error": null,
+            "player_name": "Julian Champagnie",
+            "rows_loaded": 87,
+            "status": "success"
+          },
+          {
+            "attempts": 1,
+            "elapsed_ms": 3526,
+            "error": null,
+            "player_name": "Justin Edwards",
+            "rows_loaded": 50,
+            "status": "success"
+          },
+          {
+            "attempts": 1,
+            "elapsed_ms": 3823,
+            "error": null,
+            "player_name": "Kawhi Leonard",
+            "rows_loaded": 44,
+            "status": "success"
+          },
+          {
+            "attempts": 1,
+            "elapsed_ms": 3213,
+            "error": null,
+            "player_name": "Kel'el Ware",
+            "rows_loaded": 75,
+            "status": "success"
+          },
+          {
+            "attempts": 1,
+            "elapsed_ms": 3525,
+            "error": null,
+            "player_name": "Kevin Porter Jr.",
+            "rows_loaded": 84,
+            "status": "success"
+          },
+          {
+            "attempts": 1,
+            "elapsed_ms": 3879,
+            "error": null,
+            "player_name": "Kon Knueppel",
+            "rows_loaded": 0,
+            "status": "success"
+          },
+          {
+            "attempts": 1,
+            "elapsed_ms": 3195,
+            "error": null,
+            "player_name": "Kris Dunn",
+            "rows_loaded": 85,
+            "status": "success"
+          },
+          {
+            "attempts": 1,
+            "elapsed_ms": 2637,
+            "error": null,
+            "player_name": "Kyle Kuzma",
+            "rows_loaded": 75,
+            "status": "success"
+          },
+          {
+            "attempts": 1,
+            "elapsed_ms": 8755,
+            "error": null,
+            "player_name": "LaMelo Ball",
+            "rows_loaded": 51,
+            "status": "success"
+          },
+          {
+            "attempts": 1,
+            "elapsed_ms": 650,
+            "error": null,
+            "player_name": "LeBron James",
+            "rows_loaded": 78,
+            "status": "success"
+          },
+          {
+            "attempts": 1,
+            "elapsed_ms": 644,
+            "error": null,
+            "player_name": "Luka Doncic",
+            "rows_loaded": 55,
+            "status": "success"
+          },
+          {
+            "attempts": 1,
+            "elapsed_ms": 3525,
+            "error": null,
+            "player_name": "Luke Kennard",
+            "rows_loaded": 73,
+            "status": "success"
+          },
+          {
+            "attempts": 1,
+            "elapsed_ms": 735,
+            "error": null,
+            "player_name": "Malik Monk",
+            "rows_loaded": 68,
+            "status": "success"
+          },
+          {
+            "attempts": 1,
+            "elapsed_ms": 3640,
+            "error": null,
+            "player_name": "Marcus Smart",
+            "rows_loaded": 37,
+            "status": "success"
+          },
+          {
+            "attempts": 1,
+            "elapsed_ms": 3639,
+            "error": null,
+            "player_name": "Maxime Raynaud",
+            "rows_loaded": 0,
+            "status": "success"
+          },
+          {
+            "attempts": 1,
+            "elapsed_ms": 4283,
+            "error": null,
+            "player_name": "Miles Bridges",
+            "rows_loaded": 68,
+            "status": "success"
+          },
+          {
+            "attempts": 1,
+            "elapsed_ms": 3610,
+            "error": null,
+            "player_name": "Moussa Diabate",
+            "rows_loaded": 76,
+            "status": "success"
+          },
+          {
+            "attempts": 1,
+            "elapsed_ms": 4484,
+            "error": null,
+            "player_name": "Myles Turner",
+            "rows_loaded": 98,
+            "status": "success"
+          },
+          {
+            "attempts": 1,
+            "elapsed_ms": 4981,
+            "error": null,
+            "player_name": "Neemias Queta",
+            "rows_loaded": 71,
+            "status": "success"
+          },
+          {
+            "attempts": 1,
+            "elapsed_ms": 3299,
+            "error": null,
+            "player_name": "Nickeil Alexander-Walker",
+            "rows_loaded": 101,
+            "status": "success"
+          },
+          {
+            "attempts": 1,
+            "elapsed_ms": 643,
+            "error": null,
+            "player_name": "Nikola Jokic",
+            "rows_loaded": 90,
+            "status": "success"
+          },
+          {
+            "attempts": 1,
+            "elapsed_ms": 3053,
+            "error": null,
+            "player_name": "Nique Clifford",
+            "rows_loaded": 0,
+            "status": "success"
+          },
+          {
+            "attempts": 1,
+            "elapsed_ms": 3928,
+            "error": null,
+            "player_name": "Noah Clowney",
+            "rows_loaded": 50,
+            "status": "success"
+          },
+          {
+            "attempts": 1,
+            "elapsed_ms": 5212,
+            "error": null,
+            "player_name": "Nolan Traore",
+            "rows_loaded": 0,
+            "status": "success"
+          },
+          {
+            "attempts": 1,
+            "elapsed_ms": 4271,
+            "error": null,
+            "player_name": "Norman Powell",
+            "rows_loaded": 71,
+            "status": "success"
+          },
+          {
+            "attempts": 1,
+            "elapsed_ms": 5950,
+            "error": null,
+            "player_name": "Onyeka Okongwu",
+            "rows_loaded": 77,
+            "status": "success"
+          },
+          {
+            "attempts": 1,
+            "elapsed_ms": 6471,
+            "error": null,
+            "player_name": "Paolo Banchero",
+            "rows_loaded": 55,
+            "status": "success"
+          },
+          {
+            "attempts": 1,
+            "elapsed_ms": 7525,
+            "error": null,
+            "player_name": "Payton Pritchard",
+            "rows_loaded": 96,
+            "status": "success"
+          },
+          {
+            "attempts": 1,
+            "elapsed_ms": 6022,
+            "error": null,
+            "player_name": "Pelle Larsson",
+            "rows_loaded": 64,
+            "status": "success"
+          },
+          {
+            "attempts": 1,
+            "elapsed_ms": 8258,
+            "error": null,
+            "player_name": "Precious Achiuwa",
+            "rows_loaded": 70,
+            "status": "success"
+          },
+          {
+            "attempts": 1,
+            "elapsed_ms": 5021,
+            "error": null,
+            "player_name": "Quentin Grimes",
+            "rows_loaded": 79,
+            "status": "success"
+          },
+          {
+            "attempts": 1,
+            "elapsed_ms": 5448,
+            "error": null,
+            "player_name": "Rui Hachimura",
+            "rows_loaded": 68,
+            "status": "success"
+          },
+          {
+            "attempts": 1,
+            "elapsed_ms": 4833,
+            "error": null,
+            "player_name": "Russell Westbrook",
+            "rows_loaded": 91,
+            "status": "success"
+          },
+          {
+            "attempts": 1,
+            "elapsed_ms": 2416,
+            "error": null,
+            "player_name": "Ryan Kalkbrenner",
+            "rows_loaded": 0,
+            "status": "success"
+          },
+          {
+            "attempts": 1,
+            "elapsed_ms": 731,
+            "error": null,
+            "player_name": "Ryan Rollins",
+            "rows_loaded": 62,
+            "status": "success"
+          },
+          {
+            "attempts": 1,
+            "elapsed_ms": 3412,
+            "error": null,
+            "player_name": "Sam Hauser",
+            "rows_loaded": 83,
+            "status": "success"
+          },
+          {
+            "attempts": 1,
+            "elapsed_ms": 4981,
+            "error": null,
+            "player_name": "Sion James",
+            "rows_loaded": 0,
+            "status": "success"
+          },
+          {
+            "attempts": 1,
+            "elapsed_ms": 8660,
+            "error": null,
+            "player_name": "Stephon Castle",
+            "rows_loaded": 89,
+            "status": "success"
+          },
+          {
+            "attempts": 1,
+            "elapsed_ms": 5563,
+            "error": null,
+            "player_name": "Terance Mann",
+            "rows_loaded": 74,
+            "status": "success"
+          },
+          {
+            "attempts": 1,
+            "elapsed_ms": 4482,
+            "error": null,
+            "player_name": "Tim Hardaway Jr",
+            "rows_loaded": 88,
+            "status": "success"
+          },
+          {
+            "attempts": 1,
+            "elapsed_ms": 3669,
+            "error": null,
+            "player_name": "Trae Young",
+            "rows_loaded": 83,
+            "status": "success"
+          },
+          {
+            "attempts": 1,
+            "elapsed_ms": 3122,
+            "error": null,
+            "player_name": "Tre Johnson",
+            "rows_loaded": 0,
+            "status": "success"
+          },
+          {
+            "attempts": 1,
+            "elapsed_ms": 731,
+            "error": null,
+            "player_name": "Trendon Watford",
+            "rows_loaded": 44,
+            "status": "success"
+          },
+          {
+            "attempts": 1,
+            "elapsed_ms": 3475,
+            "error": null,
+            "player_name": "Tristan da Silva",
+            "rows_loaded": 81,
+            "status": "success"
+          },
+          {
+            "attempts": 1,
+            "elapsed_ms": 16586,
+            "error": null,
+            "player_name": "Tyler Herro",
+            "rows_loaded": 87,
+            "status": "success"
+          },
+          {
+            "attempts": 1,
+            "elapsed_ms": 6246,
+            "error": null,
+            "player_name": "VJ Edgecombe",
+            "rows_loaded": 0,
+            "status": "success"
+          },
+          {
+            "attempts": 1,
+            "elapsed_ms": 5012,
+            "error": null,
+            "player_name": "Victor Wembanyama",
+            "rows_loaded": 50,
+            "status": "success"
+          },
+          {
+            "attempts": 1,
+            "elapsed_ms": 3694,
+            "error": null,
+            "player_name": "Wendell Carter Jr",
+            "rows_loaded": 76,
+            "status": "success"
+          },
+          {
+            "attempts": 1,
+            "elapsed_ms": 8907,
+            "error": null,
+            "player_name": "Will Riley",
+            "rows_loaded": 0,
+            "status": "success"
+          },
+          {
+            "attempts": 1,
+            "elapsed_ms": 8592,
+            "error": null,
+            "player_name": "Zaccharie Risacher",
+            "rows_loaded": 80,
+            "status": "success"
+          },
+          {
+            "attempts": 1,
+            "elapsed_ms": 742,
+            "error": null,
+            "player_name": "Ziaire Williams",
+            "rows_loaded": 67,
+            "status": "success"
+          }
+        ],
+        "refreshed_players": 93,
+        "requested_players": 94,
+        "status": "partial_success"
+      },
+      "status": "partial_success",
+      "step": "game_logs"
+    },
+    "odds": {
+      "reason": "Step disabled by flag.",
+      "status": "skipped"
+    },
+    "reverse_engineering": {
+      "reason": "Step disabled by flag.",
+      "status": "skipped"
+    },
+    "team_defense": {
+      "attempts": 1,
+      "elapsed_ms": 189,
+      "result": {
+        "rows_upserted": 30,
+        "validation": {
+          "expected_team_count": 30,
+          "is_complete": true,
+          "latest_updated": "2026-03-14 17:55:18",
+          "missing_teams": [],
+          "row_count": 30,
+          "season": "2025-26",
+          "team_count": 30,
+          "unexpected_teams": []
+        }
+      },
+      "status": "success",
+      "step": "team_defense"
+    }
+  }
+}

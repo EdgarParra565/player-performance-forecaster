@@ -1,0 +1,98 @@
+{
+  "db_path": "data/database/nba_data.db",
+  "elapsed_ms": 27985,
+  "finished_at_utc": "2026-03-14T17:25:31.189522+00:00",
+  "players_selected": [
+    "LeBron James",
+    "Stephen Curry",
+    "Nikola Jokic",
+    "Luka Doncic",
+    "Jayson Tatum"
+  ],
+  "season": "2025-26",
+  "started_at_utc": "2026-03-14T17:25:03.203626+00:00",
+  "status": "success",
+  "steps": {
+    "game_logs": {
+      "attempts": 1,
+      "elapsed_ms": 27853,
+      "result": {
+        "failed_players": 0,
+        "players": [
+          {
+            "attempts": 1,
+            "elapsed_ms": 8617,
+            "error": null,
+            "player_name": "LeBron James",
+            "rows_loaded": 78,
+            "status": "success"
+          },
+          {
+            "attempts": 1,
+            "elapsed_ms": 5866,
+            "error": null,
+            "player_name": "Stephen Curry",
+            "rows_loaded": 85,
+            "status": "success"
+          },
+          {
+            "attempts": 1,
+            "elapsed_ms": 3290,
+            "error": null,
+            "player_name": "Nikola Jokic",
+            "rows_loaded": 90,
+            "status": "success"
+          },
+          {
+            "attempts": 1,
+            "elapsed_ms": 5343,
+            "error": null,
+            "player_name": "Luka Doncic",
+            "rows_loaded": 55,
+            "status": "success"
+          },
+          {
+            "attempts": 1,
+            "elapsed_ms": 4734,
+            "error": null,
+            "player_name": "Jayson Tatum",
+            "rows_loaded": 86,
+            "status": "success"
+          }
+        ],
+        "refreshed_players": 5,
+        "requested_players": 5,
+        "status": "success"
+      },
+      "status": "success",
+      "step": "game_logs"
+    },
+    "odds": {
+      "reason": "Step disabled by flag.",
+      "status": "skipped"
+    },
+    "reverse_engineering": {
+      "reason": "Step disabled by flag.",
+      "status": "skipped"
+    },
+    "team_defense": {
+      "attempts": 1,
+      "elapsed_ms": 132,
+      "result": {
+        "rows_upserted": 30,
+        "validation": {
+          "expected_team_count": 30,
+          "is_complete": true,
+          "latest_updated": "2026-03-14 17:25:31",
+          "missing_teams": [],
+          "row_count": 30,
+          "season": "2025-26",
+          "team_count": 30,
+          "unexpected_teams": []
+        }
+      },
+      "status": "success",
+      "step": "team_defense"
+    }
+  }
+}

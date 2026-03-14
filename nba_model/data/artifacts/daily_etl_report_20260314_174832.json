@@ -1,0 +1,49 @@
+{
+  "db_path": "data/database/nba_data.db",
+  "elapsed_ms": 0,
+  "finished_at_utc": "2026-03-14T17:48:32.686802+00:00",
+  "player_selection_summary": {
+    "db_count": 0,
+    "default_seed_count": 5,
+    "explicit_count": 0,
+    "limit_applied": false,
+    "min_topup_count": 0,
+    "player_limit": null,
+    "total_before_limit": 5,
+    "total_selected": 5
+  },
+  "players_selected": [
+    "LeBron James",
+    "Stephen Curry",
+    "Nikola Jokic",
+    "Luka Doncic",
+    "Jayson Tatum"
+  ],
+  "season": "2025-26",
+  "started_at_utc": "2026-03-14T17:48:32.686787+00:00",
+  "status": "success",
+  "steps": {
+    "game_logs": {
+      "reason": "Step disabled by flag.",
+      "status": "skipped"
+    },
+    "odds": {
+      "attempts": 1,
+      "elapsed_ms": 0,
+      "result": {
+        "reason": "No odds API key configured.",
+        "status": "skipped"
+      },
+      "status": "skipped",
+      "step": "odds"
+    },
+    "reverse_engineering": {
+      "reason": "Step disabled by flag.",
+      "status": "skipped"
+    },
+    "team_defense": {
+      "reason": "Step disabled by flag.",
+      "status": "skipped"
+    }
+  }
+}

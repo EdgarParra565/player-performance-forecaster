@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import MagicMock, patch
 
 import pandas as pd
 
@@ -7,11 +8,50 @@ from nba_model.evaluation.line_comparison import (
     build_model_vs_book_comparison,
 )
 from nba_model.evaluation.monthly_diagnostics import build_monthly_diagnostics
+from nba_model.evaluation.run_batch_backtest import run_batch_backtest
 from nba_model.evaluation.run_distribution_sweep import build_distribution_summary
 from nba_model.evaluation.run_real_data_benchmark import build_player_window_ci_summary
 
 
 class EvaluationToolsTests(unittest.TestCase):
+    @patch("nba_model.evaluation.run_batch_backtest.Backtester")
+    @patch("nba_model.evaluation.run_batch_backtest.DataLoader")
+    def test_run_batch_backtest_handles_no_bets_metrics(
+        self,
+        mock_loader_cls,
+        mock_backtester_cls,
+    ):
+        loader = MagicMock()
+        loader.get_player_id.return_value = 1
+        loader.load_player_data.return_value = pd.DataFrame(
+            [{"game_date": "2025-01-01", "points": 20}]
+        )
+        mock_loader_cls.return_value = loader
+
+        backtester = MagicMock()
+        backtester.run_backtest.return_value = {
+            "total_games": 10,
+            "bets_made": 0,
+        }
+        mock_backtester_cls.return_value = backtester
+
+        results_df, failures_df = run_batch_backtest(
+            players=["LeBron James"],
+            windows=[5],
+            stat_types=["points"],
+            distributions=["normal"],
+            start_date="2025-01-01",
+            end_date="2025-02-01",
+            history_games=120,
+        )
+
+        self.assertTrue(failures_df.empty)
+        self.assertEqual(len(results_df), 1)
+        self.assertIn("roi", results_df.columns)
+        self.assertIn("win_rate", results_df.columns)
+        self.assertEqual(int(results_df.iloc[0]["bets_made"]), 0)
+        self.assertTrue(pd.isna(results_df.iloc[0]["roi"]))
+
     def test_player_window_ci_summary(self):
         df = pd.DataFrame(
             [

@@ -11,6 +11,26 @@ from nba_model.evaluation.significance import win_rate_significance_summary
 from nba_model.model.simulation import SUPPORTED_DISTRIBUTIONS, normalize_distribution_name
 
 ARTIFACT_DIR = Path("nba_model/evaluation/artifacts")
+DEFAULT_METRIC_COLUMNS = {
+    "total_games": 0,
+    "bets_made": 0,
+    "wins": 0,
+    "losses": 0,
+    "pushes": 0,
+    "accuracy": float("nan"),
+    "win_rate": float("nan"),
+    "total_profit": 0.0,
+    "roi": float("nan"),
+    "sharpe_ratio": float("nan"),
+    "brier_score": float("nan"),
+    "avg_prob_over": float("nan"),
+    "market_line_games": 0,
+    "fixed_line_games": 0,
+    "model_line_games": 0,
+    "market_spread_games": 0,
+    "row_spread_games": 0,
+    "default_spread_games": 0,
+}
 DEFAULT_PLAYERS = [
     "LeBron James",
     "Stephen Curry",
@@ -197,10 +217,23 @@ def run_batch_backtest(
 
     results_df = pd.DataFrame(rows)
     failures_df = pd.DataFrame(failures)
+    for column_name, default_value in DEFAULT_METRIC_COLUMNS.items():
+        if column_name not in results_df.columns:
+            results_df[column_name] = default_value
     if not results_df.empty:
+        preferred_sort_cols = ["distribution", "stat_type", "window", "roi", "win_rate"]
+        sort_cols = [col for col in preferred_sort_cols if col in results_df.columns]
+        ascending_map = {
+            "distribution": True,
+            "stat_type": True,
+            "window": True,
+            "roi": False,
+            "win_rate": False,
+        }
         results_df = results_df.sort_values(
-            ["distribution", "stat_type", "window", "roi", "win_rate"],
-            ascending=[True, True, True, False, False],
+            sort_cols,
+            ascending=[ascending_map[col] for col in sort_cols],
+            na_position="last",
         ).reset_index(drop=True)
 
     return results_df, failures_df

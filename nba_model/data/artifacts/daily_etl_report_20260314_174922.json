@@ -1,0 +1,75 @@
+{
+  "db_path": "data/database/nba_data.db",
+  "elapsed_ms": 3460,
+  "finished_at_utc": "2026-03-14T17:49:22.388210+00:00",
+  "player_selection_summary": {
+    "db_count": 0,
+    "default_seed_count": 5,
+    "explicit_count": 0,
+    "limit_applied": false,
+    "min_topup_count": 0,
+    "player_limit": null,
+    "total_before_limit": 5,
+    "total_selected": 5
+  },
+  "players_selected": [
+    "LeBron James",
+    "Stephen Curry",
+    "Nikola Jokic",
+    "Luka Doncic",
+    "Jayson Tatum"
+  ],
+  "season": "2025-26",
+  "started_at_utc": "2026-03-14T17:49:18.927932+00:00",
+  "status": "success",
+  "steps": {
+    "game_logs": {
+      "reason": "Step disabled by flag.",
+      "status": "skipped"
+    },
+    "odds": {
+      "attempts": 1,
+      "elapsed_ms": 3460,
+      "result": {
+        "db_attempted": 2493,
+        "db_duplicates_ignored": 0,
+        "db_inserted": 2493,
+        "diagnostic": null,
+        "distinct_players": 94,
+        "duplicates_in_payload": 0,
+        "event_odds_failures": 0,
+        "events_processed": 7,
+        "events_with_bookmakers": 0,
+        "first_event_error": null,
+        "ingestion_mode": "event_odds",
+        "invalid_reason_counts": {},
+        "markets_requested": [
+          "player_points",
+          "player_assists",
+          "player_rebounds",
+          "player_points_rebounds_assists"
+        ],
+        "records_invalid": 0,
+        "records_parsed": 2493,
+        "records_valid": 2493,
+        "snapshots_attempted": 2493,
+        "snapshots_inserted": 2493,
+        "status": "success",
+        "unresolved_player_names": [
+          "Carlton Carrington",
+          "Moe Wagner"
+        ]
+      },
+      "status": "success",
+      "step": "odds"
+    },
+    "reverse_engineering": {
+      "reason": "Step disabled by flag.",
+      "status": "skipped"
+    },
+    "team_defense": {
+      "reason": "Step disabled by flag.",
+      "status": "skipped"
+    }
+  }
+}

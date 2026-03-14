@@ -120,7 +120,7 @@ Notes:
 
 Artifacts are saved under `nba_model/evaluation/artifacts/` with timestamped filenames.
 
-### 5) Daily ETL Runner (Game Logs + Defense + Odds)
+### 5) Daily ETL Runner (Game Logs + Defense + Odds + Reverse Engineering)
 
 Run a single daily pipeline job with retry + JSON report output:
 
@@ -134,16 +134,49 @@ python3 -m nba_model.data.daily_etl \
 ```
 
 Notes:
-- By default, it force-refreshes game logs, updates `team_defense`, and attempts odds ingestion.
+- By default, it force-refreshes game logs, updates `team_defense`, ingests odds, and then runs `reverse_engineering` in continuous mode.
 - Odds step auto-skips when no API key is set (`ODDS_API_KEY`/`THE_ODDS_API_KEY`).
+- Reverse-engineering auto-skips when the odds step is skipped/failed; use `--skip-reverse-engineering` to disable it explicitly.
+- Use `--reverse-engineering-single-pass` to run one pass instead of continuous polling.
+- For automation, set guardrails with `--reverse-engineering-max-runs` or `--reverse-engineering-max-wait-minutes`.
+- Use `--all-db-players` to refresh every player currently in the local `players` table.
+- Use `--min-players N` to auto-expand from active NBA players if the selected pool is smaller than `N`.
+- Use `--skip-zero-game-players` to skip non-explicit players that currently have no local game logs.
 - Use `--strict` for cron jobs to return non-zero exit code on failed/partial runs.
+
+Example ETL run with the same continuous thresholds:
+
+```bash
+python3 -m nba_model.data.daily_etl \
+  --skip-game-logs \
+  --skip-team-defense \
+  --reverse-engineering-source both \
+  --reverse-engineering-poll-seconds 300 \
+  --reverse-engineering-min-inferred-rows 25 \
+  --reverse-engineering-min-book-stat-groups 2 \
+  --reverse-engineering-min-player-segment-groups 5 \
+  --reverse-engineering-require-stability-runs 2 \
+  --reverse-engineering-stability-tolerance 0.10
+```
+
+Example to grow game-log refresh beyond the default 5-player seed:
+
+```bash
+python3 -m nba_model.data.daily_etl \
+  --all-db-players \
+  --min-players 150 \
+  --skip-zero-game-players \
+  --game-log-games 200 \
+  --skip-odds \
+  --skip-reverse-engineering
+```
 
 #### 5b) Automated Daily ETL (GitHub Actions)
 
 This repository includes a scheduled GitHub Actions workflow (`.github/workflows/daily_etl.yml`) that runs the daily ETL once per day:
 
 - **Schedule**: 08:00 UTC (configurable via the `cron` line in the workflow).
-- **Command in CI**: `python -m nba_model.data.daily_etl --strict --skip-game-logs --skip-team-defense` (stats.nba.com times out from GitHub’s network; game logs and team defense are for local or self-hosted runs).
+- **Command in CI**: `python -m nba_model.data.daily_etl --strict --skip-game-logs --skip-team-defense --skip-reverse-engineering` (stats.nba.com times out from GitHub’s network; game logs and team defense are for local or self-hosted runs).
 - **Full ETL locally**: `python -m nba_model.data.daily_etl --strict`
 - **Required secret**: `ODDS_API_KEY` (configure in your GitHub repository Settings → Secrets and variables → Actions). Without it, the odds step is skipped and the run still succeeds.
 

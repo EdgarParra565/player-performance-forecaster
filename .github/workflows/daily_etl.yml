@@ -32,12 +32,12 @@ jobs:
       - name: Run daily ETL
         id: etl
         env:
-          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+          ODDS_API_KEY: ${{ env.ODDS_API_KEY }}
         run: |
           source .venv/bin/activate
           # stats.nba.com times out from GitHub Actions (data-center IPs). Skip game_logs and team_defense in CI.
           # Run full ETL locally: python -m nba_model.data.daily_etl --strict
-          python -m nba_model.data.daily_etl --strict --skip-game-logs --skip-team-defense
+          python -m nba_model.data.daily_etl --strict --skip-game-logs --skip-team-defense --skip-reverse-engineering
 
       - name: Show ETL failure summary
         if: failure()
