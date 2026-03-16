@@ -1,6 +1,6 @@
 # NBA Player Performance Forecaster - Working Notes
 
-Last updated: 2026-03-02
+Last updated: 2026-03-14
 
 This file is the active project tracker. It keeps only:
 - current architecture
@@ -9,8 +9,9 @@ This file is the active project tracker. It keeps only:
 
 
 
-Need to get historic data for model to become more accurate
-(ODDS_API) about ~$15 per month
+Near-term objective:
+- increase historical coverage quality (game logs + line snapshots + aligned predictions)
+- select production defaults from real benchmark outputs
 ---
 
 ## 1) Current Project Structure
@@ -73,6 +74,9 @@ player-performance-forecaster/
 - [x] Context features added (`rest_days`, `travel_flag`, `injury_proxy`, schedule density)
 - [x] Team defense ingestion + validation report (`--validate-only`, `--fail-on-missing`)
 - [x] Daily ETL runner for game logs + team defense + odds (`daily_etl.py`) + scheduled GitHub Actions workflow
+- [x] Daily ETL now includes optional reverse-engineering step (continuous or single-pass)
+- [x] Daily ETL player-pool controls: `--all-db-players`, `--min-players`, `--skip-zero-game-players`
+- [x] Daily ETL reporting now includes player-source breakdown + zero-game skip counters
 - [x] Odds ingestion hardening: retries, schema validation, dedupe, insert reporting
 - [x] Real-data benchmark runner with per-player/window confidence intervals
 - [x] Distribution sweep runner with ROI/calibration/significance summary exports
@@ -83,7 +87,9 @@ player-performance-forecaster/
 - [x] Historical sportsbook snapshots table (`betting_line_snapshots`) populated from The Odds API
 - [x] CLV-style proxy from snapshots (`clv_proxy.py`)
 - [x] Market reverse-engineering tools (sigma-scale inference from book odds; `market_reverse_engineering.py`)
+- [x] Reverse-engineering continuous mode added (coverage + stability thresholds, max-runs/max-wait guardrails)
 - [x] Market data quality checks for lines and snapshots (`market_data_quality.py`)
+- [x] Batch benchmark edge case fixed: no-bet windows no longer crash (`KeyError: 'roi'`)
 
 ---
 
@@ -93,6 +99,16 @@ player-performance-forecaster/
 - [ ] Run `run_real_data_benchmark.py` on 10+ players with windows `5/7/10/15`
 - [ ] Run `run_distribution_sweep.py` on `points/assists/rebounds/pra`
 - [ ] Review artifacts and pick default distribution by stat type
+- [ ] Record selected defaults in README + inline code comments
+
+### B. Improve model/market join coverage
+- [ ] Normalize player aliases across data sources (`C.J.` vs `CJ`, suffixes, punctuation)
+- [ ] Ensure prediction coverage exists for players/stat-types present in `betting_lines`
+- [ ] Re-run `line_comparison` and confirm non-empty model-vs-book outputs on current DB window
+
+### C. Productionize ETL ops
+- [ ] Persist ETL run logs/artifacts with simple run-level metadata
+- [ ] Add basic alerting on failed/partial ETL outcomes
 
 ### D. Expand comparison and diagnostics outputs
 - [ ] Add monthly report rollups by stat type and by player segment
@@ -102,28 +118,49 @@ player-performance-forecaster/
 ## 4) Important Backlog (After Current Priorities)
 
 - [ ] Historical game-log backfill beyond current season window
+- [ ] Historical odds/snapshot backfill for stronger reverse-engineering stability
 - [ ] Better injury features (not just minutes-drop proxy)
 - [ ] Travel burden improvements (distance/timezone proxies)
 - [ ] Cross-book normalization pass for naming/market aliases
 - [ ] Example notebook for reproducible analysis walkthrough
 - [ ] Remove or consolidate duplicate/legacy data loader paths
+- [ ] Centralized config/env management for DB paths + API settings
 
 ---
 
 ## 5) Known Gaps / Constraints
 
-- Historical open/close line snapshots are now stored via `betting_line_snapshots`, but quality checks and downstream consumers are still evolving.
-- Current market analysis depends on whatever is present in `betting_lines`.
-- Some output scripts can produce empty artifacts when DB windows have no eligible rows.
-- ETL scheduler exists (GitHub Actions), but external alerting/monitoring on failed runs is still minimal.
+- Reverse-engineering quality depends on enough overlapping `betting_lines` + model predictions in the same date/player/stat windows.
+- Name mismatches across sources can still reduce join coverage (e.g., punctuation/suffix variants in player names).
+- Some evaluation scripts still produce empty artifacts when windows are sparse; they now fail less often, but output quality remains data-dependent.
+- ETL scheduler exists (GitHub Actions), but external alerting/monitoring on failed or partial runs is still minimal.
 
 ---
 
 ## 6) Quick Runbook Commands
 
 ```bash
-# Daily ETL
-python3 -m nba_model.data.daily_etl --strict
+# Daily ETL (strict + expand player pool + skip known zero-game players)
+python3 -m nba_model.data.daily_etl \
+  --strict \
+  --all-db-players \
+  --min-players 40 \
+  --skip-zero-game-players
+
+# Daily ETL (single pass reverse-engineering only)
+python3 -m nba_model.data.daily_etl \
+  --strict \
+  --reverse-engineering-single-pass
+
+# Daily ETL (continuous reverse-engineering readiness loop)
+python3 -m nba_model.data.daily_etl \
+  --strict \
+  --reverse-engineering-poll-seconds 300 \
+  --reverse-engineering-min-inferred-rows 25 \
+  --reverse-engineering-min-book-stat-groups 2 \
+  --reverse-engineering-min-player-segment-groups 5 \
+  --reverse-engineering-require-stability-runs 2 \
+  --reverse-engineering-stability-tolerance 0.10
 
 # Real-data benchmark (player/window CI exports)
 python3 -m nba_model.evaluation.run_real_data_benchmark \
@@ -152,6 +189,17 @@ python3 -m nba_model.evaluation.monthly_diagnostics \
   --start-date 2024-11-01 \
   --end-date 2025-03-15 \
   --stat-types points assists rebounds pra
+
+# Reverse-engineering direct run (outside ETL)
+python3 -m nba_model.evaluation.market_reverse_engineering \
+  --continuous \
+  --source both \
+  --poll-seconds 300 \
+  --min-inferred-rows 25 \
+  --min-book-stat-groups 2 \
+  --min-player-segment-groups 5 \
+  --require-stability-runs 2 \
+  --stability-tolerance 0.10
 ```
 
 
@@ -159,13 +207,13 @@ python3 -m nba_model.evaluation.monthly_diagnostics \
 TECHNICAL DEBT / KNOWN ISSUES
 ================================================================================
 
-- Daily ETL runner exists, but scheduler + monitoring/alerting are not fully wired yet.
-- Historical sportsbook snapshots (open/close timeline with timestamps) are now stored in `betting_line_snapshots`, but validation, CLV consumers, and sigma-scale reverse-engineering outputs are still experimental and require more data.
-- Line comparison/monthly diagnostics can return empty artifacts when `betting_lines` or `predictions` are sparse.
-- Real-data benchmark/distribution sweep scripts exist, but production defaults are not yet selected from a full run.
-- Current travel/rest/injury features are heuristic; no external validation layer yet.
+- Daily ETL runner exists and is scheduled, but external monitoring/alerting is still minimal.
+- Reverse-engineering outputs are more stable with continuous mode, but remain data-coverage constrained.
+- Line comparison/monthly diagnostics can still return sparse/empty artifacts when `betting_lines` and `predictions` do not overlap enough.
+- Real-data benchmark/distribution sweep scripts are implemented; production defaults still need formal selection from full-run artifacts.
+- Current travel/rest/injury features are heuristic; no independent validation source is integrated yet.
 - Some modules still use `print()` instead of structured logging.
-- DB path/config is still mostly default-arg based; centralized env config is incomplete.
+- DB path/config remains mostly default-arg based; centralized env config is incomplete.
 - No explicit handling for player trades/team-context shifts mid-season.
 
 ================================================================================
