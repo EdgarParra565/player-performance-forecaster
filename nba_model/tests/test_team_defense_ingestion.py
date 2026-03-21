@@ -1,3 +1,5 @@
+"""Unit tests for team-defense ingestion and validation report behavior."""
+
 import tempfile
 import unittest
 from pathlib import Path

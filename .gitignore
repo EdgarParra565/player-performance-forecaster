@@ -13,6 +13,7 @@ __pycache__/
 .Python
 env/
 venv/
+.venv/
 ENV/
 build/
 dist/
@@ -42,6 +43,11 @@ data/raw/
 # Logs
 *.log
 logs/
+
+# Local browser automation artifacts
+.playwright-browsers/
+data/artifacts/
+nba_model/data/artifacts/
 
 # Environment variables
 .env

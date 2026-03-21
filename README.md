@@ -136,6 +136,11 @@ python3 -m nba_model.data.daily_etl \
 Notes:
 - By default, it force-refreshes game logs, updates `team_defense`, ingests odds, and then runs `reverse_engineering` in continuous mode.
 - Odds step auto-skips when no API key is set (`ODDS_API_KEY`/`THE_ODDS_API_KEY`).
+- Odds polling is rate-limited by default to once per 24 hours in CLI runs (`--odds-min-hours-between-polls 24`).
+- Use `--force-odds-poll` to bypass that guard for a manual refresh.
+- Use `--web-text-urls` (or `--web-text-urls-file`) to fetch raw visible text directly from public web pages.
+- Web-text polling is also guarded per URL by default (`--web-text-min-hours-between-polls 24`).
+- Not every site will parse equally well with raw text extraction (dynamic JS pages, bot protection, and custom HTML layouts can limit coverage).
 - Reverse-engineering auto-skips when the odds step is skipped/failed; use `--skip-reverse-engineering` to disable it explicitly.
 - Use `--reverse-engineering-single-pass` to run one pass instead of continuous polling.
 - For automation, set guardrails with `--reverse-engineering-max-runs` or `--reverse-engineering-max-wait-minutes`.
@@ -169,6 +174,43 @@ python3 -m nba_model.data.daily_etl \
   --game-log-games 200 \
   --skip-odds \
   --skip-reverse-engineering
+```
+
+Example odds polling with once-per-day guard while the program is running:
+
+```bash
+python3 -m nba_model.data.daily_etl \
+  --skip-game-logs \
+  --skip-team-defense \
+  --odds-min-hours-between-polls 24
+```
+
+Example direct website text ingestion (no API key) while ETL is running:
+
+```bash
+python3 -m nba_model.data.daily_etl \
+  --skip-game-logs \
+  --skip-team-defense \
+  --skip-odds \
+  --skip-reverse-engineering \
+  --web-text-urls "https://example.com/sportsbook/nba/props" \
+  --web-text-min-hours-between-polls 24
+```
+
+Standalone direct web-text CLI:
+
+```bash
+python3 -m nba_model.model.web_text_ingestion \
+  --urls "https://example.com/sportsbook/nba/props" \
+  --min-hours-between-polls 24
+```
+
+Sync active NBA players reference into DB + local file (used for filtering/classifying non-NBA names):
+
+```bash
+python3 -m nba_model.model.web_text_ingestion \
+  --sync-active-players-ref \
+  --active-players-output-file data/config/active_nba_players.txt
 ```
 
 #### 5b) Automated Daily ETL (GitHub Actions)

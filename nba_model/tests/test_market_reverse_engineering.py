@@ -1,3 +1,5 @@
+"""Unit tests for market reverse-engineering calibration and runner logic."""
+
 import unittest
 from unittest.mock import patch
 

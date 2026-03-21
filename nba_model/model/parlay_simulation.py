@@ -1,3 +1,5 @@
+"""Monte Carlo utilities for correlated same-game parlay simulations."""
+
 import numpy as np
 
 def simulate_sgp(

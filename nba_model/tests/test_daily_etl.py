@@ -1,4 +1,7 @@
+"""Unit tests for daily ETL orchestration and retry/reporting behavior."""
+
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import tempfile
 from unittest.mock import MagicMock, patch
@@ -261,6 +264,108 @@ class DailyETLTests(unittest.TestCase):
         self.assertEqual(report["steps"]["odds"]["status"], "skipped")
         self.assertEqual(report["steps"]["reverse_engineering"]["status"], "skipped")
         mock_reverse_engineering.assert_not_called()
+
+    @patch("nba_model.data.daily_etl.run_market_reverse_engineering_continuous")
+    @patch("nba_model.data.daily_etl.fetch_and_store_betting_lines")
+    def test_run_daily_etl_reuses_recent_odds_poll_within_guard_window(
+        self,
+        mock_fetch_odds,
+        mock_reverse_engineering,
+    ):
+        mock_reverse_engineering.return_value = {
+            "status": "ready",
+            "inferred_rows": 8,
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = str(Path(tmpdir) / "nba_data.db")
+            with DatabaseManager(db_path=db_path) as db:
+                db.conn.execute(
+                    """
+                    INSERT INTO odds_poll_runs (polled_at_utc, status)
+                    VALUES (?, ?)
+                    """,
+                    (datetime.now(timezone.utc).isoformat(), "success"),
+                )
+                db.conn.commit()
+
+            report = run_daily_etl(
+                players=["LeBron James"],
+                include_db_players=False,
+                skip_game_logs=True,
+                skip_team_defense=True,
+                skip_odds=False,
+                odds_api_key="dummy-key",
+                odds_min_hours_between_polls=24.0,
+                retries=0,
+                db_path=db_path,
+                write_report=False,
+            )
+
+        self.assertEqual(report["steps"]["odds"]["status"], "success")
+        self.assertEqual(
+            report["steps"]["odds"]["result"]["status"],
+            "reused_recent_poll",
+        )
+        self.assertFalse(report["steps"]["odds"]["result"]["poll_executed"])
+        self.assertEqual(report["steps"]["reverse_engineering"]["status"], "success")
+        mock_fetch_odds.assert_not_called()
+        mock_reverse_engineering.assert_called_once()
+
+    @patch("nba_model.data.daily_etl.run_market_reverse_engineering_continuous")
+    @patch("nba_model.data.daily_etl.fetch_and_store_betting_lines")
+    def test_run_daily_etl_force_odds_poll_ignores_guard_window(
+        self,
+        mock_fetch_odds,
+        mock_reverse_engineering,
+    ):
+        mock_fetch_odds.return_value = {
+            "records_parsed": 2,
+            "records_valid": 2,
+            "db_inserted": 2,
+            "snapshots_inserted": 2,
+        }
+        mock_reverse_engineering.return_value = {
+            "status": "ready",
+            "inferred_rows": 4,
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = str(Path(tmpdir) / "nba_data.db")
+            with DatabaseManager(db_path=db_path) as db:
+                db.conn.execute(
+                    """
+                    INSERT INTO odds_poll_runs (polled_at_utc, status)
+                    VALUES (?, ?)
+                    """,
+                    (
+                        (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat(),
+                        "success",
+                    ),
+                )
+                db.conn.commit()
+
+            report = run_daily_etl(
+                players=["LeBron James"],
+                include_db_players=False,
+                skip_game_logs=True,
+                skip_team_defense=True,
+                skip_odds=False,
+                odds_api_key="dummy-key",
+                odds_min_hours_between_polls=24.0,
+                force_odds_poll=True,
+                retries=0,
+                db_path=db_path,
+                write_report=False,
+            )
+
+            with DatabaseManager(db_path=db_path) as db:
+                rows = db.conn.execute(
+                    "SELECT status FROM odds_poll_runs ORDER BY poll_id ASC"
+                ).fetchall()
+
+        self.assertEqual(report["steps"]["odds"]["status"], "success")
+        mock_fetch_odds.assert_called_once()
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[-1][0], "success")
 
     @patch("nba_model.data.daily_etl.run_market_reverse_engineering_continuous")
     @patch("nba_model.data.daily_etl.fetch_and_store_betting_lines")

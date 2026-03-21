@@ -1,3 +1,5 @@
+"""Unit tests for evaluation reporting and benchmark utility modules."""
+
 import unittest
 from unittest.mock import MagicMock, patch
 

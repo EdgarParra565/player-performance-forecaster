@@ -223,6 +223,155 @@ class DatabaseManager:
             "attempted": int(len(payload)),
         }
 
+    def insert_web_text_snapshots(self, records):
+        """
+        Insert raw text snapshots fetched from direct web URLs.
+
+        Args:
+            records: Iterable of dicts with keys:
+                source_url, fetched_at_utc, http_status, content_type,
+                text_content, text_length, content_sha256
+        """
+        if not records:
+            return {
+                "inserted": 0,
+                "attempted": 0,
+            }
+
+        query = """
+            INSERT INTO web_text_snapshots (
+                source_url,
+                fetched_at_utc,
+                http_status,
+                content_type,
+                text_content,
+                text_length,
+                content_sha256
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """
+
+        payload = []
+        for rec in records:
+            row = (
+                rec.get("source_url"),
+                rec.get("fetched_at_utc"),
+                rec.get("http_status"),
+                rec.get("content_type"),
+                rec.get("text_content"),
+                rec.get("text_length"),
+                rec.get("content_sha256"),
+            )
+            if not row[0] or not row[1] or not row[4]:
+                continue
+            payload.append(row)
+
+        if not payload:
+            return {
+                "inserted": 0,
+                "attempted": 0,
+            }
+
+        before_changes = self.conn.total_changes
+        self.conn.executemany(query, payload)
+        self.conn.commit()
+        inserted = self.conn.total_changes - before_changes
+        logger.info("Inserted %s web_text_snapshots rows", inserted)
+        return {
+            "inserted": int(inserted),
+            "attempted": int(len(payload)),
+        }
+
+    def get_latest_web_text_fetch_times(self, source_urls):
+        """
+        Return latest fetched_at_utc per URL from web_text_snapshots.
+
+        Args:
+            source_urls: iterable of URLs
+
+        Returns:
+            dict[str, str]: source_url -> latest fetched_at_utc
+        """
+        urls = [
+            str(url).strip()
+            for url in (source_urls or [])
+            if str(url).strip()
+        ]
+        if not urls:
+            return {}
+
+        placeholders = ", ".join(["?"] * len(urls))
+        query = f"""
+            SELECT source_url, MAX(fetched_at_utc) AS latest_fetched_at_utc
+            FROM web_text_snapshots
+            WHERE source_url IN ({placeholders})
+            GROUP BY source_url
+        """
+        rows = self.conn.execute(query, tuple(urls)).fetchall()
+        return {
+            str(row[0]): str(row[1])
+            for row in rows
+            if row and row[0] is not None and row[1] is not None
+        }
+
+    def upsert_active_players_reference(self, records):
+        """
+        Upsert active NBA players reference rows.
+
+        Args:
+            records: Iterable[dict] with keys:
+                player_id, player_name, synced_at_utc
+        """
+        if not records:
+            return {
+                "attempted": 0,
+                "written": 0,
+            }
+
+        query = """
+            INSERT INTO nba_active_players_ref (player_id, player_name, synced_at_utc)
+            VALUES (?, ?, ?)
+            ON CONFLICT(player_id) DO UPDATE SET
+                player_name = excluded.player_name,
+                synced_at_utc = excluded.synced_at_utc
+        """
+        payload = []
+        for rec in records:
+            player_id = rec.get("player_id")
+            player_name = str(rec.get("player_name", "")).strip()
+            synced_at_utc = str(rec.get("synced_at_utc", "")).strip()
+            if player_id is None or not player_name or not synced_at_utc:
+                continue
+            payload.append((player_id, player_name, synced_at_utc))
+
+        if not payload:
+            return {
+                "attempted": 0,
+                "written": 0,
+            }
+
+        before_changes = self.conn.total_changes
+        self.conn.executemany(query, payload)
+        self.conn.commit()
+        written = self.conn.total_changes - before_changes
+        logger.info("Upserted %s nba_active_players_ref rows", written)
+        return {
+            "attempted": int(len(payload)),
+            "written": int(written),
+        }
+
+    def get_active_players_reference_names(self):
+        """Return all active NBA player names from reference table."""
+        rows = self.conn.execute(
+            """
+            SELECT player_name
+            FROM nba_active_players_ref
+            WHERE player_name IS NOT NULL AND trim(player_name) <> ''
+            ORDER BY player_name ASC
+            """
+        ).fetchall()
+        return [str(row[0]).strip() for row in rows if row and str(row[0]).strip()]
+
     def insert_game_logs(self, game_logs_df):
         """
         Bulk insert game logs from DataFrame.

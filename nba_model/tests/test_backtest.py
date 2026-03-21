@@ -1,3 +1,5 @@
+"""Manual-style backtest validation script for historical date-window checks."""
+
 from nba_model.evaluation.backtest import Backtester
 from datetime import datetime, timedelta
 

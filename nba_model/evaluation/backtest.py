@@ -1,3 +1,5 @@
+"""Backtesting engine for evaluating forecast bets on historical NBA data."""
+
 import json
 import logging
 from typing import Optional

@@ -1,3 +1,5 @@
+"""Ad hoc data-check utility script for quick local dataset sanity checks."""
+
 from nba_model.data.data_loader import DataLoader
 import pandas as pd
 

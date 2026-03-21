@@ -84,6 +84,41 @@ CREATE TABLE IF NOT EXISTS betting_line_snapshots (
     FOREIGN KEY (player_id) REFERENCES players(player_id)
 );
 
+-- Odds polling runs (for rate-limiting external API calls)
+CREATE TABLE IF NOT EXISTS odds_poll_runs (
+    poll_id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    polled_at_utc      TIMESTAMP NOT NULL,
+    status             TEXT NOT NULL, -- success, partial_success, failed
+    records_parsed     INTEGER,
+    records_valid      INTEGER,
+    db_inserted        INTEGER,
+    snapshots_inserted INTEGER,
+    error_type         TEXT,
+    error_message      TEXT,
+    created_at         TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Raw web text snapshots (direct URL scraping without API keys)
+CREATE TABLE IF NOT EXISTS web_text_snapshots (
+    snapshot_id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_url       TEXT NOT NULL,
+    fetched_at_utc   TIMESTAMP NOT NULL,
+    http_status      INTEGER,
+    content_type     TEXT,
+    text_content     TEXT NOT NULL,
+    text_length      INTEGER,
+    content_sha256   TEXT,
+    created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Active NBA players reference (used for parser filtering/classification)
+CREATE TABLE IF NOT EXISTS nba_active_players_ref (
+    player_id      INTEGER PRIMARY KEY,
+    player_name    TEXT NOT NULL UNIQUE,
+    synced_at_utc  TIMESTAMP NOT NULL,
+    created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
 -- Model predictions (for evaluation)
 CREATE TABLE IF NOT EXISTS predictions (
     prediction_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -119,3 +154,6 @@ CREATE INDEX IF NOT EXISTS idx_prediction_configs_prediction_id ON prediction_co
 CREATE INDEX IF NOT EXISTS idx_snapshots_game_book_stat ON betting_line_snapshots(game_date, book, stat_type);
 CREATE INDEX IF NOT EXISTS idx_snapshots_player_date ON betting_line_snapshots(player_id, game_date, stat_type);
 CREATE INDEX IF NOT EXISTS idx_snapshots_event_book ON betting_line_snapshots(event_id, book, market_key, snapshot_ts_utc);
+CREATE INDEX IF NOT EXISTS idx_odds_poll_runs_polled_at ON odds_poll_runs(polled_at_utc DESC);
+CREATE INDEX IF NOT EXISTS idx_web_text_snapshots_url_time ON web_text_snapshots(source_url, fetched_at_utc DESC);
+CREATE INDEX IF NOT EXISTS idx_active_players_ref_name ON nba_active_players_ref(player_name);

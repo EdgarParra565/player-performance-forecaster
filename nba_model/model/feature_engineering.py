@@ -1,3 +1,5 @@
+"""Feature engineering transforms for rolling stats and contextual signals."""
+
 import numpy as np
 import pandas as pd
 

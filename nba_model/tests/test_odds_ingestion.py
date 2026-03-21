@@ -1,3 +1,5 @@
+"""Unit tests for odds ingestion validation, retries, and summaries."""
+
 import unittest
 from unittest.mock import MagicMock, patch
 

@@ -1,3 +1,5 @@
+"""Helpers for logging model-vs-market line movement comparisons."""
+
 import csv
 from datetime import datetime
 

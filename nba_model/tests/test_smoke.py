@@ -1,3 +1,5 @@
+"""Smoke tests for core forecasting, modeling, and backtest integration paths."""
+
 import unittest
 import json
 from unittest.mock import MagicMock, patch

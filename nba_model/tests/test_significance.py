@@ -1,3 +1,5 @@
+"""Unit tests for betting significance helper calculations."""
+
 import unittest
 
 from nba_model.evaluation.significance import (

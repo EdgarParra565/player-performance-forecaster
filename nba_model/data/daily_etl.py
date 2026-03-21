@@ -1,4 +1,4 @@
-"""Daily ETL runner for game logs, team defense, odds, and reverse-engineering."""
+"""Daily ETL runner for game logs, defense, odds, web text, and reverse-engineering."""
 
 import argparse
 import json
@@ -29,6 +29,15 @@ from nba_model.model.odds_ingestion import (
     _default_api_key,
     fetch_and_store_betting_lines,
 )
+from nba_model.model.web_text_ingestion import (
+    DEFAULT_WEB_TEXT_MAX_CHARS,
+    DEFAULT_WEB_TEXT_REQUEST_RETRIES,
+    DEFAULT_WEB_TEXT_REQUEST_RETRY_BACKOFF,
+    DEFAULT_WEB_TEXT_REQUEST_RETRY_DELAY_SECONDS,
+    DEFAULT_WEB_TEXT_REQUEST_TIMEOUT,
+    fetch_and_store_web_text,
+    load_urls_from_file,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +56,127 @@ DEFAULT_PLAYERS = [
 def _utc_now_iso() -> str:
     """Return current UTC timestamp in ISO format."""
     return datetime.now(timezone.utc).isoformat()
+
+
+def _safe_int(value: object) -> Optional[int]:
+    """Convert a value to int when possible; otherwise return None."""
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_utc_datetime(raw_value: object) -> Optional[datetime]:
+    """Parse timestamp strings from SQLite/ISO payloads into UTC datetimes."""
+    if raw_value is None:
+        return None
+
+    raw = str(raw_value).strip()
+    if not raw:
+        return None
+
+    if raw.endswith("Z"):
+        raw = f"{raw[:-1]}+00:00"
+
+    parsed = None
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError:
+        for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S"):
+            try:
+                parsed = datetime.strptime(raw, fmt)
+                break
+            except ValueError:
+                continue
+
+    if parsed is None:
+        return None
+
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    else:
+        parsed = parsed.astimezone(timezone.utc)
+    return parsed
+
+
+def _latest_odds_poll_run(db_path: str) -> dict:
+    """Return latest odds polling metadata from local DB."""
+    with DatabaseManager(db_path=db_path) as db:
+        row = db.conn.execute(
+            """
+            SELECT polled_at_utc, status
+            FROM odds_poll_runs
+            ORDER BY poll_id DESC
+            LIMIT 1
+            """
+        ).fetchone()
+
+    if not row:
+        return {
+            "last_polled_at_utc": None,
+            "last_status": None,
+            "hours_since_last_poll": None,
+        }
+
+    parsed = _parse_utc_datetime(row[0])
+    if parsed is None:
+        return {
+            "last_polled_at_utc": str(row[0]) if row[0] is not None else None,
+            "last_status": str(row[1]) if row[1] is not None else None,
+            "hours_since_last_poll": None,
+        }
+
+    hours_since = (
+        datetime.now(timezone.utc) - parsed
+    ).total_seconds() / 3600.0
+    return {
+        "last_polled_at_utc": parsed.isoformat(),
+        "last_status": str(row[1]) if row[1] is not None else None,
+        "hours_since_last_poll": float(hours_since),
+    }
+
+
+def _record_odds_poll_run(
+    db_path: str,
+    status: str,
+    result: Optional[dict] = None,
+    error: Optional[dict] = None,
+) -> None:
+    """Persist one odds polling attempt for future freshness checks."""
+    payload = result or {}
+    err = error or {}
+    try:
+        with DatabaseManager(db_path=db_path) as db:
+            db.conn.execute(
+                """
+                INSERT INTO odds_poll_runs (
+                    polled_at_utc,
+                    status,
+                    records_parsed,
+                    records_valid,
+                    db_inserted,
+                    snapshots_inserted,
+                    error_type,
+                    error_message
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    _utc_now_iso(),
+                    str(status),
+                    _safe_int(payload.get("records_parsed")),
+                    _safe_int(payload.get("records_valid")),
+                    _safe_int(payload.get("db_inserted")),
+                    _safe_int(payload.get("snapshots_inserted")),
+                    str(err.get("type")) if err.get("type") else None,
+                    str(err.get("message")) if err.get("message") else None,
+                ),
+            )
+            db.conn.commit()
+    except Exception as exc:  # pragma: no cover - avoid failing ETL on audit write
+        logger.warning("Failed to record odds poll run: %s", exc)
 
 
 def configure_logging(log_dir: str = DEFAULT_LOG_DIR, level: int = logging.INFO) -> str:
@@ -465,6 +595,7 @@ def _run_odds_step(
         return {
             "status": "skipped",
             "reason": "No odds API key configured.",
+            "poll_executed": False,
         }
 
     summary = fetch_and_store_betting_lines(
@@ -482,6 +613,33 @@ def _run_odds_step(
         request_retry_backoff=request_retry_backoff,
     )
     summary["status"] = "success"
+    summary["poll_executed"] = True
+    return summary
+
+
+def _run_web_text_step(
+    db_path: str,
+    urls: Optional[list[str]],
+    min_hours_between_polls: Optional[float],
+    force_poll: bool,
+    request_timeout: int,
+    request_retries: int,
+    request_retry_delay_seconds: float,
+    request_retry_backoff: float,
+    max_chars: int,
+) -> dict:
+    """Fetch/store direct website text snapshots and return summary."""
+    summary = fetch_and_store_web_text(
+        urls=list(urls or []),
+        db_path=db_path,
+        min_hours_between_polls=min_hours_between_polls,
+        force_poll=force_poll,
+        request_timeout=request_timeout,
+        request_retries=request_retries,
+        request_retry_delay_seconds=request_retry_delay_seconds,
+        request_retry_backoff=request_retry_backoff,
+        max_chars=max_chars,
+    )
     return summary
 
 
@@ -573,6 +731,18 @@ def run_daily_etl(
     season: Optional[str] = None,
     db_path: str = DEFAULT_DB_PATH,
     odds_api_key: Optional[str] = None,
+    odds_min_hours_between_polls: Optional[float] = None,
+    force_odds_poll: bool = False,
+    web_text_urls: Optional[list[str]] = None,
+    web_text_min_hours_between_polls: Optional[float] = 24.0,
+    web_text_force_poll: bool = False,
+    web_text_max_chars: int = DEFAULT_WEB_TEXT_MAX_CHARS,
+    web_text_request_timeout: int = DEFAULT_WEB_TEXT_REQUEST_TIMEOUT,
+    web_text_request_retries: int = DEFAULT_WEB_TEXT_REQUEST_RETRIES,
+    web_text_request_retry_delay_seconds: float = (
+        DEFAULT_WEB_TEXT_REQUEST_RETRY_DELAY_SECONDS
+    ),
+    web_text_request_retry_backoff: float = DEFAULT_WEB_TEXT_REQUEST_RETRY_BACKOFF,
     sport: str = "basketball_nba",
     regions: str = "us",
     markets: Optional[list[str]] = None,
@@ -671,31 +841,111 @@ def run_daily_etl(
         steps["odds"] = {"status": "skipped",
                          "reason": "Step disabled by flag."}
     else:
-        odds_step = run_with_retry(
-            step_name="odds",
-            func=lambda: _run_odds_step(
+        min_hours_between_polls = None
+        if odds_min_hours_between_polls is not None:
+            min_hours_between_polls = max(0.0, float(odds_min_hours_between_polls))
+
+        recent_poll = _latest_odds_poll_run(db_path=db_path)
+        hours_since_recent_poll = recent_poll.get("hours_since_last_poll")
+        should_skip_for_freshness = bool(
+            not force_odds_poll
+            and min_hours_between_polls is not None
+            and min_hours_between_polls > 0
+            and isinstance(hours_since_recent_poll, (int, float))
+            and float(hours_since_recent_poll) < min_hours_between_polls
+        )
+
+        if should_skip_for_freshness:
+            steps["odds"] = {
+                "status": "success",
+                "step": "odds",
+                "attempts": 0,
+                "elapsed_ms": 0,
+                "result": {
+                    "status": "reused_recent_poll",
+                    "reason": (
+                        "Skipped external odds query because a recent odds poll "
+                        "already exists within the configured window."
+                    ),
+                    "poll_executed": False,
+                    "min_hours_between_polls": float(min_hours_between_polls),
+                    "last_polled_at_utc": recent_poll.get("last_polled_at_utc"),
+                    "last_poll_status": recent_poll.get("last_status"),
+                    "hours_since_last_poll": round(float(hours_since_recent_poll), 3),
+                },
+            }
+        else:
+            odds_step = run_with_retry(
+                step_name="odds",
+                func=lambda: _run_odds_step(
+                    db_path=db_path,
+                    odds_api_key=odds_api_key,
+                    sport=sport,
+                    regions=regions,
+                    markets=markets,
+                    bookmakers=bookmakers,
+                    max_events=max_events,
+                    sleep_seconds=sleep_seconds,
+                    request_timeout=request_timeout,
+                    request_retries=request_retries,
+                    request_retry_delay_seconds=request_retry_delay_seconds,
+                    request_retry_backoff=request_retry_backoff,
+                ),
+                retries=max(0, retries),
+                retry_delay_seconds=retry_delay_seconds,
+                retry_backoff=retry_backoff,
+            )
+            # Allow explicit skip payload from odds step.
+            if odds_step["status"] == "success":
+                if odds_step.get("result", {}).get("status") == "skipped":
+                    odds_step["status"] = "skipped"
+
+            result_payload = odds_step.get("result", {})
+            poll_executed = bool(result_payload.get("poll_executed"))
+            if odds_step.get("status") == "failed":
+                poll_executed = True
+            if poll_executed:
+                _record_odds_poll_run(
+                    db_path=db_path,
+                    status=str(odds_step.get("status", "unknown")),
+                    result=result_payload,
+                    error=odds_step.get("error"),
+                )
+
+            steps["odds"] = odds_step
+
+    if web_text_urls:
+        web_text_step = run_with_retry(
+            step_name="web_text",
+            func=lambda: _run_web_text_step(
                 db_path=db_path,
-                odds_api_key=odds_api_key,
-                sport=sport,
-                regions=regions,
-                markets=markets,
-                bookmakers=bookmakers,
-                max_events=max_events,
-                sleep_seconds=sleep_seconds,
-                request_timeout=request_timeout,
-                request_retries=request_retries,
-                request_retry_delay_seconds=request_retry_delay_seconds,
-                request_retry_backoff=request_retry_backoff,
+                urls=web_text_urls,
+                min_hours_between_polls=web_text_min_hours_between_polls,
+                force_poll=web_text_force_poll,
+                request_timeout=web_text_request_timeout,
+                request_retries=web_text_request_retries,
+                request_retry_delay_seconds=web_text_request_retry_delay_seconds,
+                request_retry_backoff=web_text_request_retry_backoff,
+                max_chars=web_text_max_chars,
             ),
             retries=max(0, retries),
             retry_delay_seconds=retry_delay_seconds,
             retry_backoff=retry_backoff,
         )
-        # Allow explicit skip payload from odds step.
-        if odds_step["status"] == "success":
-            if odds_step.get("result", {}).get("status") == "skipped":
-                odds_step["status"] = "skipped"
-        steps["odds"] = odds_step
+        if web_text_step["status"] == "success":
+            internal_status = str(
+                web_text_step.get("result", {}).get("status", "")
+            ).strip().lower()
+            if internal_status == "skipped":
+                web_text_step["status"] = "skipped"
+            elif internal_status in {"partial_success", "failed"}:
+                web_text_step["status"] = internal_status
+        steps["web_text"] = web_text_step
+    else:
+        steps["web_text"] = {
+            "status": "skipped",
+            "reason": "No web text URLs provided.",
+        }
 
     odds_status = steps.get("odds", {}).get("status")
     if skip_reverse_engineering:
@@ -829,6 +1079,71 @@ def _build_parser() -> argparse.ArgumentParser:
                         help="NBA season string (e.g., 2024-25). Defaults from current date.")
     parser.add_argument("--db-path", default=DEFAULT_DB_PATH)
     parser.add_argument("--odds-api-key", default=None)
+    parser.add_argument(
+        "--odds-min-hours-between-polls",
+        type=float,
+        default=24.0,
+        help=(
+            "Minimum hours between external odds API polls. "
+            "Set to 0 to disable freshness guard."
+        ),
+    )
+    parser.add_argument(
+        "--force-odds-poll",
+        action="store_true",
+        help="Ignore freshness guard and always query external odds API.",
+    )
+    parser.add_argument(
+        "--web-text-urls",
+        nargs="*",
+        default=None,
+        help="Optional direct website URLs to fetch/store visible text snapshots.",
+    )
+    parser.add_argument(
+        "--web-text-urls-file",
+        default=None,
+        help="Path to newline-delimited URL file for --web-text-urls.",
+    )
+    parser.add_argument(
+        "--web-text-min-hours-between-polls",
+        type=float,
+        default=24.0,
+        help=(
+            "Minimum hours between direct web-text polls per URL. "
+            "Set to 0 to disable."
+        ),
+    )
+    parser.add_argument(
+        "--web-text-force-poll",
+        action="store_true",
+        help="Ignore web-text poll freshness guard and always fetch URLs.",
+    )
+    parser.add_argument(
+        "--web-text-max-chars",
+        type=int,
+        default=DEFAULT_WEB_TEXT_MAX_CHARS,
+        help="Max chars stored per URL snapshot after text extraction.",
+    )
+    parser.add_argument(
+        "--web-text-request-timeout",
+        type=int,
+        default=DEFAULT_WEB_TEXT_REQUEST_TIMEOUT,
+    )
+    parser.add_argument(
+        "--web-text-request-retries",
+        type=int,
+        default=DEFAULT_WEB_TEXT_REQUEST_RETRIES,
+    )
+    parser.add_argument(
+        "--web-text-request-retry-delay-seconds",
+        type=float,
+        default=DEFAULT_WEB_TEXT_REQUEST_RETRY_DELAY_SECONDS,
+    )
+    parser.add_argument(
+        "--web-text-request-retry-backoff",
+        type=float,
+        default=DEFAULT_WEB_TEXT_REQUEST_RETRY_BACKOFF,
+    )
     parser.add_argument("--sport", default="basketball_nba")
     parser.add_argument("--regions", default="us")
     parser.add_argument("--bookmakers", nargs="*", default=None)
@@ -900,6 +1215,10 @@ def main() -> None:
     """CLI entry point: run daily ETL and write report."""
     log_path = configure_logging()
     args = _build_parser().parse_args()
+    web_text_urls = list(args.web_text_urls or [])
+    if args.web_text_urls_file:
+        web_text_urls.extend(load_urls_from_file(args.web_text_urls_file))
+
     report = run_daily_etl(
         players=args.players,
         include_db_players=(args.all_db_players or not args.skip_db_players),
@@ -916,6 +1235,26 @@ def main() -> None:
         season=args.season,
         db_path=args.db_path,
         odds_api_key=args.odds_api_key,
+        odds_min_hours_between_polls=(
+            args.odds_min_hours_between_polls
+            if args.odds_min_hours_between_polls > 0
+            else None
+        ),
+        force_odds_poll=args.force_odds_poll,
+        web_text_urls=web_text_urls,
+        web_text_min_hours_between_polls=(
+            args.web_text_min_hours_between_polls
+            if args.web_text_min_hours_between_polls > 0
+            else None
+        ),
+        web_text_force_poll=args.web_text_force_poll,
+        web_text_max_chars=args.web_text_max_chars,
+        web_text_request_timeout=args.web_text_request_timeout,
+        web_text_request_retries=args.web_text_request_retries,
+        web_text_request_retry_delay_seconds=(
+            args.web_text_request_retry_delay_seconds
+        ),
+        web_text_request_retry_backoff=args.web_text_request_retry_backoff,
         sport=args.sport,
         regions=args.regions,
         markets=args.markets,

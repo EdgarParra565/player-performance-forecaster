@@ -1,3 +1,5 @@
+"""Distribution-based over-probability calculations for NBA prop modeling."""
+
 import numpy as np
 from scipy.stats import binom, expon, lognorm, norm, pareto, poisson, t, uniform
 

@@ -1,3 +1,5 @@
+"""Odds conversion and expected-value utility functions."""
+
 def american_to_implied_prob(odds: int) -> float:
     """
     Converts American odds to implied probability

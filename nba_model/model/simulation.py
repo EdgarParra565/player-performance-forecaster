@@ -1,3 +1,5 @@
+"""Simulation utilities for NBA prop outcome distributions and calibration."""
+
 import numpy as np
 
 # -----------------------------------------------------------------------------

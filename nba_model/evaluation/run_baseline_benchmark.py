@@ -1,3 +1,5 @@
+"""Baseline benchmark runner for fixed-profile NBA backtest comparisons."""
+
 import hashlib
 from pathlib import Path
 

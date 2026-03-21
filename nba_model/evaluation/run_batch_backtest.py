@@ -1,3 +1,5 @@
+"""Batch backtest CLI for multi-player, multi-window evaluation runs."""
+
 import argparse
 from datetime import datetime
 from pathlib import Path

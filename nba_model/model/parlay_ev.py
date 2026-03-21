@@ -1,3 +1,5 @@
+"""Expected-value helpers for parlay-style betting combinations."""
+
 def calculate_parlay_ev(prob: float, odds: int, stake: float = 1.0) -> float:
     """
     Expected value of a parlay bet

@@ -1,3 +1,5 @@
+"""Statistical significance helpers for betting win-rate evaluation."""
+
 from math import sqrt
 from typing import Dict
 

@@ -1,3 +1,5 @@
+"""Unit tests for correlation calibration and covariance construction logic."""
+
 import unittest
 
 import numpy as np

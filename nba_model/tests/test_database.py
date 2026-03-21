@@ -1,3 +1,5 @@
+"""Manual database smoke script for verifying SQLite insert/query behavior."""
+
 from nba_model.data.database.db_manager import DatabaseManager
 import pandas as pd
 
