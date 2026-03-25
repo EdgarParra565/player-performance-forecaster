@@ -1,4 +1,4 @@
-"""Daily ETL runner for game logs, defense, odds, web text, and reverse-engineering."""
+"""Daily ETL runner for game logs, defense, odds, web text, parser, and reverse-engineering."""
 
 import argparse
 import json
@@ -28,6 +28,12 @@ from nba_model.model.odds_ingestion import (
     PLAYER_PROP_MARKETS,
     _default_api_key,
     fetch_and_store_betting_lines,
+)
+from nba_model.model.browser_prop_parser import (
+    DEFAULT_MAX_SNAPSHOTS_PER_URL as DEFAULT_BROWSER_PARSER_MAX_SNAPSHOTS_PER_URL,
+    DEFAULT_MAX_TOTAL_SNAPSHOTS as DEFAULT_BROWSER_PARSER_MAX_TOTAL_SNAPSHOTS,
+    DEFAULT_MIN_PARSE_CONFIDENCE as DEFAULT_BROWSER_PARSER_MIN_CONFIDENCE,
+    parse_and_store_web_prop_cards,
 )
 from nba_model.model.web_text_ingestion import (
     DEFAULT_WEB_TEXT_MAX_CHARS,
@@ -627,6 +633,8 @@ def _run_web_text_step(
     request_retry_delay_seconds: float,
     request_retry_backoff: float,
     max_chars: int,
+    browser_auth_state_file: Optional[str],
+    browser_user_data_dir: Optional[str],
 ) -> dict:
     """Fetch/store direct website text snapshots and return summary."""
     summary = fetch_and_store_web_text(
@@ -639,8 +647,27 @@ def _run_web_text_step(
         request_retry_delay_seconds=request_retry_delay_seconds,
         request_retry_backoff=request_retry_backoff,
         max_chars=max_chars,
+        browser_auth_state_file=browser_auth_state_file,
+        browser_user_data_dir=browser_user_data_dir,
     )
     return summary
+
+
+def _run_browser_parser_step(
+    db_path: str,
+    urls: Optional[list[str]],
+    max_snapshots_per_url: int,
+    max_total_snapshots: int,
+    min_parse_confidence: float,
+) -> dict:
+    """Parse and store structured prop cards from recent web text snapshots."""
+    return parse_and_store_web_prop_cards(
+        db_path=db_path,
+        source_urls=list(urls or []),
+        max_snapshots_per_url=max(1, int(max_snapshots_per_url)),
+        max_total_snapshots=max(1, int(max_total_snapshots)),
+        min_parse_confidence=float(min_parse_confidence),
+    )
 
 
 def _run_reverse_engineering_step(
@@ -725,6 +752,7 @@ def run_daily_etl(
     skip_game_logs: bool = False,
     skip_team_defense: bool = False,
     skip_odds: bool = False,
+    skip_browser_parser: bool = False,
     skip_reverse_engineering: bool = False,
     game_log_games: int = 120,
     game_log_force_refresh: bool = True,
@@ -743,6 +771,13 @@ def run_daily_etl(
         DEFAULT_WEB_TEXT_REQUEST_RETRY_DELAY_SECONDS
     ),
     web_text_request_retry_backoff: float = DEFAULT_WEB_TEXT_REQUEST_RETRY_BACKOFF,
+    browser_auth_state_file: Optional[str] = None,
+    browser_user_data_dir: Optional[str] = None,
+    browser_parser_max_snapshots_per_url: int = (
+        DEFAULT_BROWSER_PARSER_MAX_SNAPSHOTS_PER_URL
+    ),
+    browser_parser_max_total_snapshots: int = DEFAULT_BROWSER_PARSER_MAX_TOTAL_SNAPSHOTS,
+    browser_parser_min_parse_confidence: float = DEFAULT_BROWSER_PARSER_MIN_CONFIDENCE,
     sport: str = "basketball_nba",
     regions: str = "us",
     markets: Optional[list[str]] = None,
@@ -927,6 +962,8 @@ def run_daily_etl(
                 request_retry_delay_seconds=web_text_request_retry_delay_seconds,
                 request_retry_backoff=web_text_request_retry_backoff,
                 max_chars=web_text_max_chars,
+                browser_auth_state_file=browser_auth_state_file,
+                browser_user_data_dir=browser_user_data_dir,
             ),
             retries=max(0, retries),
             retry_delay_seconds=retry_delay_seconds,
@@ -946,6 +983,40 @@ def run_daily_etl(
             "status": "skipped",
             "reason": "No web text URLs provided.",
         }
+
+    if skip_browser_parser:
+        steps["browser_parser"] = {
+            "status": "skipped",
+            "reason": "Step disabled by flag.",
+        }
+    elif not web_text_urls:
+        steps["browser_parser"] = {
+            "status": "skipped",
+            "reason": "No web text URLs provided.",
+        }
+    else:
+        browser_parser_step = run_with_retry(
+            step_name="browser_parser",
+            func=lambda: _run_browser_parser_step(
+                db_path=db_path,
+                urls=web_text_urls,
+                max_snapshots_per_url=browser_parser_max_snapshots_per_url,
+                max_total_snapshots=browser_parser_max_total_snapshots,
+                min_parse_confidence=browser_parser_min_parse_confidence,
+            ),
+            retries=max(0, retries),
+            retry_delay_seconds=retry_delay_seconds,
+            retry_backoff=retry_backoff,
+        )
+        if browser_parser_step["status"] == "success":
+            parser_status = str(
+                browser_parser_step.get("result", {}).get("status", "")
+            ).strip().lower()
+            if parser_status == "skipped":
+                browser_parser_step["status"] = "skipped"
+            elif parser_status in {"partial_success", "failed"}:
+                browser_parser_step["status"] = parser_status
+        steps["browser_parser"] = browser_parser_step
 
     odds_status = steps.get("odds", {}).get("status")
     if skip_reverse_engineering:
@@ -1068,6 +1139,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--skip-game-logs", action="store_true")
     parser.add_argument("--skip-team-defense", action="store_true")
     parser.add_argument("--skip-odds", action="store_true")
+    parser.add_argument("--skip-browser-parser", action="store_true")
     parser.add_argument("--skip-reverse-engineering", action="store_true")
     parser.add_argument("--game-log-games", type=int, default=120)
     parser.add_argument(
@@ -1143,6 +1215,42 @@ def _build_parser() -> argparse.ArgumentParser:
         "--web-text-request-retry-backoff",
         type=float,
         default=DEFAULT_WEB_TEXT_REQUEST_RETRY_BACKOFF,
+    )
+    parser.add_argument(
+        "--browser-auth-state-file",
+        default=None,
+        help=(
+            "Optional Playwright storage-state JSON file used by web-text "
+            "ingestion for authenticated browser sessions."
+        ),
+    )
+    parser.add_argument(
+        "--browser-user-data-dir",
+        default=None,
+        help=(
+            "Optional Playwright user-data directory used by web-text "
+            "ingestion for persistent authenticated sessions."
+        ),
+    )
+    parser.add_argument(
+        "--browser-parser-max-snapshots-per-url",
+        type=int,
+        default=DEFAULT_BROWSER_PARSER_MAX_SNAPSHOTS_PER_URL,
+        help=(
+            "Max recent snapshots parsed per URL in browser parser step."
+        ),
+    )
+    parser.add_argument(
+        "--browser-parser-max-total-snapshots",
+        type=int,
+        default=DEFAULT_BROWSER_PARSER_MAX_TOTAL_SNAPSHOTS,
+        help="Hard cap on total snapshots parsed in browser parser step.",
+    )
+    parser.add_argument(
+        "--browser-parser-min-parse-confidence",
+        type=float,
+        default=DEFAULT_BROWSER_PARSER_MIN_CONFIDENCE,
+        help="Minimum parser confidence required to persist extracted cards.",
     )
     parser.add_argument("--sport", default="basketball_nba")
     parser.add_argument("--regions", default="us")
@@ -1229,6 +1337,7 @@ def main() -> None:
         skip_game_logs=args.skip_game_logs,
         skip_team_defense=args.skip_team_defense,
         skip_odds=args.skip_odds,
+        skip_browser_parser=args.skip_browser_parser,
         skip_reverse_engineering=args.skip_reverse_engineering,
         game_log_games=args.game_log_games,
         game_log_force_refresh=not args.use_cache_for_game_logs,
@@ -1255,6 +1364,13 @@ def main() -> None:
             args.web_text_request_retry_delay_seconds
         ),
         web_text_request_retry_backoff=args.web_text_request_retry_backoff,
+        browser_auth_state_file=args.browser_auth_state_file,
+        browser_user_data_dir=args.browser_user_data_dir,
+        browser_parser_max_snapshots_per_url=(
+            args.browser_parser_max_snapshots_per_url
+        ),
+        browser_parser_max_total_snapshots=args.browser_parser_max_total_snapshots,
+        browser_parser_min_parse_confidence=args.browser_parser_min_parse_confidence,
         sport=args.sport,
         regions=args.regions,
         markets=args.markets,

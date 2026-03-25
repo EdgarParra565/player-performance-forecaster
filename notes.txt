@@ -1,6 +1,6 @@
 # NBA Player Performance Forecaster - Working Notes
 
-Last updated: 2026-02-27
+Last updated: 2026-03-25
 
 This file is the active project tracker. It keeps only:
 - current architecture
@@ -14,24 +14,27 @@ Near-term objective:
 - select production defaults from real benchmark outputs
 ---
 
-## 0) End-of-Day Status (2026-02-27)
+## 0) End-of-Day Status (2026-03-25)
 
 ### Added today
 - [x] Added direct sportsbook URL config template and working list in `data/config/web_text_urls.txt`
 - [x] Ran direct web-text ingestion on UnderDog links (5 URLs fetched, 5 snapshots inserted)
 - [x] Synced active NBA players reference to DB + file (`nba_active_players_ref`, `data/config/active_nba_players.txt`)
 - [x] Ran browser-rendered diagnostics and saved artifacts under `data/artifacts/` for blocker analysis
+- [x] Added structured browser parser stage (`browser_prop_parser`) that reads `web_text_snapshots` and writes normalized `web_prop_cards`
+- [x] Added player classification (`active_nba`/`non_nba`), parse confidence scoring, raw card text audit fields, and snapshot linkage (`snapshot_id`)
+- [x] Wired parser as optional ETL step with CLI controls (`--skip-browser-parser`, confidence/snapshot limits)
 
 ### Needs work next
-- [ ] Build structured parser from raw snapshots/network payloads into normalized props rows (player/stat/line/odds/book)
-- [ ] Add automatic name classification for extracted players (`active_nba` vs `non_nba`) using `nba_active_players_ref`
-- [ ] Add per-book parser adapters (different sites/books use different DOM/API shapes)
+- [ ] Add per-book parser adapters (different sites/books use different DOM/API/text shapes)
+- [ ] Improve parser recall for login-gated pages via authenticated browser session mode
 - [ ] Convert manual helper scripts (`check_data.py`, `test_backtest.py`, `test_database.py`) into formal tests or move to a dedicated scripts folder
 
 ### Needs to be fixed / blockers
-- [ ] UnderDog pages are login-gated in browser context; anonymous fetch currently lands on loading shell/login wall (no public prop rows)
-- [ ] Generic raw-text scraping is insufficient for dynamic JS-heavy books; need endpoint-level extraction and/or authenticated browser session support
-- [ ] Browser automation setup is environment-sensitive and should be wrapped in a stable, repeatable command/script
+- [ ] UnderDog pages are login-gated in browser context; anonymous fetch still lands on loading shell/login wall (no public prop rows)
+- [ ] Even with authenticated browser-session ingestion enabled, parser output can remain empty (`browser_parser: partial_success`) when visible prop-card text is not present/parseable
+- [ ] Browser-auth mode is environment-sensitive: must run in project `.venv` with Playwright + local browser binaries installed (system `python3` can fail)
+- [ ] Generic raw-text scraping is insufficient for dynamic JS-heavy books; endpoint-aware extraction and book-specific parser adapters are still needed
 
 ---
 
@@ -139,9 +142,10 @@ player-performance-forecaster/
 - [ ] Add monthly report rollups by stat type and by player segment
 
 ### E. Web-source parsing and classification
-- [ ] Add normalized extraction path from `web_text_snapshots` into a structured props table
-- [ ] Add extracted-name classification report (`active_nba`, `non_nba`, unresolved alias)
-- [ ] Add optional authenticated browser session mode for login-gated sites
+- [x] Add normalized extraction path from `web_text_snapshots` into a structured props table (`web_prop_cards`)
+- [x] Add extracted-name classification report (`active_nba`, `non_nba`) with parse confidence + audit columns
+- [x] Add optional authenticated browser session mode flags for login-gated sites (`--browser-auth-state-file`, `--browser-user-data-dir`)
+- [ ] Improve extraction reliability for authenticated sessions where visible prop cards still do not render/parse
 
 ---
 
@@ -163,9 +167,11 @@ player-performance-forecaster/
 - Reverse-engineering quality depends on enough overlapping `betting_lines` + model predictions in the same date/player/stat windows.
 - Name mismatches across sources can still reduce join coverage (e.g., punctuation/suffix variants in player names).
 - Some evaluation scripts still produce empty artifacts when windows are sparse; they now fail less often, but output quality remains data-dependent.
+- Full test-suite reliability still depends on network access because `test_backtest.py` performs live NBA API work at import/runtime.
 - ETL scheduler exists (GitHub Actions), but external alerting/monitoring on failed or partial runs is still minimal.
 - Current UnderDog anonymous access returns login-gated UI in browser mode; props are not publicly extractable from rendered page text.
-- Generic web-text ingestion works for snapshots, but structured parsing remains site-specific and incomplete for JS-heavy sites.
+- Authenticated browser-session ingestion is wired, but requires project `.venv` + Playwright browser setup (`.playwright-browsers`) for consistent runtime behavior.
+- Generic web-text ingestion works for snapshots, but structured parsing remains site-specific and incomplete for JS-heavy/login-gated sites.
 
 ---
 
@@ -193,6 +199,22 @@ python3 -m nba_model.data.daily_etl \
   --skip-reverse-engineering \
   --web-text-urls "https://example.com/sportsbook/nba/props" \
   --web-text-min-hours-between-polls 24
+
+# Daily ETL (authenticated browser session for login-gated sites)
+python3 -m nba_model.data.daily_etl \
+  --skip-game-logs \
+  --skip-team-defense \
+  --skip-odds \
+  --skip-reverse-engineering \
+  --web-text-urls-file data/config/web_text_urls.txt \
+  --browser-auth-state-file data/config/auth/underdog_state.json \
+  --browser-user-data-dir data/config/auth/underdog_profile
+
+# Standalone browser parser over stored snapshots
+python3 -m nba_model.model.browser_prop_parser \
+  --urls-file data/config/web_text_urls.txt \
+  --min-parse-confidence 0.50 \
+  --max-snapshots-per-url 2
 
 # Sync active NBA player reference list (for filtering non-NBA names)
 python3 -m nba_model.model.web_text_ingestion \
@@ -258,8 +280,8 @@ TECHNICAL DEBT / KNOWN ISSUES
 - Reverse-engineering outputs are more stable with continuous mode, but remain data-coverage constrained.
 - Line comparison/monthly diagnostics can still return sparse/empty artifacts when `betting_lines` and `predictions` do not overlap enough.
 - Real-data benchmark/distribution sweep scripts are implemented; production defaults still need formal selection from full-run artifacts.
-- Current browser-based UnderDog fetch path lands on login-gated flow for anonymous sessions, so no prop rows are extracted yet.
-- Web text snapshots are captured, but parser normalization to structured props per book is still pending.
+- Current browser-based UnderDog fetch path remains login-gated for anonymous sessions; authenticated sessions can still return non-parseable visible text.
+- Web text snapshots + parser normalization are implemented, but extraction recall is still limited without book-specific parsing rules.
 - Current travel/rest/injury features are heuristic; no independent validation source is integrated yet.
 - Some modules still use `print()` instead of structured logging.
 - DB path/config remains mostly default-arg based; centralized env config is incomplete.

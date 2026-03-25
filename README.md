@@ -139,6 +139,10 @@ Notes:
 - Odds polling is rate-limited by default to once per 24 hours in CLI runs (`--odds-min-hours-between-polls 24`).
 - Use `--force-odds-poll` to bypass that guard for a manual refresh.
 - Use `--web-text-urls` (or `--web-text-urls-file`) to fetch raw visible text directly from public web pages.
+- Browser parser step now runs after web-text ingestion and attempts to extract structured prop cards (`player`, `stat`, `line`, `side`, `book`, `timestamp`) into `web_prop_cards`.
+- Parsed names are auto-classified with `nba_active_players_ref` as `active_nba` vs `non_nba`, and each row keeps `parse_confidence` + raw card text for auditability.
+- Use `--skip-browser-parser` to disable parsing, and tune extraction with `--browser-parser-min-parse-confidence`, `--browser-parser-max-snapshots-per-url`, and `--browser-parser-max-total-snapshots`.
+- For authenticated web sessions, pass `--browser-auth-state-file` and/or `--browser-user-data-dir` so web-text ingestion runs in browser context with your saved login state.
 - Web-text polling is also guarded per URL by default (`--web-text-min-hours-between-polls 24`).
 - Not every site will parse equally well with raw text extraction (dynamic JS pages, bot protection, and custom HTML layouts can limit coverage).
 - Reverse-engineering auto-skips when the odds step is skipped/failed; use `--skip-reverse-engineering` to disable it explicitly.
@@ -197,12 +201,42 @@ python3 -m nba_model.data.daily_etl \
   --web-text-min-hours-between-polls 24
 ```
 
+Authenticated browser-session ingestion (manual runs only):
+
+```bash
+.venv/bin/playwright install chromium
+
+.venv/bin/python -m nba_model.data.daily_etl \
+  --skip-game-logs \
+  --skip-team-defense \
+  --skip-odds \
+  --skip-reverse-engineering \
+  --web-text-urls-file data/config/web_text_urls.txt \
+  --browser-auth-state-file data/config/auth/underdog_state.json \
+  --browser-user-data-dir data/config/auth/underdog_profile
+```
+
+Notes:
+- Browser-auth mode expects Playwright installed in the Python environment you use to run the command.
+- Recommended runtime is project `.venv` (`.venv/bin/python ...`) so browser dependencies stay isolated.
+- This project auto-prefers local `.playwright-browsers/` binaries when available.
+
 Standalone direct web-text CLI:
 
 ```bash
 python3 -m nba_model.model.web_text_ingestion \
   --urls "https://example.com/sportsbook/nba/props" \
-  --min-hours-between-polls 24
+  --min-hours-between-polls 24 \
+  --browser-auth-state-file data/config/auth/underdog_state.json
+```
+
+Standalone browser-parser CLI (reads from `web_text_snapshots` and writes `web_prop_cards`):
+
+```bash
+python3 -m nba_model.model.browser_prop_parser \
+  --urls-file data/config/web_text_urls.txt \
+  --min-parse-confidence 0.50 \
+  --max-snapshots-per-url 2
 ```
 
 Sync active NBA players reference into DB + local file (used for filtering/classifying non-NBA names):

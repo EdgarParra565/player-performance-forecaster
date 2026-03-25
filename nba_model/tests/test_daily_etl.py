@@ -535,6 +535,150 @@ class DailyETLTests(unittest.TestCase):
         self.assertEqual(summary["total_selected"], 1)
         self.assertIn("DB Player 2", summary["zero_game_skipped_examples"])
 
+    @patch("nba_model.data.daily_etl.run_market_reverse_engineering_continuous")
+    @patch("nba_model.data.daily_etl.parse_and_store_web_prop_cards")
+    @patch("nba_model.data.daily_etl.fetch_and_store_web_text")
+    @patch("nba_model.data.daily_etl.fetch_and_store_betting_lines")
+    @patch("nba_model.data.daily_etl._default_api_key")
+    def test_run_daily_etl_runs_browser_parser_when_web_urls_present(
+        self,
+        mock_default_key,
+        mock_fetch_odds,
+        mock_fetch_web_text,
+        mock_parse_web_props,
+        mock_reverse_engineering,
+    ):
+        mock_default_key.return_value = "dummy-key"
+        mock_fetch_odds.return_value = {"records_parsed": 1}
+        mock_fetch_web_text.return_value = {
+            "status": "success",
+            "fetched_count": 1,
+            "db_inserted": 1,
+        }
+        mock_parse_web_props.return_value = {
+            "status": "success",
+            "cards_extracted": 2,
+            "cards_retained": 2,
+            "db_inserted": 2,
+        }
+        mock_reverse_engineering.return_value = {
+            "status": "ready",
+            "inferred_rows": 3,
+        }
+
+        report = run_daily_etl(
+            players=["LeBron James"],
+            include_db_players=False,
+            skip_game_logs=True,
+            skip_team_defense=True,
+            web_text_urls=["https://example.com/props"],
+            retries=0,
+            write_report=False,
+        )
+
+        self.assertEqual(report["steps"]["web_text"]["status"], "success")
+        self.assertEqual(report["steps"]["browser_parser"]["status"], "success")
+        self.assertEqual(report["steps"]["reverse_engineering"]["status"], "success")
+        mock_parse_web_props.assert_called_once()
+
+    @patch("nba_model.data.daily_etl.parse_and_store_web_prop_cards")
+    @patch("nba_model.data.daily_etl.fetch_and_store_web_text")
+    def test_run_daily_etl_skips_browser_parser_when_flag_set(
+        self,
+        mock_fetch_web_text,
+        mock_parse_web_props,
+    ):
+        mock_fetch_web_text.return_value = {
+            "status": "success",
+            "fetched_count": 1,
+            "db_inserted": 1,
+        }
+        report = run_daily_etl(
+            players=["LeBron James"],
+            include_db_players=False,
+            skip_game_logs=True,
+            skip_team_defense=True,
+            skip_odds=True,
+            skip_browser_parser=True,
+            skip_reverse_engineering=True,
+            web_text_urls=["https://example.com/props"],
+            retries=0,
+            write_report=False,
+        )
+
+        self.assertEqual(report["steps"]["web_text"]["status"], "success")
+        self.assertEqual(report["steps"]["browser_parser"]["status"], "skipped")
+        mock_parse_web_props.assert_not_called()
+
+    @patch("nba_model.data.daily_etl.parse_and_store_web_prop_cards")
+    @patch("nba_model.data.daily_etl.fetch_and_store_web_text")
+    def test_run_daily_etl_browser_parser_partial_status_rolls_up(
+        self,
+        mock_fetch_web_text,
+        mock_parse_web_props,
+    ):
+        mock_fetch_web_text.return_value = {
+            "status": "success",
+            "fetched_count": 1,
+            "db_inserted": 1,
+        }
+        mock_parse_web_props.return_value = {
+            "status": "partial_success",
+            "cards_extracted": 0,
+            "cards_retained": 0,
+            "db_inserted": 0,
+        }
+        report = run_daily_etl(
+            players=["LeBron James"],
+            include_db_players=False,
+            skip_game_logs=True,
+            skip_team_defense=True,
+            skip_odds=True,
+            skip_reverse_engineering=True,
+            web_text_urls=["https://example.com/props"],
+            retries=0,
+            write_report=False,
+        )
+
+        self.assertEqual(report["steps"]["browser_parser"]["status"], "partial_success")
+        self.assertEqual(report["status"], "partial_success")
+
+    @patch("nba_model.data.daily_etl.fetch_and_store_web_text")
+    def test_run_daily_etl_passes_browser_session_flags_to_web_text_step(
+        self,
+        mock_fetch_web_text,
+    ):
+        mock_fetch_web_text.return_value = {
+            "status": "success",
+            "fetched_count": 1,
+            "db_inserted": 1,
+        }
+
+        run_daily_etl(
+            players=["LeBron James"],
+            include_db_players=False,
+            skip_game_logs=True,
+            skip_team_defense=True,
+            skip_odds=True,
+            skip_browser_parser=True,
+            skip_reverse_engineering=True,
+            web_text_urls=["https://example.com/props"],
+            browser_auth_state_file="data/config/auth/underdog_state.json",
+            browser_user_data_dir="data/config/auth/underdog_profile",
+            retries=0,
+            write_report=False,
+        )
+
+        _, kwargs = mock_fetch_web_text.call_args
+        self.assertEqual(
+            kwargs.get("browser_auth_state_file"),
+            "data/config/auth/underdog_state.json",
+        )
+        self.assertEqual(
+            kwargs.get("browser_user_data_dir"),
+            "data/config/auth/underdog_profile",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

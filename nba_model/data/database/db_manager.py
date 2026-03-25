@@ -314,6 +314,71 @@ class DatabaseManager:
             if row and row[0] is not None and row[1] is not None
         }
 
+    def get_recent_web_text_snapshots(
+        self,
+        source_urls=None,
+        max_snapshots_per_url=1,
+        limit_total=250,
+    ):
+        """
+        Return recent web-text snapshots for parser ingestion.
+
+        Args:
+            source_urls: optional iterable of URL filters.
+            max_snapshots_per_url: max snapshots returned per URL.
+            limit_total: hard cap for total snapshots returned.
+        """
+        per_url_limit = max(1, int(max_snapshots_per_url))
+        total_limit = max(1, int(limit_total))
+        urls = [
+            str(url).strip()
+            for url in (source_urls or [])
+            if str(url).strip()
+        ]
+
+        if urls:
+            placeholders = ", ".join(["?"] * len(urls))
+            query = f"""
+                SELECT snapshot_id, source_url, fetched_at_utc, text_content, text_length, content_sha256
+                FROM web_text_snapshots
+                WHERE source_url IN ({placeholders})
+                ORDER BY source_url ASC, fetched_at_utc DESC, snapshot_id DESC
+            """
+            rows = self.conn.execute(query, tuple(urls)).fetchall()
+        else:
+            rows = self.conn.execute(
+                """
+                SELECT snapshot_id, source_url, fetched_at_utc, text_content, text_length, content_sha256
+                FROM web_text_snapshots
+                ORDER BY source_url ASC, fetched_at_utc DESC, snapshot_id DESC
+                """
+            ).fetchall()
+
+        selected = []
+        per_url_counts = {}
+        for row in rows:
+            source_url = str(row[1]).strip() if row and row[1] is not None else ""
+            if not source_url:
+                continue
+            seen_for_url = per_url_counts.get(source_url, 0)
+            if seen_for_url >= per_url_limit:
+                continue
+            selected.append(
+                {
+                    "snapshot_id": int(row[0]),
+                    "source_url": source_url,
+                    "fetched_at_utc": str(row[2]),
+                    "text_content": str(row[3]) if row[3] is not None else "",
+                    "text_length": int(row[4]) if row[4] is not None else None,
+                    "content_sha256": str(row[5]) if row[5] is not None else None,
+                }
+            )
+            per_url_counts[source_url] = seen_for_url + 1
+            if len(selected) >= total_limit:
+                break
+
+        return selected
+
     def upsert_active_players_reference(self, records):
         """
         Upsert active NBA players reference rows.
@@ -371,6 +436,97 @@ class DatabaseManager:
             """
         ).fetchall()
         return [str(row[0]).strip() for row in rows if row and str(row[0]).strip()]
+
+    def insert_web_prop_cards(self, records):
+        """
+        Insert parsed web prop cards with dedupe via record_sha256.
+
+        Args:
+            records: Iterable[dict] with parser output fields.
+        """
+        if not records:
+            return {
+                "inserted": 0,
+                "attempted": 0,
+            }
+
+        query = """
+            INSERT OR IGNORE INTO web_prop_cards (
+                snapshot_id,
+                source_url,
+                book,
+                observed_at_utc,
+                player_name,
+                player_classification,
+                stat_type,
+                line_value,
+                side,
+                parse_confidence,
+                raw_card_text,
+                parser_version,
+                record_sha256
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """
+
+        payload = []
+        for rec in records:
+            snapshot_id = rec.get("snapshot_id")
+            line_value = rec.get("line_value")
+            parse_confidence = rec.get("parse_confidence")
+            try:
+                snapshot_id = int(snapshot_id)
+                line_value = float(line_value)
+                parse_confidence = float(parse_confidence)
+            except (TypeError, ValueError):
+                continue
+
+            row = (
+                snapshot_id,
+                str(rec.get("source_url", "")).strip(),
+                str(rec.get("book", "")).strip(),
+                str(rec.get("observed_at_utc", "")).strip(),
+                str(rec.get("player_name", "")).strip(),
+                str(rec.get("player_classification", "")).strip(),
+                str(rec.get("stat_type", "")).strip(),
+                line_value,
+                str(rec.get("side", "")).strip(),
+                parse_confidence,
+                str(rec.get("raw_card_text", "")).strip() or None,
+                str(rec.get("parser_version", "")).strip(),
+                str(rec.get("record_sha256", "")).strip(),
+            )
+            if not all(
+                [
+                    row[1],
+                    row[2],
+                    row[3],
+                    row[4],
+                    row[5],
+                    row[6],
+                    row[8],
+                    row[11],
+                    row[12],
+                ]
+            ):
+                continue
+            payload.append(row)
+
+        if not payload:
+            return {
+                "inserted": 0,
+                "attempted": 0,
+            }
+
+        before_changes = self.conn.total_changes
+        self.conn.executemany(query, payload)
+        self.conn.commit()
+        inserted = self.conn.total_changes - before_changes
+        logger.info("Inserted %s web_prop_cards rows", inserted)
+        return {
+            "inserted": int(inserted),
+            "attempted": int(len(payload)),
+        }
 
     def insert_game_logs(self, game_logs_df):
         """

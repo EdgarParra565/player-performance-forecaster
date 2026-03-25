@@ -51,3 +51,6 @@ nba_model/data/artifacts/
 
 # Environment variables
 .env
+
+# Browser auth/session artifacts
+data/config/auth/

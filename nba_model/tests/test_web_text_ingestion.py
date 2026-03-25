@@ -101,6 +101,48 @@ class WebTextIngestionTests(unittest.TestCase):
         self.assertEqual(total_rows, 2)
         self.assertEqual(mock_get.call_count, 2)
 
+    @patch("nba_model.model.web_text_ingestion.requests.get")
+    @patch("nba_model.model.web_text_ingestion._fetch_url_text_with_browser")
+    def test_fetch_and_store_uses_browser_mode_with_session_flags(
+        self,
+        mock_browser_fetch,
+        mock_get,
+    ):
+        mock_browser_fetch.return_value = {
+            "source_url": "https://example.com/browser-page",
+            "fetched_at_utc": "2026-02-27T00:00:00+00:00",
+            "http_status": 200,
+            "content_type": "text/html",
+            "text_content": "Rendered browser text",
+            "text_length": 21,
+            "content_sha256": "abc123",
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = str(Path(tmpdir) / "nba_data.db")
+            user_data_dir = str(Path(tmpdir) / "browser_profile")
+            summary = fetch_and_store_web_text(
+                urls=["https://example.com/browser-page"],
+                db_path=db_path,
+                min_hours_between_polls=None,
+                force_poll=True,
+                request_retries=0,
+                browser_user_data_dir=user_data_dir,
+            )
+
+            with DatabaseManager(db_path=db_path) as db:
+                rows = db.conn.execute(
+                    "SELECT source_url, text_content FROM web_text_snapshots"
+                ).fetchall()
+
+        self.assertEqual(summary["status"], "success")
+        self.assertEqual(summary["fetch_mode"], "browser")
+        self.assertEqual(summary["fetched_count"], 1)
+        self.assertEqual(summary["db_inserted"], 1)
+        self.assertEqual(rows, [("https://example.com/browser-page", "Rendered browser text")])
+        mock_browser_fetch.assert_called_once()
+        mock_get.assert_not_called()
+
     def test_load_urls_from_file_ignores_comments_and_blanks(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             url_file = Path(tmpdir) / "urls.txt"

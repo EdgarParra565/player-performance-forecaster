@@ -119,6 +119,26 @@ CREATE TABLE IF NOT EXISTS nba_active_players_ref (
     created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
+-- Parsed web prop cards extracted from visible text snapshots
+CREATE TABLE IF NOT EXISTS web_prop_cards (
+    card_id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    snapshot_id           INTEGER NOT NULL,
+    source_url            TEXT NOT NULL,
+    book                  TEXT NOT NULL,
+    observed_at_utc       TIMESTAMP NOT NULL,
+    player_name           TEXT NOT NULL,
+    player_classification TEXT NOT NULL, -- active_nba, non_nba
+    stat_type             TEXT NOT NULL,
+    line_value            REAL NOT NULL,
+    side                  TEXT NOT NULL, -- over, under
+    parse_confidence      REAL NOT NULL,
+    raw_card_text         TEXT,
+    parser_version        TEXT NOT NULL,
+    record_sha256         TEXT NOT NULL UNIQUE,
+    created_at            TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (snapshot_id) REFERENCES web_text_snapshots(snapshot_id)
+);
+
 -- Model predictions (for evaluation)
 CREATE TABLE IF NOT EXISTS predictions (
     prediction_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -157,3 +177,6 @@ CREATE INDEX IF NOT EXISTS idx_snapshots_event_book ON betting_line_snapshots(ev
 CREATE INDEX IF NOT EXISTS idx_odds_poll_runs_polled_at ON odds_poll_runs(polled_at_utc DESC);
 CREATE INDEX IF NOT EXISTS idx_web_text_snapshots_url_time ON web_text_snapshots(source_url, fetched_at_utc DESC);
 CREATE INDEX IF NOT EXISTS idx_active_players_ref_name ON nba_active_players_ref(player_name);
+CREATE INDEX IF NOT EXISTS idx_web_prop_cards_snapshot ON web_prop_cards(snapshot_id, observed_at_utc DESC);
+CREATE INDEX IF NOT EXISTS idx_web_prop_cards_player_stat ON web_prop_cards(player_name, stat_type, observed_at_utc DESC);
+CREATE INDEX IF NOT EXISTS idx_web_prop_cards_book ON web_prop_cards(book, observed_at_utc DESC);

@@ -1,8 +1,9 @@
-"""Direct web-link text ingestion utilities (no API key required)."""
+"""Direct web-link text ingestion utilities."""
 
 import argparse
 import hashlib
 import logging
+import os
 import time
 from datetime import datetime, timezone
 from html.parser import HTMLParser
@@ -21,6 +22,7 @@ DEFAULT_WEB_TEXT_REQUEST_RETRIES = 1
 DEFAULT_WEB_TEXT_REQUEST_RETRY_DELAY_SECONDS = 0.75
 DEFAULT_WEB_TEXT_REQUEST_RETRY_BACKOFF = 2.0
 DEFAULT_WEB_TEXT_MAX_CHARS = 60000
+DEFAULT_WEB_TEXT_BROWSER_WAIT_AFTER_LOAD_SECONDS = 2.0
 DEFAULT_ACTIVE_PLAYERS_OUTPUT_FILE = "data/config/active_nba_players.txt"
 DEFAULT_WEB_TEXT_USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -177,57 +179,22 @@ def sync_active_nba_players_reference(
     }
 
 
-def _fetch_url_text(
+def _fetch_url_text_with_requests(
     url: str,
     timeout: int,
-    retries: int,
-    retry_delay_seconds: float,
-    retry_backoff: float,
     user_agent: str,
     max_chars: int,
 ) -> dict:
-    """Fetch one URL with retry policy and return normalized text payload."""
-    attempts = max(1, int(retries) + 1)
-    delay_base = max(0.0, float(retry_delay_seconds))
-    backoff = max(1.0, float(retry_backoff))
-
+    """Fetch one URL via HTTP requests and return normalized text payload."""
     headers = {
         "User-Agent": str(user_agent).strip() or DEFAULT_WEB_TEXT_USER_AGENT,
         "Accept": "text/html,text/plain,*/*",
     }
-    last_error: Optional[Exception] = None
-    response = None
-
-    for attempt in range(1, attempts + 1):
-        try:
-            response = requests.get(url, headers=headers, timeout=int(timeout))
-            response.raise_for_status()
-            break
-        except requests.RequestException as exc:
-            last_error = exc
-            if attempt < attempts:
-                delay = delay_base * (backoff ** (attempt - 1))
-                logger.warning(
-                    "Web text fetch failed (%s/%s) for %s: %s. Retrying in %.2fs.",
-                    attempt,
-                    attempts,
-                    url,
-                    exc,
-                    delay,
-                )
-                if delay > 0:
-                    time.sleep(delay)
-            else:
-                raise
-
-    if response is None:
-        if last_error is not None:
-            raise last_error
-        raise RuntimeError("Request failed without response")
+    response = requests.get(url, headers=headers, timeout=int(timeout))
+    response.raise_for_status()
 
     content_type = str(response.headers.get("Content-Type", "")).strip()
     body = response.text or ""
-
     looks_like_html = "html" in content_type.lower() or "<html" in body.lower()
     text_content = (
         _extract_visible_text(body)
@@ -251,6 +218,177 @@ def _fetch_url_text(
     }
 
 
+def _fetch_url_text_with_browser(
+    url: str,
+    timeout: int,
+    user_agent: str,
+    max_chars: int,
+    browser_auth_state_file: Optional[str],
+    browser_user_data_dir: Optional[str],
+) -> dict:
+    """Fetch one URL in browser context, optionally with persisted session state."""
+    local_browser_dir = Path(__file__).resolve().parents[2] / ".playwright-browsers"
+    current_browser_path = str(os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "")).strip()
+    should_force_local_browsers = (
+        local_browser_dir.exists()
+        and (
+            not current_browser_path
+            or "cursor-sandbox-cache" in current_browser_path
+        )
+    )
+    if should_force_local_browsers:
+        # Prefer project-local browser binaries when available so runtime does
+        # not depend on ephemeral Cursor cache paths that may mismatch arch.
+        os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(local_browser_dir)
+
+    try:
+        from playwright.sync_api import sync_playwright
+    except Exception as exc:
+        raise RuntimeError(
+            "Playwright is required for browser-auth web ingestion. "
+            "Install with: pip install playwright"
+        ) from exc
+
+    auth_state_path = str(browser_auth_state_file).strip() if browser_auth_state_file else ""
+    user_data_dir = str(browser_user_data_dir).strip() if browser_user_data_dir else ""
+    profile_state_path = ""
+    if user_data_dir:
+        profile_dir = Path(user_data_dir)
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        profile_state_path = str(profile_dir / "storage_state.json")
+
+    if not auth_state_path and profile_state_path and Path(profile_state_path).exists():
+        auth_state_path = profile_state_path
+
+    if auth_state_path and not Path(auth_state_path).exists():
+        raise FileNotFoundError(
+            f"Browser auth state file does not exist: {auth_state_path}"
+        )
+
+    response = None
+    visible_text = ""
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            timeout=max(1000, int(timeout) * 1000),
+        )
+        try:
+            context_kwargs = {
+                "user_agent": str(user_agent).strip() or DEFAULT_WEB_TEXT_USER_AGENT,
+            }
+            if auth_state_path:
+                context_kwargs["storage_state"] = auth_state_path
+            context = browser.new_context(**context_kwargs)
+            try:
+                page = context.new_page()
+                page.set_default_timeout(
+                    max(1000, int(timeout) * 1000)
+                )
+                response = page.goto(url, wait_until="domcontentloaded")
+                page.wait_for_timeout(
+                    int(DEFAULT_WEB_TEXT_BROWSER_WAIT_AFTER_LOAD_SECONDS * 1000)
+                )
+                body_html = page.content() or ""
+                visible_text = _extract_visible_text(body_html)
+                if not visible_text:
+                    try:
+                        visible_text = _collapse_whitespace(page.inner_text("body"))
+                    except Exception:
+                        visible_text = ""
+                if profile_state_path:
+                    context.storage_state(path=profile_state_path)
+            finally:
+                context.close()
+        finally:
+            browser.close()
+
+    max_chars = max(0, int(max_chars))
+    if max_chars > 0 and len(visible_text) > max_chars:
+        visible_text = visible_text[:max_chars]
+
+    status_code = None
+    content_type = None
+    if response is not None:
+        try:
+            status_code = int(response.status)
+        except Exception:
+            status_code = None
+        try:
+            content_type = str(response.headers.get("content-type", "")).strip() or None
+        except Exception:
+            content_type = None
+
+    content_sha256 = hashlib.sha256(visible_text.encode("utf-8")).hexdigest()
+    return {
+        "source_url": url,
+        "fetched_at_utc": datetime.now(timezone.utc).isoformat(),
+        "http_status": status_code,
+        "content_type": content_type,
+        "text_content": visible_text,
+        "text_length": int(len(visible_text)),
+        "content_sha256": content_sha256,
+    }
+
+
+def _fetch_url_text(
+    url: str,
+    timeout: int,
+    retries: int,
+    retry_delay_seconds: float,
+    retry_backoff: float,
+    user_agent: str,
+    max_chars: int,
+    browser_auth_state_file: Optional[str] = None,
+    browser_user_data_dir: Optional[str] = None,
+) -> dict:
+    """Fetch one URL with retry policy and return normalized text payload."""
+    attempts = max(1, int(retries) + 1)
+    delay_base = max(0.0, float(retry_delay_seconds))
+    backoff = max(1.0, float(retry_backoff))
+    use_browser = bool(
+        str(browser_auth_state_file or "").strip()
+        or str(browser_user_data_dir or "").strip()
+    )
+    last_error: Optional[Exception] = None
+
+    for attempt in range(1, attempts + 1):
+        try:
+            if use_browser:
+                return _fetch_url_text_with_browser(
+                    url=url,
+                    timeout=timeout,
+                    user_agent=user_agent,
+                    max_chars=max_chars,
+                    browser_auth_state_file=browser_auth_state_file,
+                    browser_user_data_dir=browser_user_data_dir,
+                )
+            return _fetch_url_text_with_requests(
+                url=url,
+                timeout=timeout,
+                user_agent=user_agent,
+                max_chars=max_chars,
+            )
+        except Exception as exc:
+            last_error = exc
+            if attempt >= attempts:
+                raise
+            delay = delay_base * (backoff ** (attempt - 1))
+            logger.warning(
+                "Web text fetch failed (%s/%s) for %s: %s. Retrying in %.2fs.",
+                attempt,
+                attempts,
+                url,
+                exc,
+                delay,
+            )
+            if delay > 0:
+                time.sleep(delay)
+
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("Request failed without response")
+
+
 def fetch_and_store_web_text(
     urls: list[str],
     db_path: str = "data/database/nba_data.db",
@@ -262,8 +400,14 @@ def fetch_and_store_web_text(
     request_retry_backoff: float = DEFAULT_WEB_TEXT_REQUEST_RETRY_BACKOFF,
     max_chars: int = DEFAULT_WEB_TEXT_MAX_CHARS,
     user_agent: str = DEFAULT_WEB_TEXT_USER_AGENT,
+    browser_auth_state_file: Optional[str] = None,
+    browser_user_data_dir: Optional[str] = None,
 ) -> dict:
     """Fetch text snapshots for URLs and store into web_text_snapshots table."""
+    use_browser = bool(
+        str(browser_auth_state_file or "").strip()
+        or str(browser_user_data_dir or "").strip()
+    )
     normalized_urls = _normalize_urls(urls or [])
     if not normalized_urls:
         return {
@@ -271,6 +415,7 @@ def fetch_and_store_web_text(
             "reason": "No valid URLs provided.",
             "urls_received": int(len(urls or [])),
             "urls_considered": 0,
+            "fetch_mode": ("browser" if use_browser else "requests"),
             "fetched_count": 0,
             "skipped_recent_count": 0,
             "failed_count": 0,
@@ -282,7 +427,6 @@ def fetch_and_store_web_text(
     min_hours = None
     if min_hours_between_polls is not None:
         min_hours = max(0.0, float(min_hours_between_polls))
-
     with DatabaseManager(db_path=db_path) as db:
         latest_fetch_map = db.get_latest_web_text_fetch_times(normalized_urls)
 
@@ -330,6 +474,8 @@ def fetch_and_store_web_text(
                 retry_backoff=request_retry_backoff,
                 user_agent=user_agent,
                 max_chars=max_chars,
+                browser_auth_state_file=browser_auth_state_file,
+                browser_user_data_dir=browser_user_data_dir,
             )
             snapshot_records.append(record)
             fetched_count += 1
@@ -368,6 +514,7 @@ def fetch_and_store_web_text(
         "status": status,
         "urls_received": int(len(urls or [])),
         "urls_considered": int(len(normalized_urls)),
+        "fetch_mode": ("browser" if use_browser else "requests"),
         "fetched_count": int(fetched_count),
         "skipped_recent_count": int(skipped_recent_count),
         "failed_count": int(failed_count),
@@ -417,6 +564,22 @@ def _build_parser() -> argparse.ArgumentParser:
         type=float,
         default=DEFAULT_WEB_TEXT_REQUEST_RETRY_BACKOFF,
     )
+    parser.add_argument(
+        "--browser-auth-state-file",
+        default=None,
+        help=(
+            "Optional Playwright storage-state JSON file for authenticated "
+            "browser session fetches."
+        ),
+    )
+    parser.add_argument(
+        "--browser-user-data-dir",
+        default=None,
+        help=(
+            "Optional Playwright user-data directory for persistent "
+            "authenticated browser profile."
+        ),
+    )
     parser.add_argument("--max-chars", type=int, default=DEFAULT_WEB_TEXT_MAX_CHARS)
     parser.add_argument("--user-agent", default=DEFAULT_WEB_TEXT_USER_AGENT)
     return parser
@@ -457,6 +620,8 @@ def main():
             request_retry_backoff=args.request_retry_backoff,
             max_chars=args.max_chars,
             user_agent=args.user_agent,
+            browser_auth_state_file=args.browser_auth_state_file,
+            browser_user_data_dir=args.browser_user_data_dir,
         )
 
         print("Web text ingestion summary:")
@@ -464,6 +629,7 @@ def main():
             "status",
             "urls_received",
             "urls_considered",
+            "fetch_mode",
             "fetched_count",
             "skipped_recent_count",
             "failed_count",
