@@ -7,9 +7,11 @@ from unittest.mock import MagicMock, patch
 
 from nba_model.data.database.db_manager import DatabaseManager
 from nba_model.model.web_text_ingestion import (
+    _match_book_domain,
     fetch_and_store_web_text,
     load_urls_from_file,
     sync_active_nba_players_reference,
+    validate_session,
 )
 
 
@@ -165,6 +167,55 @@ class WebTextIngestionTests(unittest.TestCase):
             urls,
             ["https://example.com/a", "https://example.com/b"],
         )
+
+    def test_match_book_domain_resolves_known_books(self):
+        self.assertEqual(
+            _match_book_domain("https://app.underdogfantasy.com/pick-em"),
+            "underdogfantasy.com",
+        )
+        self.assertEqual(
+            _match_book_domain("https://www.draftkings.com/sportsbook"),
+            "draftkings.com",
+        )
+        self.assertIsNone(
+            _match_book_domain("https://unknown-book.com/props"),
+        )
+
+    @patch("nba_model.model.web_text_ingestion._fetch_url_text_with_browser")
+    def test_validate_session_detects_login_wall(self, mock_fetch):
+        mock_fetch.return_value = {
+            "source_url": "https://app.underdogfantasy.com/pick-em",
+            "fetched_at_utc": "2026-02-27T00:00:00+00:00",
+            "http_status": 200,
+            "content_type": "text/html",
+            "text_content": "Sign In Sign In Sign In Create Account Loading...",
+            "text_length": 50,
+            "content_sha256": "abc",
+        }
+        result = validate_session(
+            test_url="https://app.underdogfantasy.com/pick-em",
+            auth_state_file="/nonexistent/path.json",
+            min_content_length=200,
+        )
+        self.assertFalse(result["valid"])
+
+    @patch("nba_model.model.web_text_ingestion._fetch_url_text_with_browser")
+    def test_validate_session_accepts_content_rich_page(self, mock_fetch):
+        mock_fetch.return_value = {
+            "source_url": "https://app.underdogfantasy.com/pick-em",
+            "fetched_at_utc": "2026-02-27T00:00:00+00:00",
+            "http_status": 200,
+            "content_type": "text/html",
+            "text_content": "LeBron James Higher 27.5 Points " * 30,
+            "text_length": 1000,
+            "content_sha256": "def",
+        }
+        result = validate_session(
+            test_url="https://app.underdogfantasy.com/pick-em",
+            auth_state_file="/nonexistent/path.json",
+            min_content_length=200,
+        )
+        self.assertTrue(result["valid"])
 
     @patch("nba_model.model.web_text_ingestion.nba_players.get_active_players")
     def test_sync_active_players_reference_writes_db_and_file(self, mock_get_active_players):

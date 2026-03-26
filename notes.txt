@@ -1,6 +1,6 @@
 # NBA Player Performance Forecaster - Working Notes
 
-Last updated: 2026-03-25
+Last updated: 2026-02-27
 
 This file is the active project tracker. It keeps only:
 - current architecture
@@ -14,27 +14,35 @@ Near-term objective:
 - select production defaults from real benchmark outputs
 ---
 
-## 0) End-of-Day Status (2026-03-25)
+## 0) End-of-Day Status (2026-02-27)
 
-### Added today
-- [x] Added direct sportsbook URL config template and working list in `data/config/web_text_urls.txt`
-- [x] Ran direct web-text ingestion on UnderDog links (5 URLs fetched, 5 snapshots inserted)
-- [x] Synced active NBA players reference to DB + file (`nba_active_players_ref`, `data/config/active_nba_players.txt`)
-- [x] Ran browser-rendered diagnostics and saved artifacts under `data/artifacts/` for blocker analysis
-- [x] Added structured browser parser stage (`browser_prop_parser`) that reads `web_text_snapshots` and writes normalized `web_prop_cards`
-- [x] Added player classification (`active_nba`/`non_nba`), parse confidence scoring, raw card text audit fields, and snapshot linkage (`snapshot_id`)
-- [x] Wired parser as optional ETL step with CLI controls (`--skip-browser-parser`, confidence/snapshot limits)
+### Added/fixed today
+- [x] Interactive login flow: `--login URL` opens a HEADED browser for manual login, saves session to `--browser-auth-state-file` for headless reuse
+- [x] Session validation: `--validate-session URL` headlessly checks whether saved session is still live (detects login walls vs real content)
+- [x] Smart browser wait strategies: book-specific CSS selector waits + `networkidle` fallback + configurable extra wait per book
+- [x] Book-specific adapter maps for UnderDog, DraftKings, FanDuel (CSS selector hints + extra wait durations)
+- [x] Multi-strategy text extraction: HTML parse -> `innerText("body")` -> JS `eval_on_selector_all` fallback chain
+- [x] ETL login integration: `--login URL` + `--validate-session-before-etl` flags in `daily_etl.py` for session bootstrap before ingestion
+- [x] `test_backtest.py` rewritten as proper mocked unit tests (no live API calls at import/runtime; 65/65 tests pass offline)
+- [x] New tests: `test_match_book_domain`, `test_validate_session_detects_login_wall`, `test_validate_session_accepts_content_rich_page`
+
+### Auth workflow (manual then automatic)
+1. **Manual (one-time)**: `python3 -m nba_model.model.web_text_ingestion --login https://app.underdogfantasy.com/pick-em --browser-auth-state-file data/config/auth/underdog_state.json`
+   - A visible browser opens. You log in manually. Close the browser when done. Session cookies saved.
+2. **Automatic (every run)**: `python3 -m nba_model.data.daily_etl --browser-auth-state-file data/config/auth/underdog_state.json --web-text-urls-file data/config/web_text_urls.txt ...`
+   - Headless browser loads saved session and fetches content as an authenticated user.
+3. **Re-login**: When sessions expire, re-run step 1. Use `--validate-session` to check first.
 
 ### Needs work next
-- [ ] Add per-book parser adapters (different sites/books use different DOM/API/text shapes)
-- [ ] Improve parser recall for login-gated pages via authenticated browser session mode
-- [ ] Convert manual helper scripts (`check_data.py`, `test_backtest.py`, `test_database.py`) into formal tests or move to a dedicated scripts folder
+- [ ] Build per-book parser adapters beyond CSS selector hints (different extraction logic per DOM structure)
+- [ ] Auto-detect session expiry and prompt re-login within ETL run
+- [ ] Convert remaining manual helper scripts (`check_data.py`, `test_database.py`) into formal tests or move to a scripts folder
 
-### Needs to be fixed / blockers
-- [ ] UnderDog pages are login-gated in browser context; anonymous fetch still lands on loading shell/login wall (no public prop rows)
-- [ ] Even with authenticated browser-session ingestion enabled, parser output can remain empty (`browser_parser: partial_success`) when visible prop-card text is not present/parseable
-- [ ] Browser-auth mode is environment-sensitive: must run in project `.venv` with Playwright + local browser binaries installed (system `python3` can fail)
-- [ ] Generic raw-text scraping is insufficient for dynamic JS-heavy books; endpoint-aware extraction and book-specific parser adapters are still needed
+### Remaining limitations
+- [ ] UnderDog props still require a logged-in session; anonymous headless fetch returns login wall
+- [ ] Parser recall depends on whether the saved session state actually reproduces cookie/token state in headless mode (some sites invalidate sessions across browser fingerprints)
+- [ ] Browser-auth mode requires project `.venv` + Playwright browser binaries (`.playwright-browsers`)
+- [ ] CSS selector hints are best-effort; sites that restructure their DOM will need adapter updates
 
 ---
 
@@ -118,6 +126,12 @@ player-performance-forecaster/
 - [x] Reverse-engineering continuous mode added (coverage + stability thresholds, max-runs/max-wait guardrails)
 - [x] Market data quality checks for lines and snapshots (`market_data_quality.py`)
 - [x] Batch benchmark edge case fixed: no-bet windows no longer crash (`KeyError: 'roi'`)
+- [x] Interactive login flow (`--login URL`) for manual session bootstrap, saves Playwright `storage_state` for headless reuse
+- [x] Session validation (`--validate-session URL`) to headlessly detect login walls vs live content
+- [x] Smart browser wait strategies with book-specific CSS selector hints and `networkidle` fallback
+- [x] Multi-strategy page text extraction (HTML parse -> innerText -> JS eval fallback)
+- [x] ETL login integration (`--login`, `--validate-session-before-etl`) for session bootstrap before ingestion
+- [x] `test_backtest.py` rewritten as mocked unit tests (no network dependency)
 
 ---
 
@@ -145,7 +159,10 @@ player-performance-forecaster/
 - [x] Add normalized extraction path from `web_text_snapshots` into a structured props table (`web_prop_cards`)
 - [x] Add extracted-name classification report (`active_nba`, `non_nba`) with parse confidence + audit columns
 - [x] Add optional authenticated browser session mode flags for login-gated sites (`--browser-auth-state-file`, `--browser-user-data-dir`)
-- [ ] Improve extraction reliability for authenticated sessions where visible prop cards still do not render/parse
+- [x] Add interactive login flow (`--login`) and session validation (`--validate-session`)
+- [x] Add smart browser wait strategies with book-specific CSS selectors and networkidle fallback
+- [ ] Build per-book parser adapters for sites with unique DOM structures
+- [ ] Add auto-detection of session expiry within ETL flow
 
 ---
 
@@ -167,11 +184,11 @@ player-performance-forecaster/
 - Reverse-engineering quality depends on enough overlapping `betting_lines` + model predictions in the same date/player/stat windows.
 - Name mismatches across sources can still reduce join coverage (e.g., punctuation/suffix variants in player names).
 - Some evaluation scripts still produce empty artifacts when windows are sparse; they now fail less often, but output quality remains data-dependent.
-- Full test-suite reliability still depends on network access because `test_backtest.py` performs live NBA API work at import/runtime.
 - ETL scheduler exists (GitHub Actions), but external alerting/monitoring on failed or partial runs is still minimal.
-- Current UnderDog anonymous access returns login-gated UI in browser mode; props are not publicly extractable from rendered page text.
-- Authenticated browser-session ingestion is wired, but requires project `.venv` + Playwright browser setup (`.playwright-browsers`) for consistent runtime behavior.
-- Generic web-text ingestion works for snapshots, but structured parsing remains site-specific and incomplete for JS-heavy/login-gated sites.
+- UnderDog anonymous access returns login-gated UI; use `--login` to save session first, then headless fetch with `--browser-auth-state-file`.
+- Session persistence depends on browser fingerprint compatibility; some sites may invalidate headless sessions saved from headed logins.
+- Authenticated browser ingestion requires project `.venv` + Playwright browser binaries (`.playwright-browsers`).
+- CSS selector hints for book-specific waits are best-effort; DOM changes on sportsbook sites will need adapter updates.
 
 ---
 
@@ -200,15 +217,37 @@ python3 -m nba_model.data.daily_etl \
   --web-text-urls "https://example.com/sportsbook/nba/props" \
   --web-text-min-hours-between-polls 24
 
-# Daily ETL (authenticated browser session for login-gated sites)
-python3 -m nba_model.data.daily_etl \
-  --skip-game-logs \
-  --skip-team-defense \
-  --skip-odds \
-  --skip-reverse-engineering \
-  --web-text-urls-file data/config/web_text_urls.txt \
+# Step 1: Manual login (one-time per session expiry)
+# Opens a VISIBLE browser window -- log in, then close the window.
+python3 -m nba_model.model.web_text_ingestion \
+  --login https://app.underdogfantasy.com/pick-em/higher-lower/all/NBA \
   --browser-auth-state-file data/config/auth/underdog_state.json \
   --browser-user-data-dir data/config/auth/underdog_profile
+
+# Step 2: Validate saved session still works (optional)
+python3 -m nba_model.model.web_text_ingestion \
+  --validate-session https://app.underdogfantasy.com/pick-em/higher-lower/all/NBA \
+  --browser-auth-state-file data/config/auth/underdog_state.json
+
+# Step 3: Headless fetch using saved session
+python3 -m nba_model.model.web_text_ingestion \
+  --urls-file data/config/web_text_urls.txt \
+  --browser-auth-state-file data/config/auth/underdog_state.json \
+  --force-poll
+
+# Daily ETL with login-before-run (interactive login then auto-ETL)
+python3 -m nba_model.data.daily_etl \
+  --skip-game-logs --skip-team-defense --skip-odds --skip-reverse-engineering \
+  --web-text-urls-file data/config/web_text_urls.txt \
+  --login https://app.underdogfantasy.com/pick-em/higher-lower/all/NBA \
+  --browser-auth-state-file data/config/auth/underdog_state.json
+
+# Daily ETL with session validation before web-text ingestion
+python3 -m nba_model.data.daily_etl \
+  --skip-game-logs --skip-team-defense --skip-odds --skip-reverse-engineering \
+  --web-text-urls-file data/config/web_text_urls.txt \
+  --browser-auth-state-file data/config/auth/underdog_state.json \
+  --validate-session-before-etl
 
 # Standalone browser parser over stored snapshots
 python3 -m nba_model.model.browser_prop_parser \
@@ -280,8 +319,9 @@ TECHNICAL DEBT / KNOWN ISSUES
 - Reverse-engineering outputs are more stable with continuous mode, but remain data-coverage constrained.
 - Line comparison/monthly diagnostics can still return sparse/empty artifacts when `betting_lines` and `predictions` do not overlap enough.
 - Real-data benchmark/distribution sweep scripts are implemented; production defaults still need formal selection from full-run artifacts.
-- Current browser-based UnderDog fetch path remains login-gated for anonymous sessions; authenticated sessions can still return non-parseable visible text.
-- Web text snapshots + parser normalization are implemented, but extraction recall is still limited without book-specific parsing rules.
+- UnderDog fetch requires authenticated session; use `--login` to manually save session, then `--browser-auth-state-file` for headless reuse.
+- Session persistence across headed->headless may fail if site validates browser fingerprint (user-agent, TLS, etc).
+- CSS selector wait hints for books are best-effort; DOM restructures require updating `_BOOK_WAIT_SELECTORS` map.
 - Current travel/rest/injury features are heuristic; no independent validation source is integrated yet.
 - Some modules still use `print()` instead of structured logging.
 - DB path/config remains mostly default-arg based; centralized env config is incomplete.

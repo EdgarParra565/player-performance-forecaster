@@ -22,13 +22,52 @@ DEFAULT_WEB_TEXT_REQUEST_RETRIES = 1
 DEFAULT_WEB_TEXT_REQUEST_RETRY_DELAY_SECONDS = 0.75
 DEFAULT_WEB_TEXT_REQUEST_RETRY_BACKOFF = 2.0
 DEFAULT_WEB_TEXT_MAX_CHARS = 60000
-DEFAULT_WEB_TEXT_BROWSER_WAIT_AFTER_LOAD_SECONDS = 2.0
+DEFAULT_WEB_TEXT_BROWSER_WAIT_AFTER_LOAD_SECONDS = 4.0
+DEFAULT_WEB_TEXT_BROWSER_PAGE_TIMEOUT_SECONDS = 45
 DEFAULT_ACTIVE_PLAYERS_OUTPUT_FILE = "data/config/active_nba_players.txt"
+DEFAULT_AUTH_STATE_DIR = "data/config/auth"
 DEFAULT_WEB_TEXT_USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/124.0.0.0 Safari/537.36"
 )
+
+_BOOK_WAIT_SELECTORS: dict[str, list[str]] = {
+    "underdogfantasy.com": [
+        "[class*='pick-em']",
+        "[class*='player-pick']",
+        "[class*='stat-line']",
+        "[data-testid*='pick']",
+        "[class*='higher-lower']",
+    ],
+    "draftkings.com": [
+        "[class*='sportsbook-outcome']",
+        "[class*='player-prop']",
+    ],
+    "fanduel.com": [
+        "[class*='player-prop']",
+        "[class*='alternate-line']",
+    ],
+}
+
+_BOOK_EXTRA_WAIT_SECONDS: dict[str, float] = {
+    "underdogfantasy.com": 5.0,
+    "draftkings.com": 4.0,
+    "fanduel.com": 4.0,
+}
+
+
+def _match_book_domain(url: str) -> Optional[str]:
+    """Return the book domain key from _BOOK_WAIT_SELECTORS that matches url."""
+    try:
+        from urllib.parse import urlparse
+        host = urlparse(url).netloc.lower()
+    except Exception:
+        return None
+    for domain in _BOOK_WAIT_SELECTORS:
+        if host == domain or host.endswith(f".{domain}"):
+            return domain
+    return None
 
 
 class _VisibleTextParser(HTMLParser):
@@ -179,6 +218,139 @@ def sync_active_nba_players_reference(
     }
 
 
+def login_and_save_session(
+    login_url: str,
+    auth_state_file: str,
+    user_data_dir: Optional[str] = None,
+    timeout_seconds: int = 120,
+    user_agent: str = DEFAULT_WEB_TEXT_USER_AGENT,
+) -> dict:
+    """
+    Launch a HEADED (visible) browser so you can log in manually, then save session.
+
+    The browser opens to login_url. You log in manually in the browser window.
+    When done, close the browser or press Ctrl+C in the terminal. Session
+    cookies and storage are saved to auth_state_file for future headless reuse.
+
+    Returns summary dict with session state path and status.
+    """
+    _ensure_local_playwright_browsers()
+    sync_playwright = _import_playwright()
+
+    auth_path = Path(auth_state_file)
+    auth_path.parent.mkdir(parents=True, exist_ok=True)
+
+    profile_state_path = ""
+    if user_data_dir:
+        profile_dir = Path(user_data_dir)
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        profile_state_path = str(profile_dir / "storage_state.json")
+
+    saved_path = str(auth_path)
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=False,
+            timeout=max(5000, timeout_seconds * 1000),
+        )
+        context_kwargs = {
+            "user_agent": str(user_agent).strip() or DEFAULT_WEB_TEXT_USER_AGENT,
+        }
+        if auth_path.exists():
+            context_kwargs["storage_state"] = str(auth_path)
+            logger.info("Loading existing session from %s", auth_path)
+        context = browser.new_context(**context_kwargs)
+        page = context.new_page()
+
+        print(f"\n  Browser opened to: {login_url}")
+        print("  Log in manually in the browser window.")
+        print("  When finished, CLOSE the browser window to save the session.\n")
+
+        try:
+            page.goto(login_url, wait_until="domcontentloaded")
+            page.wait_for_timeout(timeout_seconds * 1000)
+        except Exception:
+            pass
+
+        try:
+            context.storage_state(path=saved_path)
+            if profile_state_path:
+                context.storage_state(path=profile_state_path)
+        except Exception as exc:
+            logger.warning("Could not save storage state: %s", exc)
+        finally:
+            try:
+                context.close()
+            except Exception:
+                pass
+            try:
+                browser.close()
+            except Exception:
+                pass
+
+    return {
+        "status": "saved" if auth_path.exists() else "not_saved",
+        "auth_state_file": saved_path,
+        "profile_state_path": profile_state_path or None,
+        "login_url": login_url,
+    }
+
+
+def validate_session(
+    test_url: str,
+    auth_state_file: str,
+    user_data_dir: Optional[str] = None,
+    timeout_seconds: int = DEFAULT_WEB_TEXT_BROWSER_PAGE_TIMEOUT_SECONDS,
+    user_agent: str = DEFAULT_WEB_TEXT_USER_AGENT,
+    min_content_length: int = 500,
+) -> dict:
+    """
+    Headlessly validate whether a saved session is still active.
+
+    Loads auth_state_file in headless mode, navigates to test_url, and checks
+    whether the page contains meaningful content (not just a login wall).
+    """
+    try:
+        result = _fetch_url_text_with_browser(
+            url=test_url,
+            timeout=timeout_seconds,
+            user_agent=user_agent,
+            max_chars=DEFAULT_WEB_TEXT_MAX_CHARS,
+            browser_auth_state_file=auth_state_file,
+            browser_user_data_dir=user_data_dir,
+        )
+    except Exception as exc:
+        return {
+            "valid": False,
+            "reason": f"Fetch failed: {exc}",
+            "auth_state_file": auth_state_file,
+            "test_url": test_url,
+            "text_length": 0,
+        }
+
+    text = result.get("text_content", "")
+    text_lower = text.lower()
+    has_login_wall = any(
+        marker in text_lower
+        for marker in ("sign in", "log in", "create account", "loading...")
+        if text_lower.count(marker) > 2
+    )
+    has_content = len(text) >= min_content_length and not has_login_wall
+
+    return {
+        "valid": has_content,
+        "reason": (
+            "Session appears active"
+            if has_content
+            else "Content too short or login wall detected"
+        ),
+        "auth_state_file": auth_state_file,
+        "test_url": test_url,
+        "text_length": len(text),
+        "has_login_wall_markers": has_login_wall,
+    }
+
+
 def _fetch_url_text_with_requests(
     url: str,
     timeout: int,
@@ -218,37 +390,34 @@ def _fetch_url_text_with_requests(
     }
 
 
-def _fetch_url_text_with_browser(
-    url: str,
-    timeout: int,
-    user_agent: str,
-    max_chars: int,
-    browser_auth_state_file: Optional[str],
-    browser_user_data_dir: Optional[str],
-) -> dict:
-    """Fetch one URL in browser context, optionally with persisted session state."""
+def _ensure_local_playwright_browsers() -> None:
+    """Point PLAYWRIGHT_BROWSERS_PATH at project-local dir when available."""
     local_browser_dir = Path(__file__).resolve().parents[2] / ".playwright-browsers"
     current_browser_path = str(os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "")).strip()
-    should_force_local_browsers = (
-        local_browser_dir.exists()
-        and (
-            not current_browser_path
-            or "cursor-sandbox-cache" in current_browser_path
-        )
-    )
-    if should_force_local_browsers:
-        # Prefer project-local browser binaries when available so runtime does
-        # not depend on ephemeral Cursor cache paths that may mismatch arch.
+    if local_browser_dir.exists() and (
+        not current_browser_path
+        or "cursor-sandbox-cache" in current_browser_path
+    ):
         os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(local_browser_dir)
 
+
+def _import_playwright():
+    """Import and return playwright sync_api, raising clear message if missing."""
     try:
         from playwright.sync_api import sync_playwright
+        return sync_playwright
     except Exception as exc:
         raise RuntimeError(
-            "Playwright is required for browser-auth web ingestion. "
-            "Install with: pip install playwright"
+            "Playwright is required for browser web ingestion. "
+            "Install with: pip install playwright && playwright install chromium"
         ) from exc
 
+
+def _resolve_auth_state_path(
+    browser_auth_state_file: Optional[str],
+    browser_user_data_dir: Optional[str],
+) -> tuple[str, str]:
+    """Resolve auth state file and profile state paths, creating dirs as needed."""
     auth_state_path = str(browser_auth_state_file).strip() if browser_auth_state_file else ""
     user_data_dir = str(browser_user_data_dir).strip() if browser_user_data_dir else ""
     profile_state_path = ""
@@ -264,6 +433,78 @@ def _fetch_url_text_with_browser(
         raise FileNotFoundError(
             f"Browser auth state file does not exist: {auth_state_path}"
         )
+    return auth_state_path, profile_state_path
+
+
+def _wait_for_dynamic_content(page, url: str, base_wait_seconds: float) -> None:
+    """Apply smart wait strategies: book-specific selector waits then networkidle fallback."""
+    book_domain = _match_book_domain(url)
+    selectors = _BOOK_WAIT_SELECTORS.get(book_domain or "", [])
+    extra_wait = _BOOK_EXTRA_WAIT_SECONDS.get(book_domain or "", 0.0)
+
+    selector_found = False
+    for selector in selectors:
+        try:
+            page.wait_for_selector(selector, timeout=8000, state="attached")
+            selector_found = True
+            logger.info("Selector '%s' found for %s", selector, url)
+            break
+        except Exception:
+            continue
+
+    if not selector_found:
+        try:
+            page.wait_for_load_state("networkidle", timeout=12000)
+        except Exception:
+            pass
+
+    total_wait = base_wait_seconds + extra_wait
+    if total_wait > 0:
+        page.wait_for_timeout(int(total_wait * 1000))
+
+
+def _extract_page_text(page) -> str:
+    """Extract visible text from page using multiple strategies."""
+    body_html = page.content() or ""
+    visible_text = _extract_visible_text(body_html)
+
+    if not visible_text or len(visible_text) < 200:
+        try:
+            inner = _collapse_whitespace(page.inner_text("body"))
+            if len(inner) > len(visible_text):
+                visible_text = inner
+        except Exception:
+            pass
+
+    if not visible_text or len(visible_text) < 200:
+        try:
+            all_texts = page.eval_on_selector_all(
+                "*:not(script):not(style):not(noscript)",
+                "els => els.map(e => e.innerText || '').filter(t => t.trim()).join(' ')",
+            )
+            collapsed = _collapse_whitespace(all_texts or "")
+            if len(collapsed) > len(visible_text):
+                visible_text = collapsed
+        except Exception:
+            pass
+
+    return visible_text
+
+
+def _fetch_url_text_with_browser(
+    url: str,
+    timeout: int,
+    user_agent: str,
+    max_chars: int,
+    browser_auth_state_file: Optional[str],
+    browser_user_data_dir: Optional[str],
+) -> dict:
+    """Fetch one URL in browser context, optionally with persisted session state."""
+    _ensure_local_playwright_browsers()
+    sync_playwright = _import_playwright()
+    auth_state_path, profile_state_path = _resolve_auth_state_path(
+        browser_auth_state_file, browser_user_data_dir,
+    )
 
     response = None
     visible_text = ""
@@ -281,20 +522,14 @@ def _fetch_url_text_with_browser(
             context = browser.new_context(**context_kwargs)
             try:
                 page = context.new_page()
-                page.set_default_timeout(
-                    max(1000, int(timeout) * 1000)
-                )
+                page.set_default_timeout(max(1000, int(timeout) * 1000))
+
                 response = page.goto(url, wait_until="domcontentloaded")
-                page.wait_for_timeout(
-                    int(DEFAULT_WEB_TEXT_BROWSER_WAIT_AFTER_LOAD_SECONDS * 1000)
+                _wait_for_dynamic_content(
+                    page, url, DEFAULT_WEB_TEXT_BROWSER_WAIT_AFTER_LOAD_SECONDS,
                 )
-                body_html = page.content() or ""
-                visible_text = _extract_visible_text(body_html)
-                if not visible_text:
-                    try:
-                        visible_text = _collapse_whitespace(page.inner_text("body"))
-                    except Exception:
-                        visible_text = ""
+                visible_text = _extract_page_text(page)
+
                 if profile_state_path:
                     context.storage_state(path=profile_state_path)
             finally:
@@ -568,7 +803,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--browser-auth-state-file",
         default=None,
         help=(
-            "Optional Playwright storage-state JSON file for authenticated "
+            "Playwright storage-state JSON file for authenticated "
             "browser session fetches."
         ),
     )
@@ -576,17 +811,78 @@ def _build_parser() -> argparse.ArgumentParser:
         "--browser-user-data-dir",
         default=None,
         help=(
-            "Optional Playwright user-data directory for persistent "
+            "Playwright user-data directory for persistent "
             "authenticated browser profile."
         ),
     )
     parser.add_argument("--max-chars", type=int, default=DEFAULT_WEB_TEXT_MAX_CHARS)
     parser.add_argument("--user-agent", default=DEFAULT_WEB_TEXT_USER_AGENT)
+
+    parser.add_argument(
+        "--login",
+        default=None,
+        metavar="URL",
+        help=(
+            "Launch a HEADED browser to URL for manual login. "
+            "After you log in and close the browser, the session is saved to "
+            "--browser-auth-state-file for future headless reuse."
+        ),
+    )
+    parser.add_argument(
+        "--login-timeout",
+        type=int,
+        default=120,
+        help="Max seconds to keep the login browser open (default 120).",
+    )
+    parser.add_argument(
+        "--validate-session",
+        default=None,
+        metavar="URL",
+        help=(
+            "Headlessly test whether --browser-auth-state-file is still valid "
+            "by fetching URL and checking for meaningful content."
+        ),
+    )
     return parser
 
 
 def main():
     args = _build_parser().parse_args()
+
+    if args.login:
+        state_file = args.browser_auth_state_file
+        if not state_file:
+            state_file = str(
+                Path(DEFAULT_AUTH_STATE_DIR) / "session_state.json"
+            )
+        result = login_and_save_session(
+            login_url=args.login,
+            auth_state_file=state_file,
+            user_data_dir=args.browser_user_data_dir,
+            timeout_seconds=args.login_timeout,
+            user_agent=args.user_agent,
+        )
+        print("Login session save result:")
+        for key, val in result.items():
+            print(f"  {key}: {val}")
+        return
+
+    if args.validate_session:
+        state_file = args.browser_auth_state_file
+        if not state_file:
+            state_file = str(
+                Path(DEFAULT_AUTH_STATE_DIR) / "session_state.json"
+            )
+        result = validate_session(
+            test_url=args.validate_session,
+            auth_state_file=state_file,
+            user_data_dir=args.browser_user_data_dir,
+            user_agent=args.user_agent,
+        )
+        print("Session validation result:")
+        for key, val in result.items():
+            print(f"  {key}: {val}")
+        return
 
     urls = list(args.urls or [])
     if args.urls_file:

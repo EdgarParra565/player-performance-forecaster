@@ -534,7 +534,6 @@ class SimpleModelUI:
         normalized_date = self._normalize_game_date(default_game_date)
         normalized_book = (default_book or "").strip() or "manual_ui"
         unstructured_lines = []
-
         for line_no, raw_line in enumerate(text.splitlines(), start=1):
             stripped = raw_line.strip()
             if not stripped or stripped.startswith("#"):

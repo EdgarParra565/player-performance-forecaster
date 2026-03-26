@@ -43,6 +43,8 @@ from nba_model.model.web_text_ingestion import (
     DEFAULT_WEB_TEXT_REQUEST_TIMEOUT,
     fetch_and_store_web_text,
     load_urls_from_file,
+    login_and_save_session,
+    validate_session,
 )
 
 logger = logging.getLogger(__name__)
@@ -1316,6 +1318,30 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Exit with non-zero code when any step is failed or partial_success.",
     )
     parser.add_argument("--no-write-report", action="store_true")
+    parser.add_argument(
+        "--login",
+        default=None,
+        metavar="URL",
+        help=(
+            "Before running ETL, launch a HEADED browser to URL for manual login. "
+            "Session is saved to --browser-auth-state-file. "
+            "After login, ETL continues using that session automatically."
+        ),
+    )
+    parser.add_argument(
+        "--login-timeout",
+        type=int,
+        default=120,
+        help="Max seconds to keep the login browser open (default 120).",
+    )
+    parser.add_argument(
+        "--validate-session-before-etl",
+        action="store_true",
+        help=(
+            "Before running web-text ingestion, validate that "
+            "--browser-auth-state-file is still a live session."
+        ),
+    )
     return parser
 
 
@@ -1326,6 +1352,39 @@ def main() -> None:
     web_text_urls = list(args.web_text_urls or [])
     if args.web_text_urls_file:
         web_text_urls.extend(load_urls_from_file(args.web_text_urls_file))
+
+    auth_state = args.browser_auth_state_file
+    if args.login:
+        if not auth_state:
+            auth_state = "data/config/auth/session_state.json"
+        print(f"Launching login browser to {args.login} ...")
+        login_result = login_and_save_session(
+            login_url=args.login,
+            auth_state_file=auth_state,
+            user_data_dir=args.browser_user_data_dir,
+            timeout_seconds=args.login_timeout,
+        )
+        print(f"Login session: {login_result.get('status')}")
+        print(f"  saved to: {login_result.get('auth_state_file')}")
+        if login_result.get("status") != "saved":
+            print("WARNING: Session was not saved. ETL will proceed without auth.")
+            auth_state = None
+
+    if args.validate_session_before_etl and auth_state and web_text_urls:
+        test_url = web_text_urls[0]
+        print(f"Validating session against {test_url} ...")
+        validation = validate_session(
+            test_url=test_url,
+            auth_state_file=auth_state,
+            user_data_dir=args.browser_user_data_dir,
+        )
+        if validation.get("valid"):
+            print("Session is valid -- proceeding with authenticated ingestion.")
+        else:
+            print(
+                f"WARNING: Session appears invalid ({validation.get('reason')}). "
+                "ETL will still run but may get login walls."
+            )
 
     report = run_daily_etl(
         players=args.players,
@@ -1364,7 +1423,7 @@ def main() -> None:
             args.web_text_request_retry_delay_seconds
         ),
         web_text_request_retry_backoff=args.web_text_request_retry_backoff,
-        browser_auth_state_file=args.browser_auth_state_file,
+        browser_auth_state_file=auth_state or args.browser_auth_state_file,
         browser_user_data_dir=args.browser_user_data_dir,
         browser_parser_max_snapshots_per_url=(
             args.browser_parser_max_snapshots_per_url
