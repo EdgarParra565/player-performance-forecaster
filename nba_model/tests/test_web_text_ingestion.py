@@ -174,6 +174,10 @@ class WebTextIngestionTests(unittest.TestCase):
             "underdogfantasy.com",
         )
         self.assertEqual(
+            _match_book_domain("https://app.prizepicks.com/board/nba"),
+            "prizepicks.com",
+        )
+        self.assertEqual(
             _match_book_domain("https://www.draftkings.com/sportsbook"),
             "draftkings.com",
         )

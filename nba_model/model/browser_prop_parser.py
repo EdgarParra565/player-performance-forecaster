@@ -9,7 +9,7 @@ from urllib.parse import urlparse
 from nba_model.data.database.db_manager import DatabaseManager
 from nba_model.model.web_text_ingestion import load_urls_from_file
 
-PARSER_VERSION = "visible_text_v1"
+PARSER_VERSION = "visible_text_v2"
 DEFAULT_MIN_PARSE_CONFIDENCE = 0.45
 DEFAULT_MAX_SNAPSHOTS_PER_URL = 1
 DEFAULT_MAX_TOTAL_SNAPSHOTS = 250
@@ -60,6 +60,28 @@ _STAT_ALIASES = {
     "blocks": "blocks",
     "turnovers": "turnovers",
     "fantasy points": "fantasy_points",
+    "pts + rebs + asts": "pra",
+    "pts rebs asts": "pra",
+    "rebounds + assists": "ra",
+    "points + rebounds": "pr",
+    "points + assists": "pa",
+    "blocks + steals": "blocks_steals",
+    "3 pointers made": "three_pointers_made",
+    "3-pointers made": "three_pointers_made",
+    "ft made": "ft_made",
+    "double doubles": "double_doubles",
+    "triple doubles": "triple_doubles",
+    "1q points": "1q_points",
+    "1q rebounds": "1q_rebounds",
+    "1q assists": "1q_assists",
+    "1q 3-pointers made": "1q_three_pointers_made",
+    "1q pts + rebs + asts": "1q_pra",
+    "1h points": "1h_points",
+    "1h 3-pointers made": "1h_three_pointers_made",
+    "1h rebounds": "1h_rebounds",
+    "1h pts + rebs + asts": "1h_pra",
+    "3s attempted": "three_pointers_attempted",
+    "fg attempted": "fg_attempted",
 }
 
 _STAT_PATTERN = "|".join(
@@ -93,6 +115,88 @@ _CARD_PATTERNS = [
     ),
 ]
 
+_UD_NAME_PAT = (
+    r"(?P<player>"
+    r"[A-Z][A-Za-z.\'\-]*[a-z][A-Za-z.\'\-]*"
+    r"(?:\s+[A-Z][A-Za-z.\'\-]*[a-z][A-Za-z.\'\-]*){1,3}"
+    r")"
+)
+_UNDERDOG_PROP_RE = re.compile(
+    _UD_NAME_PAT
+    + r"\s+[A-Z]{2,4}\s+(?:@|vs\.?)\s+[A-Z]{2,4}"
+      r"\s+-\s+.*?(?:EDT|EST|CDT|CST|PDT|PST|PM|AM)\s+"
+      r"(?P<line>\d{1,3}(?:\.\d+)?)"
+      r"\s+(?P<stat>[A-Za-z][A-Za-z +\']{1,30}?)"
+      r"\s+(?P<side>Higher|Lower|Over|Under)",
+    flags=re.IGNORECASE,
+)
+
+
+_PRIZEPICKS_NAME_PAT = (
+    r"(?P<player>"
+    r"[A-Z][A-Za-z.\'\-]*[a-z][A-Za-z.\'\-]*"
+    r"(?:\s+[A-Z][A-Za-z.\'\-]*[a-z][A-Za-z.\'\-]*){1,3}"
+    r")"
+)
+_PRIZEPICKS_PROP_RE = re.compile(
+    _PRIZEPICKS_NAME_PAT
+    + r"\s+[A-Z]{2,4}\s+"
+      r"(?P<stat>[A-Za-z][A-Za-z +\']{1,30}?)"
+      r"\s+(?P<line>\d{1,3}(?:\.\d+)?)"
+      r"\s+(?P<side>More|Less|Over|Under|Higher|Lower)",
+    flags=re.IGNORECASE,
+)
+
+_PRIZEPICKS_ALT_RE = re.compile(
+    _PRIZEPICKS_NAME_PAT
+    + r"\s+(?:[A-Z]{2,5}\s+(?:@|vs\.?)\s+[A-Z]{2,5}\s+)?"
+      r"(?P<line>\d{1,3}(?:\.\d+)?)"
+      r"\s+(?P<stat>[A-Za-z][A-Za-z +\']{1,30}?)"
+      r"\s+(?P<side>More|Less|Over|Under|Higher|Lower)",
+    flags=re.IGNORECASE,
+)
+
+
+def _preprocess_underdog_text(text: str) -> str:
+    """
+    Strip UnderDog game-info segments so generic patterns can match.
+
+    Converts 'Player TEAM @ TEAM - TIME 11.5 Rebounds Higher 1.06x'
+    into     'Player 11.5 Rebounds Higher'
+    """
+    segments: list[str] = []
+    for m in _UNDERDOG_PROP_RE.finditer(text):
+        player = m.group("player").strip()
+        line = m.group("line").strip()
+        stat = m.group("stat").strip()
+        side = m.group("side").strip()
+        segments.append(f"{player} {line} {stat} {side}")
+    return " ".join(segments) if segments else ""
+
+
+def _preprocess_prizepicks_text(text: str) -> str:
+    """
+    Strip PrizePicks team/game segments so generic patterns can match.
+
+    Handles formats like:
+      'Player TEAM Stat 27.5 More Less'
+      'Player TEAM @ TEAM 27.5 Stat More Less'
+    """
+    segments: list[str] = []
+    seen: set[tuple] = set()
+    for pat in (_PRIZEPICKS_PROP_RE, _PRIZEPICKS_ALT_RE):
+        for m in pat.finditer(text):
+            player = m.group("player").strip()
+            line = m.group("line").strip()
+            stat = m.group("stat").strip()
+            side = m.group("side").strip()
+            key = (player.lower(), line, stat.lower())
+            if key in seen:
+                continue
+            seen.add(key)
+            segments.append(f"{player} {line} {stat} {side}")
+    return " ".join(segments) if segments else ""
+
 _NAME_STOP_WORDS = {
     "and",
     "nba",
@@ -110,9 +214,35 @@ _NAME_STOP_WORDS = {
     "login",
     "signin",
     "sign",
+    "edt",
+    "est",
+    "cdt",
+    "cst",
+    "pdt",
+    "pst",
+    "popular",
+    "featured",
+    "champions",
+    "drafts",
+    "live",
+    "results",
+    "rankings",
+    "mobile",
+    "web",
+    "coming",
+    "soon",
+    "download",
+    "app",
+    "standard",
+    "flex",
+    "play",
+    "boost",
 }
-_NOISE_HINTS = {"loading", "login", "sign in", "create account"}
+_NOISE_HINTS = {"loading", "login", "sign in", "create account", "mobile web is coming"}
 _BOOK_NAME_MAP = {
+    "prizepicks.com": "prizepicks",
+    "fliff.com": "fliff",
+    "kalshi.com": "kalshi",
     "underdogfantasy.com": "underdog",
     "draftkings.com": "draftkings",
     "fanduel.com": "fanduel",
@@ -270,6 +400,16 @@ def extract_prop_cards_from_text(
     text = _collapse_whitespace(text_content)
     if not text:
         return []
+
+    preprocessed_parts = []
+    ud = _preprocess_underdog_text(text)
+    if ud:
+        preprocessed_parts.append(ud)
+    pp = _preprocess_prizepicks_text(text)
+    if pp:
+        preprocessed_parts.append(pp)
+    if preprocessed_parts:
+        text = " ".join(preprocessed_parts) + " " + text
 
     records: list[dict] = []
     seen_card_keys: set[tuple] = set()

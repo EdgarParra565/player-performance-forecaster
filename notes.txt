@@ -40,6 +40,7 @@ Near-term objective:
 
 ### Remaining limitations
 - [ ] UnderDog props still require a logged-in session; anonymous headless fetch returns login wall
+- [ ] PrizePicks session validation (`--validate-session`) is not working; needs investigation and fix in a future session
 - [ ] Parser recall depends on whether the saved session state actually reproduces cookie/token state in headless mode (some sites invalidate sessions across browser fingerprints)
 - [ ] Browser-auth mode requires project `.venv` + Playwright browser binaries (`.playwright-browsers`)
 - [ ] CSS selector hints are best-effort; sites that restructure their DOM will need adapter updates
@@ -159,7 +160,7 @@ player-performance-forecaster/
 - [x] Add normalized extraction path from `web_text_snapshots` into a structured props table (`web_prop_cards`)
 - [x] Add extracted-name classification report (`active_nba`, `non_nba`) with parse confidence + audit columns
 - [x] Add optional authenticated browser session mode flags for login-gated sites (`--browser-auth-state-file`, `--browser-user-data-dir`)
-- [x] Add interactive login flow (`--login`) and session validation (`--validate-session`)
+- [x] Add interactive login flow (`--login`) and session validation (`--validate-session`) 
 - [x] Add smart browser wait strategies with book-specific CSS selectors and networkidle fallback
 - [ ] Build per-book parser adapters for sites with unique DOM structures
 - [ ] Add auto-detection of session expiry within ETL flow
@@ -189,6 +190,8 @@ player-performance-forecaster/
 - Session persistence depends on browser fingerprint compatibility; some sites may invalidate headless sessions saved from headed logins.
 - Authenticated browser ingestion requires project `.venv` + Playwright browser binaries (`.playwright-browsers`).
 - CSS selector hints for book-specific waits are best-effort; DOM changes on sportsbook sites will need adapter updates.
+- Practically running web_text_ingestion and browser_prop_parser in unision causing the script to be hung trying to parse after session is validated
+
 
 ---
 

@@ -40,6 +40,13 @@ _BOOK_WAIT_SELECTORS: dict[str, list[str]] = {
         "[data-testid*='pick']",
         "[class*='higher-lower']",
     ],
+    "prizepicks.com": [
+        "[class*='projection']",
+        "[class*='player-projection']",
+        "[class*='stat-container']",
+        "[class*='board-cell']",
+        "[data-testid*='projection']",
+    ],
     "draftkings.com": [
         "[class*='sportsbook-outcome']",
         "[class*='player-prop']",
@@ -52,6 +59,7 @@ _BOOK_WAIT_SELECTORS: dict[str, list[str]] = {
 
 _BOOK_EXTRA_WAIT_SECONDS: dict[str, float] = {
     "underdogfantasy.com": 5.0,
+    "prizepicks.com": 6.0,
     "draftkings.com": 4.0,
     "fanduel.com": 4.0,
 }

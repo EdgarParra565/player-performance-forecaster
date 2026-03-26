@@ -15,3 +15,7 @@ https://app.underdogfantasy.com/pick-em/higher-lower/all/NBA?filter_id=8d718cf2-
 https://app.underdogfantasy.com/pick-em/higher-lower/all/NBA?filter_id=590e7c83-99fc-419f-bdd8-78bb0a691f8b&filter_type=PickemStat
 https://app.underdogfantasy.com/pick-em/higher-lower/all/NBA?filter_id=0d33e7f2-6601-486b-9f9e-cbe268d8fc88&filter_type=PickemStat
 https://app.underdogfantasy.com/pick-em/higher-lower/all/NBA?filter_id=e3bc1aaa-7964-4a84-bcfa-2d92a4d477a2&filter_type=PickemStat
+
+# PrizePicks NBA projection board
+https://app.prizepicks.com/board/nba
+https://app.prizepicks.com/board?league=NBA
