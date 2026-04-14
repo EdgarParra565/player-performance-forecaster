@@ -54,3 +54,6 @@ nba_model/data/artifacts/
 
 # Browser auth/session artifacts
 data/config/auth/
+
+# Claude AI agent artifacts
+.claude/

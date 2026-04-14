@@ -7,6 +7,8 @@ from unittest.mock import MagicMock, patch
 
 from nba_model.data.database.db_manager import DatabaseManager
 from nba_model.model.web_text_ingestion import (
+    _check_session_content,
+    _detect_login_wall_early,
     _match_book_domain,
     fetch_and_store_web_text,
     load_urls_from_file,
@@ -205,13 +207,16 @@ class WebTextIngestionTests(unittest.TestCase):
 
     @patch("nba_model.model.web_text_ingestion._fetch_url_text_with_browser")
     def test_validate_session_accepts_content_rich_page(self, mock_fetch):
+        # Real UnderDog pick-em pages show both Higher/Lower toggle labels plus the
+        # NBA section header, so the mock includes "higher", "lower", "nba", and "points"
+        # — that's 4 of the 5 authenticated markers (threshold is 3).
         mock_fetch.return_value = {
             "source_url": "https://app.underdogfantasy.com/pick-em",
             "fetched_at_utc": "2026-02-27T00:00:00+00:00",
             "http_status": 200,
             "content_type": "text/html",
-            "text_content": "LeBron James Higher 27.5 Points " * 30,
-            "text_length": 1000,
+            "text_content": "NBA LeBron James Higher Lower 27.5 Points " * 30,
+            "text_length": 1260,
             "content_sha256": "def",
         }
         result = validate_session(
@@ -220,6 +225,255 @@ class WebTextIngestionTests(unittest.TestCase):
             min_content_length=200,
         )
         self.assertTrue(result["valid"])
+
+    # --- PrizePicks-specific session validation ---
+
+    def test_check_session_content_prizepicks_login_wall_phrase(self):
+        """A PrizePicks login-wall phrase should mark the session invalid."""
+        text = (
+            "PrizePicks Enter Your Phone Number Enter phone number "
+            "Verify your identity Sign Up Log In " * 5
+        )
+        valid, reason = _check_session_content(
+            text,
+            url="https://app.prizepicks.com/board/nba",
+            min_content_length=50,
+        )
+        self.assertFalse(valid)
+        self.assertIn("login-wall", reason.lower())
+
+    def test_check_session_content_prizepicks_authenticated(self):
+        """PrizePicks page with projection markers should be considered valid."""
+        text = (
+            "NBA Projections LeBron James Points 27.5 More Less "
+            "Rebounds 8.5 More Less Assists 7.5 More Less " * 10
+        )
+        valid, reason = _check_session_content(
+            text,
+            url="https://app.prizepicks.com/board/nba",
+            min_content_length=50,
+        )
+        self.assertTrue(valid)
+
+    def test_check_session_content_prizepicks_too_short(self):
+        """PrizePicks page that is too short should be rejected even without wall markers."""
+        text = "NBA Projections"
+        valid, reason = _check_session_content(
+            text,
+            url="https://app.prizepicks.com/board/nba",
+            min_content_length=500,
+        )
+        self.assertFalse(valid)
+        self.assertIn("short", reason.lower())
+
+    def test_check_session_content_prizepicks_insufficient_auth_markers(self):
+        """PrizePicks page with few authenticated markers but not enough should be rejected."""
+        text = "PrizePicks NBA " + "x " * 200  # long but content-sparse
+        valid, reason = _check_session_content(
+            text,
+            url="https://app.prizepicks.com/board",
+            min_content_length=50,
+        )
+        self.assertFalse(valid)
+
+    @patch("nba_model.model.web_text_ingestion._fetch_url_text_with_browser")
+    def test_validate_session_prizepicks_returns_book_domain(self, mock_fetch):
+        """validate_session result should include book_domain field."""
+        mock_fetch.return_value = {
+            "source_url": "https://app.prizepicks.com/board/nba",
+            "fetched_at_utc": "2026-04-09T00:00:00+00:00",
+            "http_status": 200,
+            "content_type": "text/html",
+            "text_content": "NBA Projections Points Rebounds Assists More Less " * 20,
+            "text_length": 900,
+            "content_sha256": "abc",
+        }
+        result = validate_session(
+            test_url="https://app.prizepicks.com/board/nba",
+            auth_state_file="/nonexistent/path.json",
+            min_content_length=100,
+        )
+        self.assertEqual(result.get("book_domain"), "prizepicks.com")
+
+    @patch("nba_model.model.web_text_ingestion._fetch_url_text_with_browser")
+    def test_validate_session_prizepicks_login_wall(self, mock_fetch):
+        """PrizePicks session validation rejects login-wall content."""
+        mock_fetch.return_value = {
+            "source_url": "https://app.prizepicks.com/board/nba",
+            "fetched_at_utc": "2026-04-09T00:00:00+00:00",
+            "http_status": 200,
+            "content_type": "text/html",
+            "text_content": (
+                "PrizePicks Enter Your Phone Number Create a new account "
+                "Log In Sign Up Verify your identity " * 5
+            ),
+            "text_length": 500,
+            "content_sha256": "def",
+        }
+        result = validate_session(
+            test_url="https://app.prizepicks.com/board/nba",
+            auth_state_file="/nonexistent/path.json",
+            min_content_length=100,
+        )
+        self.assertFalse(result["valid"])
+
+    @patch("nba_model.model.web_text_ingestion._fetch_url_text_with_browser")
+    def test_validate_session_prizepicks_authenticated(self, mock_fetch):
+        """PrizePicks session validation accepts authenticated projection board."""
+        mock_fetch.return_value = {
+            "source_url": "https://app.prizepicks.com/board/nba",
+            "fetched_at_utc": "2026-04-09T00:00:00+00:00",
+            "http_status": 200,
+            "content_type": "text/html",
+            "text_content": (
+                "NBA Projections LeBron James Points 27.5 More Less "
+                "Steph Curry Rebounds 5.5 More Less Assists 6.5 More Less " * 10
+            ),
+            "text_length": 1500,
+            "content_sha256": "ghi",
+        }
+        result = validate_session(
+            test_url="https://app.prizepicks.com/board/nba",
+            auth_state_file="/nonexistent/path.json",
+            min_content_length=100,
+        )
+        self.assertTrue(result["valid"])
+
+    # --- _detect_login_wall_early ---
+
+    def test_detect_login_wall_early_prizepicks_login_wall(self):
+        """_detect_login_wall_early returns True when PrizePicks login-wall phrase is present."""
+        mock_page = MagicMock()
+        mock_page.inner_text.return_value = (
+            "PrizePicks Enter Your Phone Number Enter phone number "
+            "Log in to PrizePicks Create a New Account"
+        )
+        result = _detect_login_wall_early(
+            mock_page, "https://app.prizepicks.com/board/nba"
+        )
+        self.assertTrue(result)
+        mock_page.inner_text.assert_called_once_with("body")
+
+    def test_detect_login_wall_early_prizepicks_valid_session(self):
+        """_detect_login_wall_early returns False when page shows projection content."""
+        mock_page = MagicMock()
+        mock_page.inner_text.return_value = (
+            "NBA Projections LeBron James Points 27.5 More Less "
+            "Rebounds 8.5 More Less"
+        )
+        result = _detect_login_wall_early(
+            mock_page, "https://app.prizepicks.com/board/nba"
+        )
+        self.assertFalse(result)
+
+    def test_detect_login_wall_early_underdog_login_wall(self):
+        """_detect_login_wall_early returns True for UnderDog sign-in wall."""
+        mock_page = MagicMock()
+        mock_page.inner_text.return_value = (
+            "Sign in to continue Enter your email Forgot password?"
+        )
+        result = _detect_login_wall_early(
+            mock_page, "https://app.underdogfantasy.com/pick-em"
+        )
+        self.assertTrue(result)
+
+    def test_detect_login_wall_early_unknown_domain_always_false(self):
+        """_detect_login_wall_early returns False for domains with no login-wall markers."""
+        mock_page = MagicMock()
+        mock_page.inner_text.return_value = "sign in log in create account"
+        result = _detect_login_wall_early(
+            mock_page, "https://unknown-book.com/props"
+        )
+        self.assertFalse(result)
+        mock_page.inner_text.assert_not_called()
+
+    def test_detect_login_wall_early_handles_inner_text_error(self):
+        """_detect_login_wall_early returns False (not raises) when inner_text fails."""
+        mock_page = MagicMock()
+        mock_page.inner_text.side_effect = RuntimeError("page crashed")
+        result = _detect_login_wall_early(
+            mock_page, "https://app.prizepicks.com/board/nba"
+        )
+        self.assertFalse(result)
+
+    # --- PrizePicks browser fetch integration (mocked) ---
+
+    @patch("nba_model.model.web_text_ingestion._fetch_url_text_with_browser")
+    def test_fetch_and_store_prizepicks_browser_mode(self, mock_browser_fetch):
+        """fetch_and_store_web_text stores PrizePicks snapshot when content is rich."""
+        mock_browser_fetch.return_value = {
+            "source_url": "https://app.prizepicks.com/board/nba",
+            "fetched_at_utc": "2026-04-14T00:00:00+00:00",
+            "http_status": 200,
+            "content_type": "text/html",
+            "text_content": (
+                "NBA Projections LeBron James Points 27.5 More Less "
+                "Steph Curry Rebounds 5.5 More Less Assists 6.5 More Less " * 10
+            ),
+            "text_length": 1400,
+            "content_sha256": "pp-abc123",
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = str(Path(tmpdir) / "nba_data.db")
+            auth_file = str(Path(tmpdir) / "prizepicks_state.json")
+            Path(auth_file).write_text("{}", encoding="utf-8")
+
+            summary = fetch_and_store_web_text(
+                urls=["https://app.prizepicks.com/board/nba"],
+                db_path=db_path,
+                min_hours_between_polls=None,
+                force_poll=True,
+                request_retries=0,
+                browser_auth_state_file=auth_file,
+            )
+
+            with DatabaseManager(db_path=db_path) as db:
+                rows = db.conn.execute(
+                    "SELECT source_url, text_content FROM web_text_snapshots"
+                ).fetchall()
+
+        self.assertEqual(summary["status"], "success")
+        self.assertEqual(summary["fetch_mode"], "browser")
+        self.assertEqual(summary["fetched_count"], 1)
+        self.assertEqual(summary["db_inserted"], 1)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][0], "https://app.prizepicks.com/board/nba")
+        self.assertIn("LeBron James", rows[0][1])
+
+    @patch("nba_model.model.web_text_ingestion._fetch_url_text_with_browser")
+    def test_fetch_and_store_prizepicks_login_wall_still_stored(self, mock_browser_fetch):
+        """Even a login-wall response is stored; classification happens in the parser."""
+        mock_browser_fetch.return_value = {
+            "source_url": "https://app.prizepicks.com/board/nba",
+            "fetched_at_utc": "2026-04-14T00:00:00+00:00",
+            "http_status": 200,
+            "content_type": "text/html",
+            "text_content": (
+                "PrizePicks Enter Your Phone Number Enter phone number "
+                "Log In Sign Up Verify your identity " * 5
+            ),
+            "text_length": 350,
+            "content_sha256": "pp-wall123",
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = str(Path(tmpdir) / "nba_data.db")
+            auth_file = str(Path(tmpdir) / "prizepicks_state.json")
+            Path(auth_file).write_text("{}", encoding="utf-8")
+
+            summary = fetch_and_store_web_text(
+                urls=["https://app.prizepicks.com/board/nba"],
+                db_path=db_path,
+                min_hours_between_polls=None,
+                force_poll=True,
+                request_retries=0,
+                browser_auth_state_file=auth_file,
+            )
+
+        self.assertEqual(summary["status"], "success")
+        self.assertEqual(summary["fetched_count"], 1)
+        self.assertEqual(summary["db_inserted"], 1)
 
     @patch("nba_model.model.web_text_ingestion.nba_players.get_active_players")
     def test_sync_active_players_reference_writes_db_and_file(self, mock_get_active_players):

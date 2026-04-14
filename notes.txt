@@ -1,6 +1,6 @@
 # NBA Player Performance Forecaster - Working Notes
 
-Last updated: 2026-02-27
+Last updated: 2026-04-14
 
 This file is the active project tracker. It keeps only:
 - current architecture
@@ -12,6 +12,66 @@ This file is the active project tracker. It keeps only:
 Near-term objective:
 - increase historical coverage quality (game logs + line snapshots + aligned predictions)
 - select production defaults from real benchmark outputs
+---
+
+## 0) End-of-Day Status (2026-04-14)
+
+### Added/fixed today
+- [x] Removed periodic CDP save loop in `login_and_save_session` (was calling `context.storage_state()` every 5s, triggering Cloudflare Turnstile resets). Replaced with `threading.Event` driven by `browser.on("disconnected")` — zero CDP calls while user interacts, single save on close.
+- [x] Added IP-based geolocation to login browser context (`_resolve_ip_geolocation` via ipapi.co) + granted `permissions=["geolocation"]` so PrizePicks's location gate passes
+- [x] Installed and integrated `playwright-stealth` (patches ~20 fingerprinting signals: webdriver flag, Canvas, WebGL, Chrome internals, plugins, permissions API). Applied via `stealth_sync(page)` in `login_and_save_session`; falls back to built-in `_BROWSER_STEALTH_SCRIPT` if library unavailable
+- [x] Added `--extract-chrome-session URL` command (`extract_chrome_session`): reads cookies from the user's installed Chrome via `pycookiecheat` and saves as Playwright `storage_state.json` (requires Chrome to be closed)
+- [x] Added `--connect-chrome URL` command (`extract_session_via_cdp`): connects to a RUNNING Chrome via CDP (Chrome DevTools Protocol), extracts cookies + `localStorage` (capturing JWT auth tokens) and saves as storage state. Chrome must be launched with `--remote-debugging-port=9222`
+- [x] Added `_fetch_url_text_via_cdp`: routes Playwright fetch through a real Chrome instance instead of Playwright's Chromium. Bypasses Cloudflare, PerimeterX, and DataDome because the TLS fingerprint is genuine Chrome
+- [x] Added `--chrome-debug-port PORT` flag to `--validate-session` and fetch commands so all browser operations can be routed through the running real Chrome
+- [x] Fixed `_fetch_url_text_via_cdp` to prefer the EXISTING open tab on the target domain (avoids cold-navigation SPA blank state); skips `_wait_for_dynamic_content` for already-loaded tabs to prevent SPA re-render wipe
+- [x] Fixed `text_content` key mismatch in CDP fetch result dict (was `"text"`, must be `"text_content"` to match `validate_session` reader)
+- [x] PrizePicks session fully validated end-to-end via CDP: `valid: True`, 6 authenticated markers found, 3317 chars of real board content
+
+### PrizePicks auth workflow (CDP approach — the only reliable method)
+PrizePicks runs three simultaneous bot-protection layers (Cloudflare, PerimeterX, DataDome). All three tie session cookies to the browser's TLS fingerprint. Playwright's Chromium has a different TLS fingerprint from real Chrome — cookies from Chrome cannot be reused in Playwright, and no JS-side stealth patch can fix TLS-layer detection.
+
+**Solution: route everything through a real running Chrome via CDP.**
+
+```bash
+# Step 1: Launch Chrome with remote debugging (one-time per session)
+open -na "Google Chrome" --args \
+    --remote-debugging-port=9222 \
+    --user-data-dir=/tmp/pp-chrome-profile
+
+# Step 2: Log in to PrizePicks in that Chrome window manually
+# (complete any Cloudflare/location verification, get to the board)
+
+# Step 3: Extract full session (cookies + localStorage JWT)
+.venv/bin/python3 -m nba_model.model.web_text_ingestion \
+  --connect-chrome https://app.prizepicks.com/board/nba \
+  --browser-auth-state-file data/config/auth/prizepicks_state.json \
+  --chrome-debug-port 9222
+
+# Step 4: Validate session through real Chrome
+.venv/bin/python3 -m nba_model.model.web_text_ingestion \
+  --validate-session https://app.prizepicks.com/board/nba \
+  --browser-auth-state-file data/config/auth/prizepicks_state.json \
+  --chrome-debug-port 9222
+
+# Step 5: Fetch/scrape through real Chrome (keep Chrome open while running)
+.venv/bin/python3 -m nba_model.model.web_text_ingestion \
+  --urls "https://app.prizepicks.com/board/nba" \
+  --browser-auth-state-file data/config/auth/prizepicks_state.json \
+  --chrome-debug-port 9222 \
+  --force-poll
+```
+
+### Needs work next
+- [ ] Wire `--chrome-debug-port` through `daily_etl.py` so the ETL pipeline can use the CDP fetch path for PrizePicks
+- [ ] Add auto-reconnect logic when Chrome closes unexpectedly during a long ETL run
+- [ ] Investigate whether UnderDog has the same multi-layer bot protection or if Playwright + stealth patches are sufficient
+
+### Remaining limitations
+- [ ] PrizePicks CDP fetch requires Chrome to remain open with `--remote-debugging-port=9222` for the duration of any scrape run — not suitable for fully unattended/cron automation
+- [ ] `--extract-chrome-session` (pycookiecheat path) extracts cookies but NOT localStorage JWT tokens; only the CDP `--connect-chrome` path captures the full session
+- [ ] DataDome / PerimeterX cookies are fingerprint-bound — session state saved from Chrome cannot be replayed in a headless Playwright context even if all cookies are present
+
 ---
 
 ## 0) End-of-Day Status (2026-02-27)
@@ -133,6 +193,13 @@ player-performance-forecaster/
 - [x] Multi-strategy page text extraction (HTML parse -> innerText -> JS eval fallback)
 - [x] ETL login integration (`--login`, `--validate-session-before-etl`) for session bootstrap before ingestion
 - [x] `test_backtest.py` rewritten as mocked unit tests (no network dependency)
+- [x] CDP-based session extraction (`--connect-chrome URL`): connects to running Chrome via remote-debugging, captures cookies + localStorage JWT tokens
+- [x] CDP-based fetch path (`_fetch_url_text_via_cdp`): routes all page fetches through real Chrome, bypasses Cloudflare/PerimeterX/DataDome TLS fingerprinting
+- [x] `--chrome-debug-port PORT` flag on `--validate-session` and fetch commands for CDP routing
+- [x] `playwright-stealth` integration in login browser (patches ~20 JS fingerprinting signals)
+- [x] IP-based geolocation in login browser context (resolves PrizePicks location gate)
+- [x] `--extract-chrome-session URL` command via `pycookiecheat` (cookie-only fallback, requires Chrome closed)
+- [x] Login browser: removed periodic CDP save loop (was resetting Cloudflare challenges); now saves once on browser close via `threading.Event`
 
 ---
 
@@ -190,7 +257,9 @@ player-performance-forecaster/
 - Session persistence depends on browser fingerprint compatibility; some sites may invalidate headless sessions saved from headed logins.
 - Authenticated browser ingestion requires project `.venv` + Playwright browser binaries (`.playwright-browsers`).
 - CSS selector hints for book-specific waits are best-effort; DOM changes on sportsbook sites will need adapter updates.
-- Practically running web_text_ingestion and browser_prop_parser in unision causing the script to be hung trying to parse after session is validated
+- PrizePicks CDP fetch requires Chrome to remain open with `--remote-debugging-port=9222` — not suitable for fully unattended cron jobs without a persistent Chrome process.
+- `--extract-chrome-session` (pycookiecheat) captures cookies only; `--connect-chrome` (CDP) is required to also capture localStorage JWT tokens.
+- Previously: running `web_text_ingestion` and `browser_prop_parser` in unison caused the script to hang after session validation (resolved by separating fetch and parse steps).
 
 
 ---
@@ -251,6 +320,35 @@ python3 -m nba_model.data.daily_etl \
   --web-text-urls-file data/config/web_text_urls.txt \
   --browser-auth-state-file data/config/auth/underdog_state.json \
   --validate-session-before-etl
+
+# PrizePicks: launch real Chrome with remote debugging
+open -na "Google Chrome" --args \
+    --remote-debugging-port=9222 \
+    --user-data-dir=/tmp/pp-chrome-profile
+
+# PrizePicks: extract full session from running Chrome (cookies + localStorage JWT)
+.venv/bin/python3 -m nba_model.model.web_text_ingestion \
+  --connect-chrome https://app.prizepicks.com/board/nba \
+  --browser-auth-state-file data/config/auth/prizepicks_state.json \
+  --chrome-debug-port 9222
+
+# PrizePicks: validate session through real Chrome
+.venv/bin/python3 -m nba_model.model.web_text_ingestion \
+  --validate-session https://app.prizepicks.com/board/nba \
+  --browser-auth-state-file data/config/auth/prizepicks_state.json \
+  --chrome-debug-port 9222
+
+# PrizePicks: fetch board content through real Chrome
+.venv/bin/python3 -m nba_model.model.web_text_ingestion \
+  --urls "https://app.prizepicks.com/board/nba" \
+  --browser-auth-state-file data/config/auth/prizepicks_state.json \
+  --chrome-debug-port 9222 \
+  --force-poll
+
+# Fallback: extract cookies-only from closed Chrome (no localStorage)
+.venv/bin/python3 -m nba_model.model.web_text_ingestion \
+  --extract-chrome-session https://app.prizepicks.com/ \
+  --browser-auth-state-file data/config/auth/prizepicks_state.json
 
 # Standalone browser parser over stored snapshots
 python3 -m nba_model.model.browser_prop_parser \
@@ -323,6 +421,7 @@ TECHNICAL DEBT / KNOWN ISSUES
 - Line comparison/monthly diagnostics can still return sparse/empty artifacts when `betting_lines` and `predictions` do not overlap enough.
 - Real-data benchmark/distribution sweep scripts are implemented; production defaults still need formal selection from full-run artifacts.
 - UnderDog fetch requires authenticated session; use `--login` to manually save session, then `--browser-auth-state-file` for headless reuse.
+- PrizePicks fetch requires real Chrome running with `--remote-debugging-port=9222`; use `--connect-chrome` to capture session and `--chrome-debug-port` for all subsequent fetches. Playwright's Chromium is blocked at the TLS layer by Cloudflare + PerimeterX + DataDome regardless of JS stealth patches.
 - Session persistence across headed->headless may fail if site validates browser fingerprint (user-agent, TLS, etc).
 - CSS selector wait hints for books are best-effort; DOM restructures require updating `_BOOK_WAIT_SELECTORS` map.
 - Current travel/rest/injury features are heuristic; no independent validation source is integrated yet.

@@ -221,6 +221,61 @@ Notes:
 - Recommended runtime is project `.venv` (`.venv/bin/python ...`) so browser dependencies stay isolated.
 - This project auto-prefers local `.playwright-browsers/` binaries when available.
 
+#### PrizePicks — CDP Workflow (Required for Multi-Layer Bot Protection)
+
+PrizePicks runs Cloudflare + PerimeterX + DataDome simultaneously. All three tie session cookies to the browser's TLS fingerprint, so Playwright's Chromium is blocked at the network layer regardless of JS-side stealth patches. The only reliable approach is to route everything through a **real running Chrome** via Chrome DevTools Protocol (CDP).
+
+**One-time setup — install dependencies:**
+
+```bash
+.venv/bin/python3 -m pip install playwright-stealth pycookiecheat
+```
+
+**Step 1: Launch Chrome with remote debugging**
+
+```bash
+open -na "Google Chrome" --args \
+    --remote-debugging-port=9222 \
+    --user-data-dir=/tmp/pp-chrome-profile
+```
+
+**Step 2: Log in to PrizePicks** in that Chrome window. Complete any Cloudflare/location verification until you see the player props board.
+
+**Step 3: Extract the full session (cookies + localStorage JWT)**
+
+```bash
+.venv/bin/python3 -m nba_model.model.web_text_ingestion \
+  --connect-chrome https://app.prizepicks.com/board/nba \
+  --browser-auth-state-file data/config/auth/prizepicks_state.json \
+  --chrome-debug-port 9222
+```
+
+**Step 4: Validate the session**
+
+```bash
+.venv/bin/python3 -m nba_model.model.web_text_ingestion \
+  --validate-session https://app.prizepicks.com/board/nba \
+  --browser-auth-state-file data/config/auth/prizepicks_state.json \
+  --chrome-debug-port 9222
+```
+
+**Step 5: Fetch/scrape through real Chrome** (keep the Chrome window open while running)
+
+```bash
+.venv/bin/python3 -m nba_model.model.web_text_ingestion \
+  --urls "https://app.prizepicks.com/board/nba" \
+  --browser-auth-state-file data/config/auth/prizepicks_state.json \
+  --chrome-debug-port 9222 \
+  --force-poll
+```
+
+Notes:
+- Chrome must remain open with `--remote-debugging-port=9222` for the duration of any scrape run.
+- `--connect-chrome` captures both cookies AND `localStorage` (which stores PrizePicks JWT auth tokens) — unlike `--extract-chrome-session` which only captures cookies.
+- The `--chrome-debug-port` flag is also accepted by `--validate-session` to route validation through the same real Chrome.
+- If Chrome closes unexpectedly, re-run Steps 1–2 and then Step 3 to refresh the session state.
+- For UnderDog, Playwright + `playwright-stealth` + `--login` is usually sufficient (lighter bot protection).
+
 Standalone direct web-text CLI:
 
 ```bash

@@ -88,115 +88,9 @@ _STAT_PATTERN = "|".join(
     re.escape(item)
     for item in sorted(_STAT_ALIASES.keys(), key=len, reverse=True)
 )
-_NAME_PATTERN = r"(?:[A-Z][A-Za-z\.\'\-]{1,}(?:\s+[A-Z][A-Za-z\.\'\-]{1,}){1,3})"
-_LINE_PATTERN = r"(?:\d{1,3}(?:\.\d+)?)"
 
-_CARD_PATTERNS = [
-    re.compile(
-        rf"(?P<player>{_NAME_PATTERN})\s+"
-        rf"(?P<side>{_SIDE_PATTERN})\s+"
-        rf"(?P<line>{_LINE_PATTERN})\s+"
-        rf"(?P<stat>{_STAT_PATTERN})\b",
-        flags=re.IGNORECASE,
-    ),
-    re.compile(
-        rf"(?P<player>{_NAME_PATTERN})\s+"
-        rf"(?P<line>{_LINE_PATTERN})\s+"
-        rf"(?P<stat>{_STAT_PATTERN})\s+"
-        rf"(?P<side>{_SIDE_PATTERN})\b",
-        flags=re.IGNORECASE,
-    ),
-    re.compile(
-        rf"(?P<player>{_NAME_PATTERN})\s+"
-        rf"(?P<stat>{_STAT_PATTERN})\s+"
-        rf"(?P<line>{_LINE_PATTERN})\s+"
-        rf"(?P<side>{_SIDE_PATTERN})\b",
-        flags=re.IGNORECASE,
-    ),
-]
-
-_UD_NAME_PAT = (
-    r"(?P<player>"
-    r"[A-Z][A-Za-z.\'\-]*[a-z][A-Za-z.\'\-]*"
-    r"(?:\s+[A-Z][A-Za-z.\'\-]*[a-z][A-Za-z.\'\-]*){1,3}"
-    r")"
-)
-_UNDERDOG_PROP_RE = re.compile(
-    _UD_NAME_PAT
-    + r"\s+[A-Z]{2,4}\s+(?:@|vs\.?)\s+[A-Z]{2,4}"
-      r"\s+-\s+.*?(?:EDT|EST|CDT|CST|PDT|PST|PM|AM)\s+"
-      r"(?P<line>\d{1,3}(?:\.\d+)?)"
-      r"\s+(?P<stat>[A-Za-z][A-Za-z +\']{1,30}?)"
-      r"\s+(?P<side>Higher|Lower|Over|Under)",
-    flags=re.IGNORECASE,
-)
-
-
-_PRIZEPICKS_NAME_PAT = (
-    r"(?P<player>"
-    r"[A-Z][A-Za-z.\'\-]*[a-z][A-Za-z.\'\-]*"
-    r"(?:\s+[A-Z][A-Za-z.\'\-]*[a-z][A-Za-z.\'\-]*){1,3}"
-    r")"
-)
-_PRIZEPICKS_PROP_RE = re.compile(
-    _PRIZEPICKS_NAME_PAT
-    + r"\s+[A-Z]{2,4}\s+"
-      r"(?P<stat>[A-Za-z][A-Za-z +\']{1,30}?)"
-      r"\s+(?P<line>\d{1,3}(?:\.\d+)?)"
-      r"\s+(?P<side>More|Less|Over|Under|Higher|Lower)",
-    flags=re.IGNORECASE,
-)
-
-_PRIZEPICKS_ALT_RE = re.compile(
-    _PRIZEPICKS_NAME_PAT
-    + r"\s+(?:[A-Z]{2,5}\s+(?:@|vs\.?)\s+[A-Z]{2,5}\s+)?"
-      r"(?P<line>\d{1,3}(?:\.\d+)?)"
-      r"\s+(?P<stat>[A-Za-z][A-Za-z +\']{1,30}?)"
-      r"\s+(?P<side>More|Less|Over|Under|Higher|Lower)",
-    flags=re.IGNORECASE,
-)
-
-
-def _preprocess_underdog_text(text: str) -> str:
-    """
-    Strip UnderDog game-info segments so generic patterns can match.
-
-    Converts 'Player TEAM @ TEAM - TIME 11.5 Rebounds Higher 1.06x'
-    into     'Player 11.5 Rebounds Higher'
-    """
-    segments: list[str] = []
-    for m in _UNDERDOG_PROP_RE.finditer(text):
-        player = m.group("player").strip()
-        line = m.group("line").strip()
-        stat = m.group("stat").strip()
-        side = m.group("side").strip()
-        segments.append(f"{player} {line} {stat} {side}")
-    return " ".join(segments) if segments else ""
-
-
-def _preprocess_prizepicks_text(text: str) -> str:
-    """
-    Strip PrizePicks team/game segments so generic patterns can match.
-
-    Handles formats like:
-      'Player TEAM Stat 27.5 More Less'
-      'Player TEAM @ TEAM 27.5 Stat More Less'
-    """
-    segments: list[str] = []
-    seen: set[tuple] = set()
-    for pat in (_PRIZEPICKS_PROP_RE, _PRIZEPICKS_ALT_RE):
-        for m in pat.finditer(text):
-            player = m.group("player").strip()
-            line = m.group("line").strip()
-            stat = m.group("stat").strip()
-            side = m.group("side").strip()
-            key = (player.lower(), line, stat.lower())
-            if key in seen:
-                continue
-            seen.add(key)
-            segments.append(f"{player} {line} {stat} {side}")
-    return " ".join(segments) if segments else ""
-
+# Words that should never appear at the start of a player-name token.
+# Defined here (before _NAME_PATTERN) so _STOP_WORD_LOOKAHEAD can reference it.
 _NAME_STOP_WORDS = {
     "and",
     "nba",
@@ -237,7 +131,163 @@ _NAME_STOP_WORDS = {
     "flex",
     "play",
     "boost",
+    # sportsbook UI labels that appear before prop cards
+    "projections",
+    "projection",
+    "board",
+    "slate",
+    "lineup",
+    "entry",
 }
+
+# Negative-lookahead fragment: prevents any word in _NAME_STOP_WORDS from
+# starting a player-name token.  Applied case-insensitively (via IGNORECASE on
+# the parent regex), this stops words like "More", "Less", "Projections", "NBA"
+# from being captured as the beginning of a player name — which would otherwise
+# cause finditer to skip over the real player name that follows.
+_STOP_WORD_LOOKAHEAD = (
+    "(?!"
+    + "|".join(re.escape(w) + r"\b" for w in sorted(_NAME_STOP_WORDS, key=len, reverse=True))
+    + ")"
+)
+# (?-i:[A-Z]) turns off IGNORECASE for just this character class so the first
+# letter of every player-name word must be a genuine uppercase letter.  Without
+# this, IGNORECASE would let lowercase letters (e.g. "r" from "rojections")
+# satisfy [A-Z] after the stop-word lookahead rejects the actual uppercase start.
+_NAME_WORD = _STOP_WORD_LOOKAHEAD + r"(?-i:[A-Z])[A-Za-z\.\'\-]{1,}"
+_NAME_PATTERN = rf"(?:{_NAME_WORD}(?:\s+{_NAME_WORD}){{1,3}})"
+
+_LINE_PATTERN = r"(?:\d{1,3}(?:\.\d+)?)"
+
+_CARD_PATTERNS = [
+    re.compile(
+        rf"(?P<player>{_NAME_PATTERN})\s+"
+        rf"(?P<side>{_SIDE_PATTERN})\s+"
+        rf"(?P<line>{_LINE_PATTERN})\s+"
+        rf"(?P<stat>{_STAT_PATTERN})\b",
+        flags=re.IGNORECASE,
+    ),
+    re.compile(
+        rf"(?P<player>{_NAME_PATTERN})\s+"
+        rf"(?P<line>{_LINE_PATTERN})\s+"
+        rf"(?P<stat>{_STAT_PATTERN})\s+"
+        rf"(?P<side>{_SIDE_PATTERN})\b",
+        flags=re.IGNORECASE,
+    ),
+    re.compile(
+        rf"(?P<player>{_NAME_PATTERN})\s+"
+        rf"(?P<stat>{_STAT_PATTERN})\s+"
+        rf"(?P<line>{_LINE_PATTERN})\s+"
+        rf"(?P<side>{_SIDE_PATTERN})\b",
+        flags=re.IGNORECASE,
+    ),
+]
+
+# UnderDog name pattern: mixed-case words only (each word must contain at least
+# one lowercase letter), so all-uppercase team abbreviations are excluded.
+_UD_NAME_PAT = (
+    r"(?P<player>"
+    r"[A-Z][A-Za-z.\'\-]*[a-z][A-Za-z.\'\-]*"
+    r"(?:\s+[A-Z][A-Za-z.\'\-]*[a-z][A-Za-z.\'\-]*){1,3}"
+    r")"
+)
+_UNDERDOG_PROP_RE = re.compile(
+    _UD_NAME_PAT
+    + r"\s+[A-Z]{2,4}\s+(?:@|vs\.?)\s+[A-Z]{2,4}"
+      r"\s+-\s+.*?(?:EDT|EST|CDT|CST|PDT|PST|PM|AM)\s+"
+      r"(?P<line>\d{1,3}(?:\.\d+)?)"
+      r"\s+(?P<stat>[A-Za-z][A-Za-z +\']{1,30}?)"
+      r"\s+(?P<side>Higher|Lower|Over|Under)",
+    flags=re.IGNORECASE,
+)
+
+# PrizePicks name pattern: same mixed-case requirement as UnderDog, PLUS a
+# stop-word negative lookahead so that words like "Less", "More", "Projections"
+# cannot start a player-name token (even though they have lowercase letters).
+# Compiled WITHOUT re.IGNORECASE so [a-z] is truly case-sensitive.
+_PP_STOP_LOOKAHEAD = (
+    "(?!"
+    + "|".join(
+        # Include both lowercase and title-case forms since patterns are case-sensitive.
+        re.escape(w[0].upper() + w[1:]) + r"\b"
+        for w in sorted(_NAME_STOP_WORDS, key=len, reverse=True)
+        if w
+    )
+    + ")"
+)
+_PRIZEPICKS_NAME_WORD = _PP_STOP_LOOKAHEAD + r"[A-Z][A-Za-z.\'\-]*[a-z][A-Za-z.\'\-]*"
+_PRIZEPICKS_NAME_PAT = (
+    r"(?P<player>"
+    + _PRIZEPICKS_NAME_WORD
+    + r"(?:\s+" + _PRIZEPICKS_NAME_WORD + r"){1,3}"
+    + r")"
+)
+# Primary PrizePicks pattern: "Player TEAM Stat Line More|Less"
+# Not IGNORECASE: case sensitivity is needed to exclude all-uppercase tokens.
+_PRIZEPICKS_PROP_RE = re.compile(
+    _PRIZEPICKS_NAME_PAT
+    + r"\s+[A-Z]{2,4}\s+"             # team abbreviation (all-uppercase 2-4 chars)
+      r"(?P<stat>[A-Z][A-Za-z +\']{1,30}?)"  # stat label (starts uppercase)
+      r"\s+(?P<line>\d{1,3}(?:\.\d+)?)"
+      r"\s+(?P<side>More|Less|Over|Under|Higher|Lower)",
+)
+
+# Alternate PrizePicks pattern: "Player Line Stat More|Less" (line before stat)
+_PRIZEPICKS_ALT_RE = re.compile(
+    _PRIZEPICKS_NAME_PAT
+    + r"(?:\s+[A-Z]{2,5}(?:\s+(?:@|vs\.?)\s+[A-Z]{2,5})?)?"  # optional team context
+      r"\s+(?P<line>\d{1,3}(?:\.\d+)?)"
+      r"\s+(?P<stat>[A-Za-z][A-Za-z +\']{1,30}?)"
+      r"\s+(?P<side>More|Less|Over|Under|Higher|Lower)",
+)
+
+
+def _preprocess_underdog_text(text: str) -> str:
+    """
+    Strip UnderDog game-info segments so generic patterns can match.
+
+    Converts 'Player TEAM @ TEAM - TIME 11.5 Rebounds Higher 1.06x'
+    into     'Player 11.5 Rebounds Higher'
+    """
+    segments: list[str] = []
+    for m in _UNDERDOG_PROP_RE.finditer(text):
+        player = m.group("player").strip()
+        line = m.group("line").strip()
+        stat = m.group("stat").strip()
+        side = m.group("side").strip()
+        segments.append(f"{player} {line} {stat} {side}")
+    return " ".join(segments) if segments else ""
+
+
+def _preprocess_prizepicks_text(text: str) -> str:
+    """
+    Strip PrizePicks team/game segments so generic patterns can match.
+
+    Handles formats like:
+      'Player TEAM Stat 27.5 More Less'
+      'Player TEAM @ TEAM 27.5 Stat More Less'
+
+    Player names are validated via ``_clean_player_name`` before being added so
+    that UI labels like "Projections" that slip through the regex are filtered out.
+    """
+    segments: list[str] = []
+    seen: set[tuple] = set()
+    for pat in (_PRIZEPICKS_PROP_RE, _PRIZEPICKS_ALT_RE):
+        for m in pat.finditer(text):
+            raw_player = m.group("player").strip()
+            player = _clean_player_name(raw_player)
+            if not player:
+                continue
+            line = m.group("line").strip()
+            stat = m.group("stat").strip()
+            side = m.group("side").strip()
+            key = (player.lower(), line, stat.lower())
+            if key in seen:
+                continue
+            seen.add(key)
+            segments.append(f"{player} {line} {stat} {side}")
+    return " ".join(segments) if segments else ""
+
 _NOISE_HINTS = {"loading", "login", "sign in", "create account", "mobile web is coming"}
 _BOOK_NAME_MAP = {
     "prizepicks.com": "prizepicks",
@@ -280,9 +330,19 @@ def _normalize_name_key(name: str) -> str:
 
 
 def _clean_player_name(raw_name: str) -> str:
-    """Clean extracted player token into display name."""
+    """Clean extracted player token into display name.
+
+    Strips trailing team-abbreviation tokens (all-uppercase 2-4 chars, e.g. LAL,
+    GSW, DEN) that the generic name pattern sometimes captures from PrizePicks
+    or UnderDog text formatted as ``"Player TEAM Stat Line Side"``.
+    """
     name = _collapse_whitespace(raw_name).strip(" -:|,;")
     parts = [part for part in name.split(" ") if part]
+    if len(parts) < 2:
+        return ""
+    # Strip trailing team-abbreviation tokens (e.g. "LAL", "GSW", "DEN").
+    while parts and re.match(r"^[A-Z]{2,4}$", parts[-1]):
+        parts = parts[:-1]
     if len(parts) < 2:
         return ""
     lowered = [part.lower().strip(".") for part in parts]

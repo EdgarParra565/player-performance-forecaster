@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import logging
 import os
+import threading
 import time
 from datetime import datetime, timezone
 from html.parser import HTMLParser
@@ -41,11 +42,19 @@ _BOOK_WAIT_SELECTORS: dict[str, list[str]] = {
         "[class*='higher-lower']",
     ],
     "prizepicks.com": [
+        # broad class-name fragment matches — PrizePicks uses CSS modules so names vary
+        "[class*='Projection']",
         "[class*='projection']",
-        "[class*='player-projection']",
-        "[class*='stat-container']",
-        "[class*='board-cell']",
+        "[class*='ProjectionCard']",
+        "[class*='StatLine']",
+        "[class*='stat-line']",
+        "[class*='Pick']",
+        "[class*='pick']",
         "[data-testid*='projection']",
+        "[data-testid*='pick']",
+        # semantic fallback — PP wraps each card in an article or li
+        "article",
+        "ul li",
     ],
     "draftkings.com": [
         "[class*='sportsbook-outcome']",
@@ -59,9 +68,51 @@ _BOOK_WAIT_SELECTORS: dict[str, list[str]] = {
 
 _BOOK_EXTRA_WAIT_SECONDS: dict[str, float] = {
     "underdogfantasy.com": 5.0,
-    "prizepicks.com": 6.0,
+    "prizepicks.com": 8.0,  # extra time for React SPA lazy render
     "draftkings.com": 4.0,
     "fanduel.com": 4.0,
+}
+
+# Book-specific session-validation markers.
+# login_wall: substrings that (when found in page text) indicate an unauthenticated state.
+# authenticated: substrings that should appear when the user IS logged in with live content.
+# min_authenticated_hits: how many authenticated markers must be present to confirm a valid session.
+_BOOK_SESSION_MARKERS: dict[str, dict] = {
+    "prizepicks.com": {
+        "login_wall": [
+            "enter your phone number",
+            "enter phone number",
+            "log in to prizepicks",
+            "create a new account",
+            "sign up for prizepicks",
+            "verify your identity",
+        ],
+        "authenticated": [
+            "more",
+            "less",
+            "projections",
+            "nba",
+            "points",
+            "rebounds",
+            "assists",
+        ],
+        "min_authenticated_hits": 4,
+    },
+    "underdogfantasy.com": {
+        "login_wall": [
+            "sign in to continue",
+            "enter your email",
+            "forgot password",
+        ],
+        "authenticated": [
+            "higher",
+            "lower",
+            "nba",
+            "pick",
+            "points",
+        ],
+        "min_authenticated_hits": 3,
+    },
 }
 
 
@@ -226,6 +277,246 @@ def sync_active_nba_players_reference(
     }
 
 
+
+# Injected into every page before navigation to remove Playwright's automation
+# fingerprints that Cloudflare Turnstile (and similar challenges) use to block
+# automated browsers.  Must stay a single JS expression so Playwright can eval
+# it safely as an init script.
+_BROWSER_STEALTH_SCRIPT = """
+(function () {
+  // Remove the canonical webdriver flag
+  Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+
+  // Restore the permissions API to normal browser behaviour
+  try {
+    const _origQuery = window.navigator.permissions.query.bind(navigator.permissions);
+    window.navigator.permissions.query = (params) =>
+      params.name === 'notifications'
+        ? Promise.resolve({ state: Notification.permission })
+        : _origQuery(params);
+  } catch (_) {}
+
+  // Expose a non-empty plugins list (Playwright ships with zero plugins)
+  Object.defineProperty(navigator, 'plugins', { get: () => Array.from({ length: 3 }) });
+
+  // Make sure chrome runtime object is present (expected by Cloudflare)
+  if (!window.chrome) {
+    Object.defineProperty(window, 'chrome', {
+      value: { runtime: {} },
+      writable: true,
+    });
+  }
+})();
+"""
+
+
+def extract_chrome_session(url: str, auth_state_file: str) -> dict:
+    """Extract a live session from the user's installed Chrome browser and save
+    it as a Playwright storage_state JSON so headless fetches can reuse it.
+
+    The user must already be logged in to ``url`` in their regular Chrome.
+    Chrome must be closed (or at least not actively writing cookies) for the
+    SQLite database to be readable.
+
+    Returns a summary dict with status and path.
+    """
+    try:
+        from pycookiecheat import chrome_cookies  # type: ignore[import]
+    except ImportError as exc:
+        raise RuntimeError(
+            "pycookiecheat is required for Chrome session extraction. "
+            "Install with: pip install pycookiecheat"
+        ) from exc
+
+    import json as _json
+    from urllib.parse import urlparse
+
+    parsed = urlparse(url)
+    domain = parsed.netloc or parsed.path  # e.g. "app.prizepicks.com"
+
+    logger.info("Extracting Chrome cookies for %s …", url)
+    try:
+        raw_cookies: dict = chrome_cookies(url)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Failed to read Chrome cookies for {url}: {exc}\n"
+            "Make sure Chrome is fully closed before running this command."
+        ) from exc
+
+    if not raw_cookies:
+        raise RuntimeError(
+            f"No cookies found for {url}. "
+            "Make sure you are logged in to the site in Chrome and Chrome is closed."
+        )
+
+    # Convert to Playwright storage_state format
+    cookies = []
+    for name, value in raw_cookies.items():
+        cookies.append({
+            "name": name,
+            "value": str(value),
+            "domain": domain,
+            "path": "/",
+            "expires": -1,
+            "httpOnly": False,
+            "secure": parsed.scheme == "https",
+            "sameSite": "Lax",
+        })
+
+    storage_state = {
+        "cookies": cookies,
+        "origins": [],
+    }
+
+    auth_path = Path(auth_state_file)
+    auth_path.parent.mkdir(parents=True, exist_ok=True)
+    auth_path.write_text(_json.dumps(storage_state, indent=2))
+    logger.info("Saved %d cookies to %s", len(cookies), auth_path)
+
+    return {
+        "status": "saved",
+        "auth_state_file": str(auth_path),
+        "cookie_count": len(cookies),
+        "domain": domain,
+    }
+
+
+def extract_session_via_cdp(
+    url: str,
+    auth_state_file: str,
+    debug_port: int = 9222,
+) -> dict:
+    """Connect to a running Chrome with remote-debugging enabled, extract its
+    cookies AND localStorage for *url*, and save a Playwright-compatible
+    storage_state JSON.
+
+    This is the most reliable way to capture a session protected by Cloudflare,
+    PerimeterX, DataDome, etc., because the requests come from REAL Chrome —
+    no fingerprinting mismatch.
+
+    Prerequisites
+    -------------
+    Launch Chrome with::
+
+        open -na "Google Chrome" --args \\
+            --remote-debugging-port=9222 \\
+            --user-data-dir=/tmp/pp-chrome-profile
+
+    Log in to the site in that Chrome window, then call this function.
+    """
+    import json as _json
+
+    sync_playwright = _import_playwright()
+
+    auth_path = Path(auth_state_file)
+    auth_path.parent.mkdir(parents=True, exist_ok=True)
+
+    cdp_url = f"http://localhost:{debug_port}"
+    logger.info("Connecting to Chrome at %s …", cdp_url)
+
+    with sync_playwright() as p:
+        try:
+            browser = p.chromium.connect_over_cdp(cdp_url)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Could not connect to Chrome on port {debug_port}: {exc}\n\n"
+                "Make sure Chrome is running with remote debugging enabled:\n"
+                "  open -na \"Google Chrome\" --args "
+                "--remote-debugging-port=9222 "
+                "--user-data-dir=/tmp/pp-chrome-profile"
+            ) from exc
+
+        # Find the context / page that matches the target URL
+        context = browser.contexts[0] if browser.contexts else None
+        if context is None:
+            raise RuntimeError("No browser context found — is a tab open in Chrome?")
+
+        # Prefer a page already on the target domain; fall back to first page.
+        from urllib.parse import urlparse as _up
+        target_domain = _up(url).netloc
+        page = None
+        for ctx in browser.contexts:
+            for pg in ctx.pages:
+                if target_domain in pg.url:
+                    page = pg
+                    context = ctx
+                    break
+            if page:
+                break
+        if page is None:
+            page = context.pages[0] if context.pages else context.new_page()
+            try:
+                page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+            except Exception:
+                pass
+
+        # Extract localStorage so JWT auth tokens are captured too.
+        try:
+            local_storage: dict = page.evaluate(
+                "() => Object.fromEntries(Object.entries(localStorage))"
+            )
+        except Exception:
+            local_storage = {}
+
+        ls_origin = _up(url)._replace(path="", query="", fragment="").geturl()
+        origins = []
+        if local_storage:
+            origins.append({
+                "origin": ls_origin,
+                "localStorage": [{"name": k, "value": str(v)} for k, v in local_storage.items()],
+            })
+
+        # Capture full storage state (cookies + localStorage).
+        try:
+            state = context.storage_state()
+        except Exception:
+            state = {"cookies": [], "origins": []}
+
+        # Merge our localStorage into the saved state.
+        if origins:
+            existing_origins = {o.get("origin"): o for o in state.get("origins", [])}
+            existing_origins[ls_origin] = origins[0]
+            state["origins"] = list(existing_origins.values())
+
+        auth_path.write_text(_json.dumps(state, indent=2))
+        cookie_count = len(state.get("cookies", []))
+        ls_count = len(local_storage)
+        logger.info(
+            "CDP session saved — %d cookies, %d localStorage keys → %s",
+            cookie_count, ls_count, auth_path,
+        )
+
+        # Look for a PrizePicks-style auth token in localStorage.
+        token_keys = [k for k in local_storage if "token" in k.lower() or "auth" in k.lower()]
+        if token_keys:
+            logger.info("Auth-related localStorage keys found: %s", token_keys)
+
+    return {
+        "status": "saved",
+        "auth_state_file": str(auth_path),
+        "cookie_count": cookie_count,
+        "local_storage_keys": ls_count,
+        "auth_keys_found": token_keys if "token_keys" in dir() else [],
+    }
+
+
+def _resolve_ip_geolocation() -> Optional[dict]:
+    """Return {latitude, longitude} based on the machine's public IP.
+
+    Uses the free ipapi.co JSON endpoint (no API key needed for low-volume use).
+    Returns None on any error so callers can degrade gracefully.
+    """
+    try:
+        resp = requests.get("https://ipapi.co/json/", timeout=5)
+        data = resp.json()
+        lat = float(data["latitude"])
+        lon = float(data["longitude"])
+        return {"latitude": lat, "longitude": lon}
+    except Exception as exc:
+        logger.debug("IP geolocation lookup failed: %s", exc)
+        return None
+
+
 def login_and_save_session(
     login_url: str,
     auth_state_file: str,
@@ -239,6 +530,10 @@ def login_and_save_session(
     The browser opens to login_url. You log in manually in the browser window.
     When done, close the browser or press Ctrl+C in the terminal. Session
     cookies and storage are saved to auth_state_file for future headless reuse.
+
+    Session state is saved once when the browser window is closed.  No periodic
+    CDP calls are made while the window is open so that bot-detection challenges
+    (e.g. Cloudflare Turnstile) are not reset by automation activity.
 
     Returns summary dict with session state path and status.
     """
@@ -257,35 +552,80 @@ def login_and_save_session(
     saved_path = str(auth_path)
 
     with sync_playwright() as p:
+        # Anti-detection launch args: tell the browser not to announce itself as
+        # being controlled by automation — this removes the "AutomationControlled"
+        # feature flag that Cloudflare Turnstile uses to identify Playwright.
         browser = p.chromium.launch(
             headless=False,
             timeout=max(5000, timeout_seconds * 1000),
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--disable-features=ChromeWhatsNewUI",
+            ],
         )
-        context_kwargs = {
+        logger.info("Login browser: using Playwright's bundled Chromium with stealth flags.")
+
+        context_kwargs: dict = {
             "user_agent": str(user_agent).strip() or DEFAULT_WEB_TEXT_USER_AGENT,
+            # Grant geolocation permission so PrizePicks (and similar sites) can
+            # confirm the user is in a valid state.  Without this the browser
+            # silently denies every geolocation request and the site shows
+            # "ensure you are in a valid location before signing in".
+            "permissions": ["geolocation"],
         }
+        # Resolve the user's approximate coordinates from their public IP so the
+        # browser can report a real location.  Falls back silently if the lookup
+        # fails (the permission is still granted; the site may then use IP geo).
+        geo = _resolve_ip_geolocation()
+        if geo:
+            context_kwargs["geolocation"] = geo
+            logger.info("Geolocation set to lat=%.4f lon=%.4f from IP lookup.", geo["latitude"], geo["longitude"])
+        else:
+            logger.info("IP geolocation lookup failed — geolocation permission granted but no coords set.")
         if auth_path.exists():
             context_kwargs["storage_state"] = str(auth_path)
             logger.info("Loading existing session from %s", auth_path)
         context = browser.new_context(**context_kwargs)
         page = context.new_page()
+        # Apply comprehensive stealth patches (playwright-stealth covers ~20
+        # fingerprinting signals: webdriver flag, Canvas, WebGL renderer, Chrome
+        # internals, plugins, languages, permissions API, etc.).  Falls back to
+        # our own lightweight script if the library is unavailable.
+        try:
+            from playwright_stealth import stealth_sync  # type: ignore[import]
+            stealth_sync(page)
+            logger.info("playwright-stealth applied to login page.")
+        except Exception:
+            context.add_init_script(_BROWSER_STEALTH_SCRIPT)
+            logger.info("playwright-stealth unavailable — using built-in stealth script.")
 
         print(f"\n  Browser opened to: {login_url}")
         print("  Log in manually in the browser window.")
-        print("  When finished, CLOSE the browser window to save the session.\n")
+        print("  When finished, CLOSE the browser window — session will be saved automatically.")
+        print(f"  (Timeout: {timeout_seconds}s)\n")
 
         try:
             page.goto(login_url, wait_until="domcontentloaded")
-            page.wait_for_timeout(timeout_seconds * 1000)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("Initial page load error (continuing): %s", exc)
 
+        # Wait silently for the browser to be closed by the user.  We use a
+        # threading.Event driven by the browser's "disconnected" callback so
+        # that no CDP calls are made while the user is interacting — periodic
+        # CDP activity can be detected by Cloudflare Turnstile and reset the
+        # auth challenge.
+        _closed = threading.Event()
+        browser.on("disconnected", lambda _b=None: _closed.set())
+        _closed.wait(timeout=timeout_seconds)
+        logger.info("Browser closed (or timeout reached) — saving session state.")
+
+        # Save once after the browser has been closed / disconnected.
         try:
             context.storage_state(path=saved_path)
             if profile_state_path:
                 context.storage_state(path=profile_state_path)
-        except Exception as exc:
-            logger.warning("Could not save storage state: %s", exc)
+        except Exception:
+            pass
         finally:
             try:
                 context.close()
@@ -304,6 +644,54 @@ def login_and_save_session(
     }
 
 
+def _check_session_content(text: str, url: str, min_content_length: int) -> tuple[bool, str]:
+    """
+    Determine whether page text represents an authenticated session.
+
+    Returns (is_valid, reason_string). Uses book-specific marker sets when
+    the URL matches a known sportsbook domain; falls back to generic heuristics.
+    """
+    text_lower = text.lower()
+    book_domain = _match_book_domain(url)
+    markers = _BOOK_SESSION_MARKERS.get(book_domain or "", {})
+
+    if markers:
+        # Book-specific: check for explicit login-wall phrases.
+        login_wall_phrases = markers.get("login_wall", [])
+        for phrase in login_wall_phrases:
+            if phrase in text_lower:
+                return False, f"Login-wall phrase detected: '{phrase}'"
+
+        # Book-specific: require a minimum number of authenticated content markers.
+        auth_phrases = markers.get("authenticated", [])
+        min_hits = int(markers.get("min_authenticated_hits", 3))
+        hit_count = sum(1 for phrase in auth_phrases if phrase in text_lower)
+        if len(text) < min_content_length:
+            return False, (
+                f"Content too short ({len(text)} < {min_content_length} chars); "
+                "page may still be loading"
+            )
+        if hit_count < min_hits:
+            return False, (
+                f"Only {hit_count}/{min_hits} authenticated content markers found "
+                f"({', '.join(p for p in auth_phrases if p in text_lower) or 'none'})"
+            )
+        return True, f"Session active ({hit_count} authenticated markers present)"
+
+    # Generic fallback: repeated login-wall keywords indicate unauthenticated state.
+    generic_wall_markers = ("sign in", "log in", "create account", "loading...")
+    has_login_wall = any(
+        marker in text_lower
+        for marker in generic_wall_markers
+        if text_lower.count(marker) > 2
+    )
+    if len(text) < min_content_length:
+        return False, f"Content too short ({len(text)} < {min_content_length} chars)"
+    if has_login_wall:
+        return False, "Generic login-wall markers detected (>2 occurrences)"
+    return True, "Session appears active (generic check passed)"
+
+
 def validate_session(
     test_url: str,
     auth_state_file: str,
@@ -311,12 +699,18 @@ def validate_session(
     timeout_seconds: int = DEFAULT_WEB_TEXT_BROWSER_PAGE_TIMEOUT_SECONDS,
     user_agent: str = DEFAULT_WEB_TEXT_USER_AGENT,
     min_content_length: int = 500,
+    chrome_debug_port: Optional[int] = None,
 ) -> dict:
     """
     Headlessly validate whether a saved session is still active.
 
     Loads auth_state_file in headless mode, navigates to test_url, and checks
     whether the page contains meaningful content (not just a login wall).
+    Uses book-specific authenticated/login-wall markers when the URL matches a
+    known sportsbook domain.
+
+    Pass chrome_debug_port to route the check through a running real Chrome
+    instead of Playwright's Chromium (required for Cloudflare/PerimeterX sites).
     """
     try:
         result = _fetch_url_text_with_browser(
@@ -326,6 +720,7 @@ def validate_session(
             max_chars=DEFAULT_WEB_TEXT_MAX_CHARS,
             browser_auth_state_file=auth_state_file,
             browser_user_data_dir=user_data_dir,
+            chrome_debug_port=chrome_debug_port,
         )
     except Exception as exc:
         return {
@@ -337,25 +732,15 @@ def validate_session(
         }
 
     text = result.get("text_content", "")
-    text_lower = text.lower()
-    has_login_wall = any(
-        marker in text_lower
-        for marker in ("sign in", "log in", "create account", "loading...")
-        if text_lower.count(marker) > 2
-    )
-    has_content = len(text) >= min_content_length and not has_login_wall
+    is_valid, reason = _check_session_content(text, test_url, min_content_length)
 
     return {
-        "valid": has_content,
-        "reason": (
-            "Session appears active"
-            if has_content
-            else "Content too short or login wall detected"
-        ),
+        "valid": is_valid,
+        "reason": reason,
         "auth_state_file": auth_state_file,
         "test_url": test_url,
         "text_length": len(text),
-        "has_login_wall_markers": has_login_wall,
+        "book_domain": _match_book_domain(test_url),
     }
 
 
@@ -444,8 +829,67 @@ def _resolve_auth_state_path(
     return auth_state_path, profile_state_path
 
 
+_SELECTOR_TIMEOUT_MS = 2000  # per-selector timeout (keeps total wait bounded)
+
+
+def _scroll_page_for_lazy_content(page) -> None:
+    """Scroll the page incrementally to trigger lazy-loaded content."""
+    try:
+        page.evaluate(
+            """
+            () => {
+                const step = Math.round(window.innerHeight * 0.8);
+                const max = Math.max(
+                    document.body.scrollHeight,
+                    document.documentElement.scrollHeight,
+                    3000,
+                );
+                let y = 0;
+                while (y < max) {
+                    window.scrollTo(0, y);
+                    y += step;
+                }
+                window.scrollTo(0, 0);
+            }
+            """
+        )
+    except Exception:
+        pass
+
+
+def _detect_login_wall_early(page, url: str) -> bool:
+    """
+    Quick check whether the page already shows a login wall.
+
+    Called immediately after domcontentloaded, before any selector waits.
+    Returns True when book-specific login-wall phrases are found so we can
+    skip the expensive per-selector wait loop and avoid multi-minute hangs.
+    """
+    book_domain = _match_book_domain(url)
+    markers = _BOOK_SESSION_MARKERS.get(book_domain or "", {})
+    login_wall_phrases = markers.get("login_wall", [])
+    if not login_wall_phrases:
+        return False
+    try:
+        text = page.inner_text("body")
+        text_lower = str(text or "").lower()
+        return any(phrase in text_lower for phrase in login_wall_phrases)
+    except Exception:
+        return False
+
+
 def _wait_for_dynamic_content(page, url: str, base_wait_seconds: float) -> None:
-    """Apply smart wait strategies: book-specific selector waits then networkidle fallback."""
+    """Apply smart wait strategies: book-specific selector waits then networkidle fallback.
+
+    After domcontentloaded we do a fast login-wall check first.  If the page is
+    already showing a login wall we return immediately — this avoids the multi-minute
+    hang that would otherwise occur as every selector times out one by one (up to
+    ``_SELECTOR_TIMEOUT_MS`` × len(selectors) seconds per URL).
+    """
+    if _detect_login_wall_early(page, url):
+        logger.info("Login wall detected early for %s — skipping extended content waits.", url)
+        return
+
     book_domain = _match_book_domain(url)
     selectors = _BOOK_WAIT_SELECTORS.get(book_domain or "", [])
     extra_wait = _BOOK_EXTRA_WAIT_SECONDS.get(book_domain or "", 0.0)
@@ -453,7 +897,7 @@ def _wait_for_dynamic_content(page, url: str, base_wait_seconds: float) -> None:
     selector_found = False
     for selector in selectors:
         try:
-            page.wait_for_selector(selector, timeout=8000, state="attached")
+            page.wait_for_selector(selector, timeout=_SELECTOR_TIMEOUT_MS, state="attached")
             selector_found = True
             logger.info("Selector '%s' found for %s", selector, url)
             break
@@ -462,16 +906,77 @@ def _wait_for_dynamic_content(page, url: str, base_wait_seconds: float) -> None:
 
     if not selector_found:
         try:
-            page.wait_for_load_state("networkidle", timeout=12000)
+            page.wait_for_load_state("networkidle", timeout=8000)
         except Exception:
             pass
 
-    total_wait = base_wait_seconds + extra_wait
+    # Only apply extra book-specific wait when content selectors were actually
+    # found.  On login-wall pages that slipped past the early check, skip the
+    # extra wait to avoid stalling unnecessarily.
+    effective_extra = extra_wait if selector_found else 0.0
+    total_wait = base_wait_seconds + effective_extra
     if total_wait > 0:
         page.wait_for_timeout(int(total_wait * 1000))
 
+    # Scroll to trigger lazy-loaded content (SPAs like PrizePicks render cards on scroll).
+    if book_domain in {"prizepicks.com", "underdogfantasy.com"}:
+        _scroll_page_for_lazy_content(page)
+        try:
+            page.wait_for_timeout(1500)
+        except Exception:
+            pass
 
-def _extract_page_text(page) -> str:
+
+def _extract_prizepicks_text_js(page) -> str:
+    """
+    Extract PrizePicks projection card text via targeted JavaScript DOM traversal.
+
+    PrizePicks uses a React SPA with CSS-module class names that change between
+    deploys. This approach queries a broad set of structural selectors and returns
+    the deduplicated visible text of matching elements.
+    """
+    try:
+        result = page.evaluate(
+            """
+            () => {
+                const selectors = [
+                    '[class*="Projection"]',
+                    '[class*="projection"]',
+                    '[class*="StatLine"]',
+                    '[class*="stat-line"]',
+                    '[class*="PlayerCard"]',
+                    '[class*="player-card"]',
+                    '[class*="Pick"]',
+                    '[class*="pick"]',
+                    '[class*="Board"]',
+                    '[class*="board"]',
+                    '[data-testid*="projection"]',
+                    '[data-testid*="pick"]',
+                    'article',
+                ];
+                const texts = [];
+                const seen = new Set();
+                for (const sel of selectors) {
+                    try {
+                        document.querySelectorAll(sel).forEach(el => {
+                            const t = (el.innerText || '').trim().replace(/\\s+/g, ' ');
+                            if (t.length > 8 && !seen.has(t)) {
+                                seen.add(t);
+                                texts.push(t);
+                            }
+                        });
+                    } catch (e) {}
+                }
+                return texts.join(' ');
+            }
+            """
+        )
+        return _collapse_whitespace(str(result or ""))
+    except Exception:
+        return ""
+
+
+def _extract_page_text(page, url: str = "") -> str:
     """Extract visible text from page using multiple strategies."""
     body_html = page.content() or ""
     visible_text = _extract_visible_text(body_html)
@@ -496,7 +1001,103 @@ def _extract_page_text(page) -> str:
         except Exception:
             pass
 
+    # For PrizePicks, supplement with a targeted JS extraction of projection cards,
+    # which may not be captured reliably by the generic HTML/innerText strategies.
+    book_domain = _match_book_domain(url)
+    if book_domain == "prizepicks.com":
+        pp_text = _extract_prizepicks_text_js(page)
+        if pp_text and len(pp_text) > len(visible_text):
+            logger.info("PrizePicks JS extraction yielded %d chars (vs %d HTML)", len(pp_text), len(visible_text))
+            visible_text = pp_text
+        elif pp_text:
+            visible_text = visible_text + " " + pp_text
+
     return visible_text
+
+
+def _fetch_url_text_via_cdp(
+    url: str,
+    chrome_debug_port: int,
+    timeout: int,
+    max_chars: int,
+) -> dict:
+    """Fetch page text by connecting to a REAL Chrome via CDP.
+
+    All requests go through Chrome's genuine TLS stack and existing session
+    cookies, so PerimeterX, DataDome, and Cloudflare cannot distinguish them
+    from normal user traffic.  Chrome must be running with::
+
+        open -na "Google Chrome" --args \\
+            --remote-debugging-port=<chrome_debug_port> \\
+            --user-data-dir=/tmp/pp-chrome-profile
+    """
+    _ensure_local_playwright_browsers()
+    sync_playwright = _import_playwright()
+
+    cdp_endpoint = f"http://localhost:{chrome_debug_port}"
+    with sync_playwright() as p:
+        try:
+            browser = p.chromium.connect_over_cdp(cdp_endpoint)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Cannot connect to Chrome on port {chrome_debug_port}: {exc}. "
+                "Launch Chrome with: open -na \"Google Chrome\" --args "
+                f"--remote-debugging-port={chrome_debug_port} "
+                "--user-data-dir=/tmp/pp-chrome-profile"
+            ) from exc
+
+        context = browser.contexts[0] if browser.contexts else None
+        if not context:
+            raise RuntimeError("No browser context in running Chrome.")
+
+        # Prefer an existing tab already on the target domain so we reuse its
+        # fully-loaded SPA state rather than starting a cold navigation.
+        from urllib.parse import urlparse as _up
+        target_domain = _up(url).netloc
+        existing_page = None
+        for ctx in browser.contexts:
+            for pg in ctx.pages:
+                if target_domain in (pg.url or ""):
+                    existing_page = pg
+                    context = ctx
+                    break
+            if existing_page:
+                break
+
+        opened_new_tab = existing_page is None
+        page = existing_page or context.new_page()
+        visible_text = ""
+        try:
+            page.set_default_timeout(max(1000, int(timeout) * 1000))
+            response = None
+            if opened_new_tab:
+                response = page.goto(url, wait_until="domcontentloaded")
+                _wait_for_dynamic_content(
+                    page, url, DEFAULT_WEB_TEXT_BROWSER_WAIT_AFTER_LOAD_SECONDS,
+                )
+            # For an already-loaded existing tab, skip the scroll/wait so we
+            # don't trigger SPA re-renders that wipe the rendered content.
+            visible_text = _extract_page_text(page, url=page.url or url)
+        finally:
+            if opened_new_tab:
+                page.close()
+
+    max_chars = max(0, int(max_chars))
+    if max_chars > 0 and len(visible_text) > max_chars:
+        visible_text = visible_text[:max_chars]
+
+    status_code = None
+    try:
+        status_code = int(response.status) if response else None
+    except Exception:
+        pass
+
+    return {
+        "text_content": visible_text,
+        "status_code": status_code,
+        "content_type": None,
+        "fetch_method": f"cdp:{chrome_debug_port}",
+    }
 
 
 def _fetch_url_text_with_browser(
@@ -506,8 +1107,17 @@ def _fetch_url_text_with_browser(
     max_chars: int,
     browser_auth_state_file: Optional[str],
     browser_user_data_dir: Optional[str],
+    chrome_debug_port: Optional[int] = None,
 ) -> dict:
     """Fetch one URL in browser context, optionally with persisted session state."""
+    if chrome_debug_port:
+        return _fetch_url_text_via_cdp(
+            url=url,
+            chrome_debug_port=chrome_debug_port,
+            timeout=timeout,
+            max_chars=max_chars,
+        )
+
     _ensure_local_playwright_browsers()
     sync_playwright = _import_playwright()
     auth_state_path, profile_state_path = _resolve_auth_state_path(
@@ -536,7 +1146,7 @@ def _fetch_url_text_with_browser(
                 _wait_for_dynamic_content(
                     page, url, DEFAULT_WEB_TEXT_BROWSER_WAIT_AFTER_LOAD_SECONDS,
                 )
-                visible_text = _extract_page_text(page)
+                visible_text = _extract_page_text(page, url=url)
 
                 if profile_state_path:
                     context.storage_state(path=profile_state_path)
@@ -837,6 +1447,35 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--extract-chrome-session",
+        default=None,
+        metavar="URL",
+        help=(
+            "Extract the live session for URL from your installed Chrome browser "
+            "and save it to --browser-auth-state-file. "
+            "Log in to the site in regular Chrome first, then close Chrome, "
+            "then run this command."
+        ),
+    )
+    parser.add_argument(
+        "--connect-chrome",
+        default=None,
+        metavar="URL",
+        help=(
+            "Connect to a running Chrome (with --remote-debugging-port) and extract "
+            "the full session (cookies + localStorage) for URL. "
+            "First launch Chrome with: "
+            "open -na 'Google Chrome' --args --remote-debugging-port=9222 "
+            "--user-data-dir=/tmp/pp-chrome-profile"
+        ),
+    )
+    parser.add_argument(
+        "--chrome-debug-port",
+        type=int,
+        default=9222,
+        help="Chrome remote debugging port used by --connect-chrome (default 9222).",
+    )
+    parser.add_argument(
         "--login-timeout",
         type=int,
         default=120,
@@ -856,6 +1495,35 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def main():
     args = _build_parser().parse_args()
+
+    if args.connect_chrome:
+        state_file = args.browser_auth_state_file
+        if not state_file:
+            state_file = str(Path(DEFAULT_AUTH_STATE_DIR) / "session_state.json")
+        result = extract_session_via_cdp(
+            url=args.connect_chrome,
+            auth_state_file=state_file,
+            debug_port=args.chrome_debug_port,
+        )
+        print("CDP session extraction result:")
+        for key, val in result.items():
+            print(f"  {key}: {val}")
+        return
+
+    if args.extract_chrome_session:
+        state_file = args.browser_auth_state_file
+        if not state_file:
+            state_file = str(
+                Path(DEFAULT_AUTH_STATE_DIR) / "session_state.json"
+            )
+        result = extract_chrome_session(
+            url=args.extract_chrome_session,
+            auth_state_file=state_file,
+        )
+        print("Chrome session extraction result:")
+        for key, val in result.items():
+            print(f"  {key}: {val}")
+        return
 
     if args.login:
         state_file = args.browser_auth_state_file
@@ -886,6 +1554,7 @@ def main():
             auth_state_file=state_file,
             user_data_dir=args.browser_user_data_dir,
             user_agent=args.user_agent,
+            chrome_debug_port=args.chrome_debug_port if args.chrome_debug_port else None,
         )
         print("Session validation result:")
         for key, val in result.items():
