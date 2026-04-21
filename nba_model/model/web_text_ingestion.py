@@ -1092,10 +1092,15 @@ def _fetch_url_text_via_cdp(
     except Exception:
         pass
 
+    content_sha256 = hashlib.sha256(visible_text.encode("utf-8")).hexdigest()
     return {
-        "text_content": visible_text,
-        "status_code": status_code,
+        "source_url": url,
+        "fetched_at_utc": datetime.now(timezone.utc).isoformat(),
+        "http_status": status_code,
         "content_type": None,
+        "text_content": visible_text,
+        "text_length": int(len(visible_text)),
+        "content_sha256": content_sha256,
         "fetch_method": f"cdp:{chrome_debug_port}",
     }
 
@@ -1472,8 +1477,13 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--chrome-debug-port",
         type=int,
-        default=9222,
-        help="Chrome remote debugging port used by --connect-chrome (default 9222).",
+        default=None,
+        help=(
+            "Chrome remote debugging port. Required for --connect-chrome "
+            "(defaults to 9222 if omitted there). For --validate-session, "
+            "passing this flag opts into routing the check through a running "
+            "real Chrome instead of Playwright's headless Chromium."
+        ),
     )
     parser.add_argument(
         "--login-timeout",
@@ -1503,7 +1513,7 @@ def main():
         result = extract_session_via_cdp(
             url=args.connect_chrome,
             auth_state_file=state_file,
-            debug_port=args.chrome_debug_port,
+            debug_port=args.chrome_debug_port or 9222,
         )
         print("CDP session extraction result:")
         for key, val in result.items():
@@ -1554,7 +1564,7 @@ def main():
             auth_state_file=state_file,
             user_data_dir=args.browser_user_data_dir,
             user_agent=args.user_agent,
-            chrome_debug_port=args.chrome_debug_port if args.chrome_debug_port else None,
+            chrome_debug_port=args.chrome_debug_port,
         )
         print("Session validation result:")
         for key, val in result.items():
