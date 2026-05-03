@@ -18,7 +18,7 @@ The current baseline is designed to be reproducible offline (synthetic benchmark
 - `nba_model/model/` - feature engineering, probability, simulation, EV, parlay modeling
 - `nba_model/evaluation/` - backtesting and benchmark runners
 - `nba_model/tests/` - smoke and integration-style tests
-- `nba_model/visualization/` - distribution plotting
+- `nba_model/visualization/` - distribution plotting + Player Charts builders (`player_charts.py` powers the Player Charts UI tab)
 - `docs/API_TO_DATABASE.md` - how data flows from APIs to SQLite and how we clean it
 
 ## Setup
@@ -66,6 +66,55 @@ In the `Manual Lines Import` tab you can paste sportsbook rows and write them in
 - `player | game_date | book | stat | line | over_odds | under_odds`
 - raw board text paste is also supported (auto-extracts player + matchup + line + stat blocks)
 After parsing, use the table preview to verify rows and delete selected entries before saving.
+
+#### Player Charts tab (highlighted feature)
+
+Pick a team and player, choose a stat (`points / assists / rebounds / pra / minutes`)
+and a window of recent games — the UI pulls from the local SQLite DB and renders
+four interactive matplotlib charts plus an EV summary:
+
+- **Overview view**
+  - Recent-N-games bar chart with rolling-mean overlay and a dashed horizontal
+    line at the median book line for that stat.
+  - Distribution histogram of recent values with one or more fitted distributions
+    on top (toggle any combination of normal / poisson / negative-binomial), and
+    one colored vertical dashed line per book at that book's current line.
+- **Splits view**
+  - Home vs away mean (with sample sizes).
+  - Mean by rest-day bucket (`0-1`, `2`, `3+` days since last game).
+- **Hit Rate + Custom Line view**
+  - Horizontal bar chart of historical over-rate vs each book's line in the last N
+    games, with a tick mark at the book's break-even probability.
+  - Custom-line probe: type a hypothetical line and American odds → fitted
+    P(over), historical over-rate over the same window, EV per unit for OVER and
+    UNDER, and a `+EV/-EV` verdict.
+- **Always-visible summary text:** per-book table of `line | odds_over |
+  odds_under | P(over) | EV_over | EV_under | hit%`, plus home/away and
+  rest-days splits.
+
+The team dropdown filters the player list. Player names not in the DB fall through
+to the `nba_api` static lookup, so you can chart any active player even if no game
+logs have been ingested for them yet.
+
+#### Operations tab
+
+Every back-end pipeline can be launched and monitored from the desktop UI without
+touching the shell. Each section in the sub-notebook builds the right CLI args
+behind the scenes, runs the subprocess in its own process group, streams stdout
+live to the output panel, and exposes a Stop button (sends SIGTERM):
+
+- **Daily ETL** — db path, season, players, all skip flags, web URLs (file or
+  inline), browser auth state file, `--chrome-debug-port`, login URL,
+  `--validate-session-before-etl`, `--web-text-force-poll`.
+- **Web Text** — Login (headed), Validate Session, Fetch URL, Connect Chrome
+  (CDP capture), Extract Chrome Cookies, Sync Active Players Ref. Shared inputs:
+  target URL, auth state file, chrome debug port, user data dir.
+- **Browser Parser** — urls-file, min parse confidence, max snapshots per URL.
+- **Evaluation** — shared start/end date, stat types, windows, distributions;
+  buttons for Real-data Benchmark, Distribution Sweep, Line Comparison, Monthly
+  Diagnostics.
+- **Reverse-Engineering** — source, poll seconds, thresholds, stability runs/
+  tolerance, continuous toggle.
 
 Optional flags:
 - `--window` (rolling window)

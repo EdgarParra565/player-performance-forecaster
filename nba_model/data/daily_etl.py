@@ -637,6 +637,7 @@ def _run_web_text_step(
     max_chars: int,
     browser_auth_state_file: Optional[str],
     browser_user_data_dir: Optional[str],
+    chrome_debug_port: Optional[int] = None,
 ) -> dict:
     """Fetch/store direct website text snapshots and return summary."""
     summary = fetch_and_store_web_text(
@@ -651,6 +652,7 @@ def _run_web_text_step(
         max_chars=max_chars,
         browser_auth_state_file=browser_auth_state_file,
         browser_user_data_dir=browser_user_data_dir,
+        chrome_debug_port=chrome_debug_port,
     )
     return summary
 
@@ -775,6 +777,7 @@ def run_daily_etl(
     web_text_request_retry_backoff: float = DEFAULT_WEB_TEXT_REQUEST_RETRY_BACKOFF,
     browser_auth_state_file: Optional[str] = None,
     browser_user_data_dir: Optional[str] = None,
+    chrome_debug_port: Optional[int] = None,
     browser_parser_max_snapshots_per_url: int = (
         DEFAULT_BROWSER_PARSER_MAX_SNAPSHOTS_PER_URL
     ),
@@ -966,6 +969,7 @@ def run_daily_etl(
                 max_chars=web_text_max_chars,
                 browser_auth_state_file=browser_auth_state_file,
                 browser_user_data_dir=browser_user_data_dir,
+                chrome_debug_port=chrome_debug_port,
             ),
             retries=max(0, retries),
             retry_delay_seconds=retry_delay_seconds,
@@ -1235,6 +1239,17 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--chrome-debug-port",
+        type=int,
+        default=None,
+        help=(
+            "Route web-text fetches and session validation through a running "
+            "real Chrome instance via CDP on this port (e.g. 9222). Required "
+            "for PrizePicks (Cloudflare/PerimeterX/DataDome bypass). Chrome "
+            "must be launched with --remote-debugging-port=PORT."
+        ),
+    )
+    parser.add_argument(
         "--browser-parser-max-snapshots-per-url",
         type=int,
         default=DEFAULT_BROWSER_PARSER_MAX_SNAPSHOTS_PER_URL,
@@ -1370,13 +1385,18 @@ def main() -> None:
             print("WARNING: Session was not saved. ETL will proceed without auth.")
             auth_state = None
 
-    if args.validate_session_before_etl and auth_state and web_text_urls:
+    if (
+        args.validate_session_before_etl
+        and (auth_state or args.chrome_debug_port is not None)
+        and web_text_urls
+    ):
         test_url = web_text_urls[0]
         print(f"Validating session against {test_url} ...")
         validation = validate_session(
             test_url=test_url,
-            auth_state_file=auth_state,
+            auth_state_file=auth_state or "",
             user_data_dir=args.browser_user_data_dir,
+            chrome_debug_port=args.chrome_debug_port,
         )
         if validation.get("valid"):
             print("Session is valid -- proceeding with authenticated ingestion.")
@@ -1425,6 +1445,7 @@ def main() -> None:
         web_text_request_retry_backoff=args.web_text_request_retry_backoff,
         browser_auth_state_file=auth_state or args.browser_auth_state_file,
         browser_user_data_dir=args.browser_user_data_dir,
+        chrome_debug_port=args.chrome_debug_port,
         browser_parser_max_snapshots_per_url=(
             args.browser_parser_max_snapshots_per_url
         ),

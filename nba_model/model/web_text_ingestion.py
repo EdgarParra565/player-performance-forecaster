@@ -1115,7 +1115,7 @@ def _fetch_url_text_with_browser(
     chrome_debug_port: Optional[int] = None,
 ) -> dict:
     """Fetch one URL in browser context, optionally with persisted session state."""
-    if chrome_debug_port:
+    if chrome_debug_port is not None:
         return _fetch_url_text_via_cdp(
             url=url,
             chrome_debug_port=chrome_debug_port,
@@ -1198,6 +1198,7 @@ def _fetch_url_text(
     max_chars: int,
     browser_auth_state_file: Optional[str] = None,
     browser_user_data_dir: Optional[str] = None,
+    chrome_debug_port: Optional[int] = None,
 ) -> dict:
     """Fetch one URL with retry policy and return normalized text payload."""
     attempts = max(1, int(retries) + 1)
@@ -1206,6 +1207,7 @@ def _fetch_url_text(
     use_browser = bool(
         str(browser_auth_state_file or "").strip()
         or str(browser_user_data_dir or "").strip()
+        or chrome_debug_port is not None
     )
     last_error: Optional[Exception] = None
 
@@ -1219,6 +1221,7 @@ def _fetch_url_text(
                     max_chars=max_chars,
                     browser_auth_state_file=browser_auth_state_file,
                     browser_user_data_dir=browser_user_data_dir,
+                    chrome_debug_port=chrome_debug_port,
                 )
             return _fetch_url_text_with_requests(
                 url=url,
@@ -1260,11 +1263,13 @@ def fetch_and_store_web_text(
     user_agent: str = DEFAULT_WEB_TEXT_USER_AGENT,
     browser_auth_state_file: Optional[str] = None,
     browser_user_data_dir: Optional[str] = None,
+    chrome_debug_port: Optional[int] = None,
 ) -> dict:
     """Fetch text snapshots for URLs and store into web_text_snapshots table."""
     use_browser = bool(
         str(browser_auth_state_file or "").strip()
         or str(browser_user_data_dir or "").strip()
+        or chrome_debug_port is not None
     )
     normalized_urls = _normalize_urls(urls or [])
     if not normalized_urls:
@@ -1334,6 +1339,7 @@ def fetch_and_store_web_text(
                 max_chars=max_chars,
                 browser_auth_state_file=browser_auth_state_file,
                 browser_user_data_dir=browser_user_data_dir,
+                chrome_debug_port=chrome_debug_port,
             )
             snapshot_records.append(record)
             fetched_count += 1
@@ -1513,7 +1519,8 @@ def main():
         result = extract_session_via_cdp(
             url=args.connect_chrome,
             auth_state_file=state_file,
-            debug_port=args.chrome_debug_port or 9222,
+            debug_port=(9222 if args.chrome_debug_port is None
+                        else args.chrome_debug_port),
         )
         print("CDP session extraction result:")
         for key, val in result.items():

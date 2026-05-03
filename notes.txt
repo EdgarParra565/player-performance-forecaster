@@ -1,6 +1,6 @@
 # NBA Player Performance Forecaster - Working Notes
 
-Last updated: 2026-04-14
+Last updated: 2026-05-03
 
 This file is the active project tracker. It keeps only:
 - current architecture
@@ -12,6 +12,69 @@ This file is the active project tracker. It keeps only:
 Near-term objective:
 - increase historical coverage quality (game logs + line snapshots + aligned predictions)
 - select production defaults from real benchmark outputs
+- expand the Player Charts UI as the marquee analysis surface
+---
+
+## 0) End-of-Day Status (2026-05-03)
+
+### Added/fixed today
+- [x] Wired `--chrome-debug-port` end-to-end through `daily_etl.py`: forwarded into `_run_web_text_step`, `run_daily_etl`, `fetch_and_store_web_text`, `_fetch_url_text`, and the `--validate-session-before-etl` path. PrizePicks ETL is now reachable from the daily pipeline.
+- [x] Fixed gating bug: `--validate-session-before-etl` previously required `--browser-auth-state-file`; now it triggers when EITHER `auth_state` OR `chrome_debug_port` is set, since CDP-only flows hold session inside the running Chrome.
+- [x] Added new "Operations" tab to `simple_ui.py` driving every CLI: Daily ETL, Web Text (login/validate/fetch/connect-chrome/extract-chrome/sync-active-players), Browser Prop Parser, Evaluation suite (real-data benchmark, distribution sweep, line comparison, monthly diagnostics), Reverse-Engineering. Subprocess streamed live with Stop button (sends SIGTERM to process group).
+- [x] Added new "Player Charts" tab — recent-N-games chart, distribution histogram with multi-distribution overlay (normal/poisson/neg-binomial), per-book vertical line markers, hit-rate-vs-book-lines bar chart with break-even marker, home/away + rest-day splits figure, EV per book in summary text, custom-line probe (user enters line + American odds → fitted P(over), historical over-rate, EV per unit, +EV/-EV verdict).
+- [x] Added `nba_model/visualization/player_charts.py`: pure data + Figure helpers (`fetch_player_chart_data`, `build_recent_games_figure`, `build_distribution_figure`, `build_hit_rate_figure`, `build_splits_figure`, `compute_home_away_split`, `compute_rest_days_split`, `evaluate_custom_line`, `book_lines_summary_text`).
+
+### Player Charts feature — what to expand next (HIGH PRIORITY, this is the marquee feature)
+
+**Charts to add:**
+- [ ] Stat-vs-opponent-defense scatter (filter by opponent team; overlay `team_defense.def_rating`)
+- [ ] Box-and-whisker / quantile chart per stat (visualize spread, outliers, IQR)
+- [ ] Cumulative line-vs-actual ribbon: walks game-by-game showing each book's line vs actual outcome (over/under streak visualization)
+- [ ] Pace + minutes-projected chart: per-minute productivity overlaid with projected minutes from `minutes_projection.py`
+- [ ] Heatmap by month / day-of-week (calendar view of stat performance)
+- [ ] Multi-player overlay: stack 2-3 players' distributions to compare for parlays
+- [ ] Trend / form panel: last-5 vs season avg KPI cards with delta arrows
+- [ ] Confidence-interval band on rolling-mean line (bootstrap or analytic CI)
+- [ ] Live odds-movement timeline using `betting_line_snapshots` (line drift + sharp/public splits)
+
+**Splits to add:**
+- [ ] vs specific opponent (filter by `matchup` LIKE pattern)
+- [ ] Win/loss split (use `result` column)
+- [ ] Starter vs bench (heuristic from minutes >= 20)
+- [ ] Pre-/post-All-Star, pre-/post-trade-deadline (date-bucketed)
+- [ ] Performance by spread bucket (use `betting_line_snapshots` market spread)
+
+**Decisional / EV features:**
+- [ ] Kelly stake suggestion for +EV bets (already have probability + odds)
+- [ ] Multi-book best-line picker: highlight book with best EV for over and best for under
+- [ ] Compare model EV (current `predictions` table) against fitted-from-data EV
+- [ ] CLV proxy (line-move from `betting_line_snapshots` close vs picked line)
+- [ ] Parlay correlation visualizer: pull `correlation_calibration.py` matrix into a heatmap
+
+**UI / UX:**
+- [ ] Player autocomplete with fuzzy match across both DB players and `nba_api` static list
+- [ ] Save-snapshot button (export figure + summary as PNG / CSV)
+- [ ] "Watchlist": pin players for quick re-check; persist to a small JSON
+- [ ] Refresh button to re-pull from DB without changing selections
+- [ ] Async data fetch (currently synchronous — UI freezes on slow DB queries)
+- [ ] Keyboard shortcut: Enter on entry → Show charts
+- [ ] Date-range picker (instead of "last N games") so user can scope to a period
+
+**Data quality / coverage:**
+- [ ] Many `players.team` fields are null — backfill from latest game_logs `matchup`
+- [ ] Pull most-recent line per book per UPCOMING game (not "max(game_date)") once we have a current-game reference
+- [ ] Surface staleness: show "line scraped X hours ago" in summary
+- [ ] Tests: add `test_player_charts.py` for fetch/build helpers (currently only smoke-tested manually)
+
+### Web-text / ETL items still open from 2026-04-14
+- [ ] Add auto-reconnect logic when Chrome closes unexpectedly during a long ETL run
+- [ ] Investigate whether UnderDog has the same multi-layer bot protection or if Playwright + stealth patches are sufficient
+
+### Remaining limitations (unchanged)
+- [ ] PrizePicks CDP fetch requires Chrome to remain open with `--remote-debugging-port=9222` for the duration of any scrape run — not suitable for fully unattended/cron automation
+- [ ] `--extract-chrome-session` (pycookiecheat path) extracts cookies but NOT localStorage JWT tokens; only the CDP `--connect-chrome` path captures the full session
+- [ ] DataDome / PerimeterX cookies are fingerprint-bound — session state saved from Chrome cannot be replayed in a headless Playwright context even if all cookies are present
+
 ---
 
 ## 0) End-of-Day Status (2026-04-14)
@@ -63,7 +126,7 @@ open -na "Google Chrome" --args \
 ```
 
 ### Needs work next
-- [ ] Wire `--chrome-debug-port` through `daily_etl.py` so the ETL pipeline can use the CDP fetch path for PrizePicks
+- [x] Wire `--chrome-debug-port` through `daily_etl.py` so the ETL pipeline can use the CDP fetch path for PrizePicks (threaded into `_run_web_text_step`, `run_daily_etl`, `fetch_and_store_web_text`, `_fetch_url_text`, and the `--validate-session-before-etl` path)
 - [ ] Add auto-reconnect logic when Chrome closes unexpectedly during a long ETL run
 - [ ] Investigate whether UnderDog has the same multi-layer bot protection or if Playwright + stealth patches are sufficient
 
@@ -200,10 +263,21 @@ player-performance-forecaster/
 - [x] IP-based geolocation in login browser context (resolves PrizePicks location gate)
 - [x] `--extract-chrome-session URL` command via `pycookiecheat` (cookie-only fallback, requires Chrome closed)
 - [x] Login browser: removed periodic CDP save loop (was resetting Cloudflare challenges); now saves once on browser close via `threading.Event`
+- [x] Desktop UI "Operations" tab: every CLI launchable from `simple_ui.py` with live subprocess streaming + Stop button (Daily ETL, Web Text suite, Browser Parser, Evaluation suite, Reverse-Engineering)
+- [x] Desktop UI "Player Charts" tab (marquee feature): per-player game logs + distribution + book-line overlays + multi-distribution overlay + hit-rate-vs-lines + home/away + rest-day splits + EV per book + custom-line probe with +EV/-EV verdict
+- [x] `nba_model/visualization/player_charts.py` module: pure data + Figure helpers usable from any frontend
 
 ---
 
 ## 3) Current Active Priorities (Do Next)
+
+### 0. Player Charts expansion (NEW — marquee feature)
+See "Player Charts feature - what to expand next" block in the End-of-Day 2026-05-03
+section above. Top three to do first:
+- [ ] Stat-vs-opponent-defense scatter (use `team_defense.def_rating` per game)
+- [ ] Live odds-movement timeline from `betting_line_snapshots`
+- [ ] `test_player_charts.py` covering data fetch + each figure builder + EV math
+
 
 ### A. Run and review real benchmarks (highest priority)
 - [ ] Run `run_real_data_benchmark.py` on 10+ players with windows `5/7/10/15`
