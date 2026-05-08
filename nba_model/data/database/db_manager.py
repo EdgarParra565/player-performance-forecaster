@@ -3,10 +3,37 @@ import logging
 import sqlite3
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 import pandas as pd
 
 logger = logging.getLogger(__name__)
+
+
+def _safe_int(value):
+    """Coerce ``value`` to int, returning None on failure or NaN."""
+    if value is None:
+        return None
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return None
+    if f != f:  # NaN
+        return None
+    return int(f)
+
+
+def _safe_float(value):
+    """Coerce ``value`` to float, returning None on failure or NaN."""
+    if value is None:
+        return None
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return None
+    if f != f:
+        return None
+    return f
 
 
 class DatabaseManager:
@@ -116,7 +143,16 @@ class DatabaseManager:
             )
         """
 
+        # SECURITY (data poisoning defense): drop scraper-poisoned rows that
+        # claim a structurally implausible line/odds. The scrapers are the
+        # only third-party-influenced surface; even one bad row pollutes the
+        # consensus mean + EV math for every user. The validator's range is
+        # deliberately generous - real outliers pass, deliberate bad data
+        # (negative lines, 9999.5 points, nan, inf, odds=0) gets dropped.
+        from nba_model.web.input_validation import is_plausible_betting_line
+
         payload = []
+        rejected_implausible = 0
         for rec in records:
             row = (
                 rec.get("player_id"),
@@ -128,6 +164,11 @@ class DatabaseManager:
                 rec.get("under_odds"),
             )
             if not all([row[0], row[1], row[2], row[3]]) or row[4] is None:
+                continue
+            if not is_plausible_betting_line(
+                row[3], row[4], over_odds=row[5], under_odds=row[6],
+            ):
+                rejected_implausible += 1
                 continue
             payload.append(row + row)
 
@@ -143,14 +184,21 @@ class DatabaseManager:
         self.conn.commit()
         inserted = self.conn.total_changes - before_changes
         ignored = len(payload) - inserted
+        if rejected_implausible:
+            logger.warning(
+                "Dropped %s implausible betting_lines rows (likely scraper "
+                "poisoning); see input_validation.is_plausible_betting_line",
+                rejected_implausible,
+            )
         logger.info(
-            "Inserted %s betting_lines rows (%s duplicates ignored)",
-            inserted,
-            ignored,
+            "Inserted %s betting_lines rows (%s duplicates ignored, "
+            "%s implausible)",
+            inserted, ignored, rejected_implausible,
         )
         return {
             "inserted": int(inserted),
             "duplicates_ignored": int(ignored),
+            "rejected_implausible": int(rejected_implausible),
             "attempted": int(len(payload)),
         }
 
@@ -528,16 +576,447 @@ class DatabaseManager:
             "attempted": int(len(payload)),
         }
 
+    def get_consensus_prop_lines(
+        self,
+        player_name=None,
+        stat_type=None,
+        side=None,
+        since_hours=None,
+        min_books=1,
+    ):
+        """Return cross-book consensus line values from web_prop_cards.
+
+        For each (player, stat, side) the latest line from each book is
+        selected (so a single book can't be double-counted), then averaged
+        across books.  Returns rows with the mean line, the number of
+        contributing books, and the comma-separated book list.
+
+        Args:
+            player_name: optional case-insensitive filter on player_name.
+            stat_type: optional case-insensitive filter on stat_type.
+            side: optional 'over' / 'under' filter; default returns both.
+            since_hours: only include cards observed within the last N hours.
+            min_books: drop rows with fewer than this many contributing books.
+        """
+        clauses = ["player_classification = 'active_nba'"]
+        params: list = []
+        if player_name:
+            clauses.append("lower(player_name) = lower(?)")
+            params.append(str(player_name).strip())
+        if stat_type:
+            clauses.append("lower(stat_type) = lower(?)")
+            params.append(str(stat_type).strip())
+        if side:
+            clauses.append("lower(side) = lower(?)")
+            params.append(str(side).strip())
+        if since_hours is not None:
+            try:
+                hours = float(since_hours)
+            except (TypeError, ValueError):
+                hours = None
+            if hours and hours > 0:
+                clauses.append(
+                    "observed_at_utc >= datetime('now', ?)"
+                )
+                params.append(f"-{hours} hours")
+        where_sql = " AND ".join(clauses) if clauses else "1=1"
+
+        query = f"""
+            WITH latest_per_book AS (
+                SELECT
+                    player_name,
+                    stat_type,
+                    side,
+                    book,
+                    line_value,
+                    observed_at_utc,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY lower(player_name), lower(stat_type), lower(side), lower(book)
+                        ORDER BY observed_at_utc DESC, card_id DESC
+                    ) AS rn
+                FROM web_prop_cards
+                WHERE {where_sql}
+            )
+            SELECT
+                player_name,
+                stat_type,
+                side,
+                AVG(line_value)               AS mean_line,
+                MIN(line_value)               AS min_line,
+                MAX(line_value)               AS max_line,
+                COUNT(DISTINCT lower(book))   AS n_books,
+                GROUP_CONCAT(DISTINCT book)   AS books,
+                MAX(observed_at_utc)          AS latest_observed_at
+            FROM latest_per_book
+            WHERE rn = 1
+            GROUP BY lower(player_name), lower(stat_type), lower(side)
+            HAVING n_books >= ?
+            ORDER BY player_name ASC, stat_type ASC, side ASC
+        """
+        params.append(int(max(1, min_books)))
+        rows = self.conn.execute(query, tuple(params)).fetchall()
+        return [
+            {
+                "player_name": row[0],
+                "stat_type": row[1],
+                "side": row[2],
+                "mean_line": float(row[3]) if row[3] is not None else None,
+                "min_line": float(row[4]) if row[4] is not None else None,
+                "max_line": float(row[5]) if row[5] is not None else None,
+                "n_books": int(row[6] or 0),
+                "books": str(row[7] or ""),
+                "latest_observed_at": row[8],
+            }
+            for row in rows
+        ]
+
+    def insert_web_team_lines(self, records):
+        """Insert game-level team lines with dedupe via record_sha256."""
+        if not records:
+            return {"inserted": 0, "attempted": 0}
+
+        query = """
+            INSERT OR IGNORE INTO web_team_lines (
+                snapshot_id, source_url, book, observed_at_utc,
+                away_team, home_team, market_type, side, team,
+                line_value, odds_american,
+                parse_confidence, raw_text, parser_version, record_sha256
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """
+        payload = []
+        for rec in records:
+            try:
+                snapshot_id = int(rec.get("snapshot_id"))
+                parse_confidence = float(rec.get("parse_confidence"))
+            except (TypeError, ValueError):
+                continue
+            line_value = rec.get("line_value")
+            try:
+                line_value = float(line_value) if line_value is not None else None
+            except (TypeError, ValueError):
+                line_value = None
+            odds = rec.get("odds_american")
+            try:
+                odds = int(odds) if odds is not None else None
+            except (TypeError, ValueError):
+                odds = None
+
+            row = (
+                snapshot_id,
+                str(rec.get("source_url", "")).strip(),
+                str(rec.get("book", "")).strip(),
+                str(rec.get("observed_at_utc", "")).strip(),
+                str(rec.get("away_team", "")).strip(),
+                str(rec.get("home_team", "")).strip(),
+                str(rec.get("market_type", "")).strip(),
+                str(rec.get("side", "")).strip(),
+                (str(rec.get("team", "")).strip() or None),
+                line_value,
+                odds,
+                parse_confidence,
+                (str(rec.get("raw_text", "")).strip() or None),
+                str(rec.get("parser_version", "")).strip(),
+                str(rec.get("record_sha256", "")).strip(),
+            )
+            # Required: source_url, book, observed_at_utc, both teams,
+            # market_type, side, parser_version, record_sha256.
+            if not all([row[1], row[2], row[3], row[4], row[5], row[6], row[7], row[13], row[14]]):
+                continue
+            payload.append(row)
+
+        if not payload:
+            return {"inserted": 0, "attempted": 0}
+
+        before = self.conn.total_changes
+        self.conn.executemany(query, payload)
+        self.conn.commit()
+        inserted = self.conn.total_changes - before
+        logger.info("Inserted %s web_team_lines rows", inserted)
+        return {"inserted": int(inserted), "attempted": int(len(payload))}
+
+    def get_consensus_team_lines(
+        self,
+        away_team=None,
+        home_team=None,
+        market_type=None,
+        side=None,
+        since_hours=None,
+        min_books=1,
+    ):
+        """Return cross-book consensus for game-level markets.
+
+        For each (away_team, home_team, market_type, side) the latest line
+        from each book is selected, then averaged across books.  Returns one
+        row per (game, market, side) with mean line, mean odds, and the
+        list of contributing books.
+        """
+        clauses: list[str] = []
+        params: list = []
+        if away_team:
+            clauses.append("lower(away_team) = lower(?)")
+            params.append(str(away_team).strip())
+        if home_team:
+            clauses.append("lower(home_team) = lower(?)")
+            params.append(str(home_team).strip())
+        if market_type:
+            clauses.append("lower(market_type) = lower(?)")
+            params.append(str(market_type).strip())
+        if side:
+            clauses.append("lower(side) = lower(?)")
+            params.append(str(side).strip())
+        if since_hours is not None:
+            try:
+                hours = float(since_hours)
+            except (TypeError, ValueError):
+                hours = None
+            if hours and hours > 0:
+                clauses.append("observed_at_utc >= datetime('now', ?)")
+                params.append(f"-{hours} hours")
+        where_sql = (" AND ".join(clauses)) if clauses else "1=1"
+
+        query = f"""
+            WITH latest_per_book AS (
+                SELECT
+                    away_team, home_team, market_type, side, team,
+                    book, line_value, odds_american, observed_at_utc,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY lower(away_team), lower(home_team),
+                                     lower(market_type), lower(side), lower(book)
+                        ORDER BY observed_at_utc DESC, line_id DESC
+                    ) AS rn
+                FROM web_team_lines
+                WHERE {where_sql}
+            )
+            SELECT
+                away_team, home_team, market_type, side,
+                AVG(line_value)              AS mean_line,
+                MIN(line_value)              AS min_line,
+                MAX(line_value)              AS max_line,
+                AVG(odds_american)           AS mean_odds,
+                COUNT(DISTINCT lower(book))  AS n_books,
+                GROUP_CONCAT(DISTINCT book)  AS books,
+                MAX(observed_at_utc)         AS latest_observed_at
+            FROM latest_per_book
+            WHERE rn = 1
+            GROUP BY lower(away_team), lower(home_team),
+                     lower(market_type), lower(side)
+            HAVING n_books >= ?
+            ORDER BY home_team, away_team, market_type, side
+        """
+        params.append(int(max(1, min_books)))
+        rows = self.conn.execute(query, tuple(params)).fetchall()
+        return [
+            {
+                "away_team": row[0],
+                "home_team": row[1],
+                "market_type": row[2],
+                "side": row[3],
+                "mean_line": float(row[4]) if row[4] is not None else None,
+                "min_line": float(row[5]) if row[5] is not None else None,
+                "max_line": float(row[6]) if row[6] is not None else None,
+                "mean_odds": float(row[7]) if row[7] is not None else None,
+                "n_books": int(row[8] or 0),
+                "books": str(row[9] or ""),
+                "latest_observed_at": row[10],
+            }
+            for row in rows
+        ]
+
+    def insert_games(self, records):
+        """Upsert team-game rows (one per team per game).
+
+        ``records`` is an iterable of dicts with the columns from the
+        ``games`` table. Existing (game_id, team_id) rows are replaced so
+        a fresh nba_api fetch always reflects the latest scores/results.
+        """
+        if not records:
+            return {"inserted": 0, "attempted": 0}
+        query = """
+            INSERT OR REPLACE INTO games (
+                game_id, season, season_type, game_date,
+                team_id, team_abbrev, team_name,
+                matchup, home_away, opponent_abbrev, result,
+                pts, opp_pts, plus_minus,
+                fg_pct, fg3_pct, ft_pct,
+                rebounds, assists, steals, blocks, turnovers,
+                last_updated
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """
+        now = datetime.utcnow().isoformat()
+        payload = []
+        for rec in records:
+            try:
+                game_id = str(rec.get("game_id") or "").strip()
+                team_id = int(rec.get("team_id"))
+            except (TypeError, ValueError):
+                continue
+            if not game_id or not team_id:
+                continue
+            payload.append((
+                game_id,
+                str(rec.get("season") or "").strip(),
+                str(rec.get("season_type") or "").strip(),
+                str(rec.get("game_date") or "").strip(),
+                team_id,
+                str(rec.get("team_abbrev") or "").strip().upper(),
+                rec.get("team_name") or None,
+                rec.get("matchup") or None,
+                rec.get("home_away") or None,
+                rec.get("opponent_abbrev") or None,
+                rec.get("result") or None,
+                _safe_int(rec.get("pts")),
+                _safe_int(rec.get("opp_pts")),
+                _safe_int(rec.get("plus_minus")),
+                _safe_float(rec.get("fg_pct")),
+                _safe_float(rec.get("fg3_pct")),
+                _safe_float(rec.get("ft_pct")),
+                _safe_int(rec.get("rebounds")),
+                _safe_int(rec.get("assists")),
+                _safe_int(rec.get("steals")),
+                _safe_int(rec.get("blocks")),
+                _safe_int(rec.get("turnovers")),
+                now,
+            ))
+        if not payload:
+            return {"inserted": 0, "attempted": 0}
+        before = self.conn.total_changes
+        self.conn.executemany(query, payload)
+        self.conn.commit()
+        inserted = self.conn.total_changes - before
+        logger.info("Upserted %s rows into games", inserted)
+        return {"inserted": int(inserted), "attempted": int(len(payload))}
+
+    def get_recent_games(
+        self,
+        n: int = 100,
+        season: Optional[str] = None,
+        season_type: Optional[str] = None,
+        team_abbrev: Optional[str] = None,
+    ):
+        """Return recent NBA games as one row per matchup (away vs home).
+
+        Joins the two team-rows per game_id back together so callers get a
+        single row per game with both team names + scores + winner.
+        """
+        clauses = []
+        params: list = []
+        if season:
+            clauses.append("a.season = ?")
+            params.append(season)
+        if season_type:
+            clauses.append("a.season_type = ?")
+            params.append(season_type)
+        if team_abbrev:
+            clauses.append("(a.team_abbrev = ? OR h.team_abbrev = ?)")
+            tt = team_abbrev.upper()
+            params.extend([tt, tt])
+        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        query = f"""
+            SELECT
+                a.game_id, a.game_date, a.season, a.season_type,
+                a.team_abbrev AS away_abbrev, a.team_name AS away_name,
+                a.pts AS away_pts,
+                h.team_abbrev AS home_abbrev, h.team_name AS home_name,
+                h.pts AS home_pts,
+                a.matchup AS matchup,
+                CASE
+                    WHEN a.pts IS NULL OR h.pts IS NULL THEN NULL
+                    WHEN a.pts > h.pts THEN a.team_abbrev
+                    WHEN h.pts > a.pts THEN h.team_abbrev
+                    ELSE 'TIE'
+                END AS winner
+            FROM games a
+            JOIN games h
+              ON h.game_id = a.game_id
+             AND h.team_id != a.team_id
+             AND a.home_away = 'away'
+             AND h.home_away = 'home'
+            {where}
+            ORDER BY a.game_date DESC, a.game_id DESC
+            LIMIT ?
+        """
+        params.append(int(max(1, n)))
+        return [dict(zip(
+            ["game_id", "game_date", "season", "season_type",
+             "away_abbrev", "away_name", "away_pts",
+             "home_abbrev", "home_name", "home_pts",
+             "matchup", "winner"],
+            row,
+        )) for row in self.conn.execute(query, tuple(params)).fetchall()]
+
+    def get_player_recent_results(
+        self,
+        n: int = 200,
+        player_id: Optional[int] = None,
+        team_abbrev: Optional[str] = None,
+        stat: Optional[str] = None,
+        min_value: Optional[float] = None,
+        season: Optional[str] = None,
+    ):
+        """Return recent player game-log rows joined with player names.
+
+        Uses ``nba_active_players_ref`` for the canonical name (530 rows)
+        with a fallback to the sparse ``players`` table.  Optional filters
+        let the frontend slice by player, team, season, or "show me players
+        with at least N points last game".
+        """
+        clauses = []
+        params: list = []
+        if player_id is not None:
+            clauses.append("g.player_id = ?")
+            params.append(int(player_id))
+        if team_abbrev:
+            clauses.append("upper(trim(substr(g.matchup, 1, instr(g.matchup, ' ') - 1))) = ?")
+            params.append(team_abbrev.upper())
+        if season:
+            clauses.append("g.season = ?")
+            params.append(season)
+        if stat and min_value is not None:
+            allowed = {"points", "rebounds", "assists", "steals", "blocks",
+                       "turnovers", "fg3m", "minutes"}
+            stat_col = stat.lower()
+            if stat_col in allowed:
+                clauses.append(f"g.{stat_col} >= ?")
+                params.append(float(min_value))
+        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        query = f"""
+            SELECT
+                g.player_id,
+                COALESCE(r.player_name, p.name, 'Player ' || g.player_id) AS player_name,
+                g.game_id, g.game_date, g.season,
+                g.matchup, g.home_away, g.result,
+                g.minutes, g.points, g.rebounds, g.assists,
+                g.steals, g.blocks, g.turnovers,
+                g.fgm, g.fga, g.fg3m, g.fg3a, g.ftm, g.fta,
+                g.plus_minus
+            FROM game_logs g
+            LEFT JOIN nba_active_players_ref r ON r.player_id = g.player_id
+            LEFT JOIN players p ON p.player_id = g.player_id
+            {where}
+            ORDER BY g.game_date DESC, g.player_id ASC
+            LIMIT ?
+        """
+        params.append(int(max(1, n)))
+        cols = ["player_id", "player_name", "game_id", "game_date", "season",
+                "matchup", "home_away", "result",
+                "minutes", "points", "rebounds", "assists",
+                "steals", "blocks", "turnovers",
+                "fgm", "fga", "fg3m", "fg3a", "ftm", "fta", "plus_minus"]
+        return [dict(zip(cols, row))
+                for row in self.conn.execute(query, tuple(params)).fetchall()]
+
     def insert_game_logs(self, game_logs_df):
         """
         Bulk insert game logs from DataFrame.
 
-        Args:
-            game_logs_df: DataFrame with columns matching game_logs table
+        Returns the number of newly-inserted rows (existing duplicates are
+        skipped via ``INSERT OR IGNORE``).
         """
         try:
             if game_logs_df is None or game_logs_df.empty:
-                return
+                return 0
 
             # Remove duplicates before inserting
             game_logs_df = game_logs_df.drop_duplicates(
@@ -556,7 +1035,7 @@ class DatabaseManager:
             ]
             if not columns:
                 logger.warning("No valid game_logs columns to insert")
-                return
+                return 0
 
             payload = game_logs_df[columns].where(
                 pd.notna(game_logs_df[columns]), None)
@@ -574,6 +1053,7 @@ class DatabaseManager:
             logger.info(
                 "Inserted %s game logs (%s duplicates ignored)", inserted, ignored
             )
+            return int(inserted)
         except Exception as e:
             logger.error("Error inserting game logs: %s", e)
             self.conn.rollback()

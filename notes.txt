@@ -1,6 +1,6 @@
 # NBA Player Performance Forecaster - Working Notes
 
-Last updated: 2026-05-03
+Last updated: 2026-05-08
 
 This file is the active project tracker. It keeps only:
 - current architecture
@@ -13,6 +13,93 @@ Near-term objective:
 - increase historical coverage quality (game logs + line snapshots + aligned predictions)
 - select production defaults from real benchmark outputs
 - expand the Player Charts UI as the marquee analysis surface
+- broaden cross-book consensus by activating more scrapers (currently 9 of 20)
+---
+
+## 0) End-of-Day Status (2026-05-08)
+
+### Added/fixed today
+
+**Per-book scraper package (refactor + expansion):**
+- [x] New `nba_model/scrapers/` package with `BookScraper` dataclass (`base.py`) + per-book modules. Each book exports `SCRAPER` describing wait selectors, session markers, optional JS extractor, optional player-prop preprocessor, optional team-line extractor, and aliases (rebrand domains).
+- [x] Migrated PrizePicks + Underdog regexes/preprocessors out of `browser_prop_parser.py`/`web_text_ingestion.py` into per-book files; old modules now consume the registry via `get_scraper_for_url()`. Public API preserved (tests + `daily_etl.py` import paths unchanged).
+- [x] **20 scrapers registered**: prizepicks, underdog, fliff, pick6, sleeper, dabble, parlayplay, draftkings, fanduel, betmgm, caesars, betrivers, fanatics, espnbet, hardrockbet, bovada, kalshi, oddsshark, vegasinsider, bettingpros.
+- [x] Domain resolver in `scrapers/__init__.py::get_scraper_for_url` now picks the longest-matching domain, so subdomain-specific scrapers (`pick6.draftkings.com`) win over their parent (`draftkings.com`). Added `aliases` field for rebrands (e.g. `underdogfantasy.com` → `underdogsports.com`; `fanatics.com` → `betfanatics.com`; `fanduel.com` → `sportsbook.fanduel.com`).
+- [x] Added `nba_model/scrapers/team_names.py` — canonical-team-name normalizer for cross-book joining (handles "NY Knicks" / "NYK" / "New York Knicks" / "Knicks" → "Knicks", plus Kalshi truncations like "Los Angeles L" → Lakers).
+
+**Working parsers (9 of 20 producing data):**
+- [x] PrizePicks player props — updated `_BOARD_RE` for new format `<pop>K <TEAM> - <POS> <Player> @ <OPP> <Day> <Time> <Line> <Stat> <Side>`. Added stat aliases for `3PTM` / `3-PT Made`. Live: 11 cards.
+- [x] Underdog player props — added `underdogsports.com` alias for the 2026 rebrand. Live: 20 cards.
+- [x] Pick6 player props — abbreviated-name expansion (`J. Brunson` → `Jalen Brunson` via `nba_active_players_ref`). Live: 23 cards.
+- [x] ParlayPlay player props — extracts median of alternate lines per (player, stat) so consensus gets one canonical line per stat. Live: 6 cards.
+- [x] BetMGM team lines — spread + total + moneyline regex against the basketball lobby. Live: 24 lines (4 NBA games × 6 markets).
+- [x] Caesars team lines — same shape. Live: 24 lines.
+- [x] DraftKings team lines — handles Unicode minus (U+2212) → ASCII. Live: 24 lines.
+- [x] Bovada team lines — `(odds)` parens format with full team names. Live: 24 lines.
+- [x] Kalshi moneylines — decimal-odds → American conversion; index page only shows moneylines. Live: 18 lines.
+- [x] Stub-only (config without parser): fliff, sleeper, dabble, fanduel, betrivers, fanatics, espnbet, hardrockbet, oddsshark, vegasinsider, bettingpros. Their fetch path runs and stores snapshots; parser is added once an authenticated NBA-page sample is captured.
+
+**Cross-book consensus + chart wiring:**
+- [x] Added `web_team_lines` table for game-level markets (spread/total/moneyline/team_total) with `(away_team, home_team, market_type, side)` cardinality and per-book de-duping by latest snapshot.
+- [x] Added `db.insert_web_team_lines()` and `db.get_consensus_team_lines(...)` (mean across books with `since_hours` filter, `n_books` count, contributing-book list).
+- [x] Added `model/team_line_parser.py` orchestrator (parallel to `browser_prop_parser.py`) that runs each book's `team_line_extractor` over recent snapshots.
+- [x] Switched `_market_consensus_line` from median to **mean** in `player_charts.py`; renamed `market_median_line` → `market_consensus_line` on `PlayerChartData` (kept old name as a backward-compat property for `simple_ui.py` + `web/app.py`).
+- [x] Fixed `_fetch_latest_book_lines` to join `web_prop_cards` directly by `player_name`, falling back to `nba_active_players_ref` (530 rows) instead of going through the sparse `players` table (94 rows). Added 48h lookback so stale snapshots don't pollute today's mean.
+- [x] Wired team-chart consensus: `fetch_team_chart_data` now calls `_fetch_latest_team_book_lines` which derives implied team total `(game_total - team_spread) / 2` per book (currently `stat_type=points` only — the only stat books surface at the lobby level).
+
+**NBA API ingestion (3 seasons of game results + player game logs):**
+- [x] New `nba_model/data/nba_results_ingestion.py` module:
+  - `ingest_games(seasons)` — bulk team-game results via `leaguegamefinder.LeagueGameFinder`. Derives `season_type` from `SEASON_ID` prefix so playoffs are tagged correctly.
+  - `ingest_player_game_logs(seasons)` — league-wide player logs via `playergamelogs.PlayerGameLogs` (one request per season; much faster than the legacy per-player path in `data_loader.py`).
+  - `ingest_all(...)` and CLI: `python -m nba_model.data.nba_results_ingestion --seasons 2025-26 2024-25 2023-24`.
+- [x] Added `games` table to `schema.sql` (one row per team per game; PK = `(game_id, team_id)`); added indexes on date / team / season.
+- [x] Added `db.insert_games(records)` (INSERT OR REPLACE), `db.get_recent_games(n, season, season_type, team_abbrev)` (joins both team-rows back into one matchup row with winner), `db.get_player_recent_results(...)` (league-wide player game-log query with optional stat-threshold filter, name lookup via `nba_active_players_ref`).
+- [x] **Live ingest data**: 8,344 team-game rows (4,170 unique games × 2 teams) + 91,065 player game-log rows across 1,091 distinct players for 2023-24, 2024-25, 2025-26 (regular season + playoffs). KAT went from 0 logs → 267.
+
+**Frontend surfaces (Streamlit + Tk):**
+- [x] Restructured Streamlit sidebar so **Player charts and Team charts are top-level peers** in both free + premium view options. Free tier: `Player charts | Team charts | Game Results | Player Stats Browse`. Premium adds: `All stats (overview) | Parlay analysis`.
+- [x] Removed paywall on team charts; free tier sees the same view restricted to `PREVIEW_STATS`.
+- [x] New Streamlit views: `_game_results_view` (filter by season / season type / team) and `_player_browse_view` (filter by season / team / stat threshold — e.g. "last 200 games where someone scored ≥ 30").
+- [x] New Tk tabs: `Game Results` + `Player Stats Browse` (ttk.Treeview tables with the same filter set as the web equivalents).
+- [x] Added query helpers to `player_charts.py`: `fetch_recent_games`, `fetch_player_recent_results`, `list_seasons`.
+
+**Input validation:**
+- [x] Extended `nba_model/web/input_validation.py` with new validators:
+  - `validate_stat_type(s, allowed=...)` — resolves aliases (`3pm` → `three_pointers_made`, `FGM` → `field_goals_made`); rejects unknown stats; optional `allowed` subset for tier gating.
+  - `validate_team_code(code)` — normalizes case/punctuation; rejects anything outside the 30 NBA codes.
+  - `validate_season(s)` — enforces `YYYY-YY` form; checks `end == (start + 1) mod 100` so `"2024-26"` is rejected.
+  - `validate_rolling_window(n, default=5)` — bounds rolling-mean window to `[1, 60]`; defaults blanks to 5.
+- [x] Applied all validators to Streamlit sidebar inputs, the new `_game_results_view` / `_player_browse_view`, and the equivalent Tk handlers (`_load_game_results`, `_load_player_browse`). Bad input shows a friendly `st.error` (web) or status-bar message (Tk) instead of stack-tracing.
+- [x] Made `db.insert_game_logs` return an int row count (was returning None) so the new ingester can report attempted/inserted symmetry with the other DB methods.
+
+**Tests added today (182 passing total, was 77 at session start):**
+- [x] `test_input_validation.py` — 14 tests covering all new validators (canonical, alias resolution, edge cases, tier filtering, season-segment math).
+- [x] `test_scrapers_consensus.py` — registry shape, URL routing (subdomain priority), and full scrape→parse→DB→consensus round-trip for player props.
+- [x] `test_team_lines.py` — team-name normalization, BetMGM/Caesars/DraftKings/Kalshi extractors, two-book consensus round-trip, latest-per-book deduping.
+
+**Late-day session work (security stress + AI threat model + chrome-debug-port fixes):**
+- [x] Hardened `chrome_debug_port` checks: replaced 5 truthiness tests in `web_text_ingestion.py` and `daily_etl.py` with `is not None` so `--chrome-debug-port 0` (typo) routes to CDP and fails loudly with `Cannot connect to Chrome on port 0` instead of silently falling back to the requests path.
+- [x] Locked down user-controllable `db_path` text input in the Streamlit sidebar — only visible to admin emails listed in `[auth].admins`. Prevents free-tier users from pointing the app at arbitrary SQLite files.
+- [x] **Layer-1 webhook hardening**: 256 KiB body cap before buffering, Stripe replay tolerance via `construct_event(tolerance=300)`, idempotent on event_id, `TrustedHostMiddleware`, FastAPI `docs_url=redoc_url=openapi_url=None`, generic 400 errors that don't echo exception bytes, no PII / payload bodies / emails in any log line.
+- [x] **Layer-2 OWASP-2025 hardening**: `SecurityHeadersMiddleware` (HSTS 2yr+preload, CSP `default-src 'none'`, X-Content-Type-Options nosniff, X-Frame-Options DENY, Referrer-Policy no-referrer, Permissions-Policy denying camera/mic/geo/payment, Cross-Origin-* same-origin); per-IP sliding-window rate limiter on `/stripe/webhook` (default 120/60s, env-tunable, 429 with `Retry-After`); `scripts/security_scan.sh` running `pip-audit` + `bandit` + secret-pattern grep; `scripts/backup_subscriptions.sh` using SQLite's online `.backup`; Data Retention / GDPR section in `docs/SECURITY.md`. Patched 6 transitive CVEs (pillow, python-dotenv, requests, pip).
+- [x] **Layer-3 stress + fuzz pass** (`test_security_stress.py`): concurrent rate-limiter thread safety, parallel subscription upsert deadlock check, email-validator fuzz (homoglyphs / header injection / 254-byte boundary / SQL metachars), webhook payload edge cases, DB resilience, 10k-IP rate-limiter memory + GC, 12 pathological signature-header forms, slowloris (`asyncio.wait_for` body-read timeout). **Found and fixed 5 real production bugs**: (1) Stripe SDK 15.x's `StripeObject` no longer subclasses `dict` so `obj.get("customer")` would have crashed every real event → added `_safe_get`; (2) punycode IDN domains (`xn--*`) accepted as emails (homograph attack) → rejected; (3) `ValueError` from `upsert` on bad email would have 500'd the webhook → caught and 200-rejected; (4) no body-read timeout (slowloris) → `asyncio.wait_for` 10s default → 408; (5) SQLite "database is locked" flake under 16-thread parallel upserts → process-wide one-time `journal_mode=WAL` flip behind `_INIT_LOCK` + `busy_timeout=5000`.
+- [x] **Layer-4 AI/ML threat-model pass**: documented which OWASP-AI-Top-10 items apply (input manipulation, data poisoning, compute DoS) and which don't (no LLM / no learned weights / no generative output). New `nba_model/web/input_validation.py`: `validate_line` (per-stat ranges, rejects NaN/inf/unknown stat), `validate_american_odds` (rejects 0/inf/extreme), `validate_n_games` (200-cap), `validate_n_sims` (200k cap, 1000 floor), `validate_parlay_legs_count` (2-6). `is_plausible_betting_line` runs at insert time in `db_manager.insert_betting_lines_records` so scraper-poisoned rows are dropped before they pollute consensus / EV math (rejected count returned in the insert summary). Found another bug: unknown stat types fell through to a generic 1000-cap range (poison vector) → fail-closed allowlist.
+- [x] **Final state**: 182/182 tests passing (was 174 at session start of this block); `bandit` MEDIUM/HIGH = 0; `pip-audit` clean; secret-grep clean; 30 consecutive stress runs flake-free; AI threat model documented in `docs/SECURITY.md` "AI threat model" section.
+
+### Known limitations (carry-forward)
+- Naive **American odds averaging** in `get_consensus_team_lines` produces wrong mean when book signs flip (e.g. +100, -105, -108 averages to -37.7). Should convert to implied probability first, then back. **Open follow-up.**
+- 11 of 20 scrapers are stub-only (no parser yet). Each just needs an authenticated NBA-page sample so the regex can be written following the same template as BetMGM/Caesars/DK.
+- The **`players` table is sparse** (94 rows vs. 530 active players). The chart code now falls back to `nba_active_players_ref` for name lookup, but a full sync of `players` would be cleaner.
+- Team-chart book reference is currently **points-only** — books don't surface assists/rebounds/etc. on the lobby page. Would need per-game click-through to populate `team_total` rows.
+
+### Workflow for adding the remaining 11 stub parsers
+1. Open the book's authenticated NBA prop board in real Chrome on `:9222`.
+2. Run `/tmp/scraper_audit.py` (or `live_scrape_full.py`) — it'll fetch + snapshot via CDP.
+3. Inspect the snapshot text in the DB: `SELECT text_content FROM web_text_snapshots WHERE source_url LIKE '%bookname%' ORDER BY fetched_at_utc DESC LIMIT 1`.
+4. Write a regex (or `team_line_extractor` for sportsbooks) following [pick6.py](nba_model/scrapers/pick6.py) (DFS) or [betmgm.py](nba_model/scrapers/betmgm.py) (sportsbook) as the template.
+5. Set `prop_preprocess=` or `team_line_extractor=` on the book's `SCRAPER`.
+6. Re-run the audit; cards/lines will start flowing into consensus automatically.
+
 ---
 
 ## 0) End-of-Day Status (2026-05-03)
@@ -51,7 +138,7 @@ Near-term objective:
 - [ ] CLV proxy (line-move from `betting_line_snapshots` close vs picked line)
 - [ ] Parlay correlation visualizer: pull `correlation_calibration.py` matrix into a heatmap
 
-**UI / UX:**
+**UI / UX (desktop tkinter):**
 - [ ] Player autocomplete with fuzzy match across both DB players and `nba_api` static list
 - [ ] Save-snapshot button (export figure + summary as PNG / CSV)
 - [ ] "Watchlist": pin players for quick re-check; persist to a small JSON
@@ -59,6 +146,26 @@ Near-term objective:
 - [ ] Async data fetch (currently synchronous — UI freezes on slow DB queries)
 - [ ] Keyboard shortcut: Enter on entry → Show charts
 - [ ] Date-range picker (instead of "last N games") so user can scope to a period
+
+**Deployment / auth / billing follow-ups:**
+- [ ] Migrate `subscriptions.py` from SQLite to managed Postgres (Neon / Supabase / Render Postgres). Streamlit Cloud has ephemeral disks so the SQLite path won't survive container restarts in production.
+- [ ] Add Stripe Customer Portal link so users can self-manage their subscription (cancel / update card) without contacting us.
+- [ ] Email-on-failure: webhook handler should alert the dev when `invoice.payment_failed` fires for a known-paying user.
+- [ ] Server-side admin dashboard listing active subscribers / MRR / churn (small Streamlit page gated to `[auth].admins`).
+- [ ] Stripe test-mode and live-mode toggle controlled by env, not by hand-editing keys.
+- [ ] Trial period: first 7 days premium for free on first sign-in, then auto-downgrade unless they upgrade.
+- [ ] Stronger preview limits: rate-limit anonymous and free users at the LB layer (Cloudflare Access or Streamlit Cloud auth-gating) to discourage scraping.
+- [ ] Move `data/database/nba_data.db` off the Streamlit Cloud container too -- it's mounted readonly in production today which means the daily ETL has to run elsewhere and push the DB blob in.
+
+**Web app (Streamlit) follow-ups:**
+- [ ] URL query-string state: encode selected player/stat/window in the URL so links are shareable and back-button preserves state
+- [ ] Multi-player compare page: pick 2-3 players, overlay their distributions on the same chart for parlay shopping
+- [ ] Promote the matplotlib charts to Plotly so hover/zoom/click-to-isolate works (keep the matplotlib path as fallback for tkinter desktop)
+- [ ] Add a "live ETL status" sidebar widget reading the latest `daily_etl_report_*.json` so the web app shows data freshness
+- [ ] Auth gate (password or magic link) before exposing the app on a public host — currently safe only on localhost
+- [ ] Dockerfile + `streamlit run` entrypoint so the app can be deployed to a VPS / fly.io / Streamlit Cloud
+- [ ] Persist a per-user watchlist via Streamlit's `session_state` + a small `watchlists.json` (or a new `watchlist` SQLite table)
+- [ ] CSV download buttons for: book-lines table, raw game-log table, custom-line probe history
 
 **Data quality / coverage:**
 - [ ] Many `players.team` fields are null — backfill from latest game_logs `matchup`
@@ -266,6 +373,21 @@ player-performance-forecaster/
 - [x] Desktop UI "Operations" tab: every CLI launchable from `simple_ui.py` with live subprocess streaming + Stop button (Daily ETL, Web Text suite, Browser Parser, Evaluation suite, Reverse-Engineering)
 - [x] Desktop UI "Player Charts" tab (marquee feature): per-player game logs + distribution + book-line overlays + multi-distribution overlay + hit-rate-vs-lines + home/away + rest-day splits + EV per book + custom-line probe with +EV/-EV verdict
 - [x] `nba_model/visualization/player_charts.py` module: pure data + Figure helpers usable from any frontend
+- [x] Streamlit web frontend at `nba_model/web/app.py` reusing the same figure builders: sidebar player switcher, KPI row (mu/sigma/n/market-median/+EV-book-count), 4 tabs (Overview / Splits / Hit Rate + Custom Line / Raw data), interactive book-lines table with progress-bar columns, custom-line probe form. Run: `.venv/bin/python3 -m streamlit run nba_model/web/app.py`
+- [x] Hardened `chrome_debug_port` checks: replaced 5 truthiness tests with `is not None` so port=0 (typo) routes to CDP and fails loudly instead of silently falling back to the requests path
+- [x] Added `nba_model/data/audit_db.py` and `data/DATABASE_INVENTORY.txt`: refreshable inventory of every table with row counts, team coverage parsed from `game_logs.matchup`, book x stat matrix for `betting_lines`/`web_prop_cards`, and a "Known data-quality flags" block. Wired into the desktop UI as Operations -> DB Audit (Refresh + Open buttons). Run from CLI: `.venv/bin/python3 -m nba_model.data.audit_db [--stdout] [--no-write]`
+- [x] **Production deployment scaffolding**: native OIDC sign-in (Google + Microsoft) via Streamlit `st.login` (1.42+); Stripe-powered membership tiers (Free preview vs Premium); SQLite subscription store at `data/database/subscriptions.db`; FastAPI webhook handler at `nba_model/web/webhook_app.py` that verifies Stripe signatures and updates the store on checkout/subscription/invoice events. New files: `nba_model/web/{auth,subscriptions,stripe_helpers,webhook_app}.py`, `.streamlit/secrets.toml.example`, `docs/DEPLOYMENT.md`. requirements.txt gained `streamlit>=1.42, stripe, fastapi, uvicorn[standard], authlib`.
+- [x] **Free vs Premium feature gating**: free users see only `Nikola Jokic` + `LeBron James`, points only, last 5 games, Single-stat view; everything else (All-stats overview, Team distributions, Parlay analysis, custom-line probe) shows a paywall with an Upgrade button. Admin emails listed in `[auth].admins` are forced premium without paying.
+- [x] **Security hardening pass + threat model**: locked down user-controllable `db_path` (admin-only), webhook body-size cap (256 KiB) before buffering, Stripe replay tolerance (300s default, env-tunable), TrustedHostMiddleware on the FastAPI webhook, FastAPI docs/openapi disabled in prod, subscription DB chmod 0600 + WAL + extension-loading disabled, defense-in-depth email regex+length check before SQL upserts, defensive allowlist assertion on the one f-string SQL fragment, no PII / payload bodies in logs, dependency versions pinned with `~=` plus `requirements.lock` for reproducible installs. All documented in `docs/SECURITY.md`. New regression tests in `nba_model/tests/test_security.py` (22 cases covering email validation, fail-closed tier resolution, webhook signature/oversize/replay, idempotency, SQL allowlist).
+- [x] **Layer-2 hardening (post-OWASP-2025 research pass)**: added the OWASP-recommended HTTP security headers as FastAPI middleware (HSTS 2yr+preload, CSP `default-src 'none'`, X-Content-Type-Options nosniff, X-Frame-Options DENY, Referrer-Policy no-referrer, Permissions-Policy denying camera/mic/geo/etc, Cross-Origin-* same-origin), plus a per-IP sliding-window rate limiter on `/stripe/webhook` (default 120/60s, env-tunable, returns 429 with `Retry-After` so Stripe's exponential-backoff retry kicks in). Added `scripts/security_scan.sh` running pip-audit + bandit + a secrets-pattern grep, `scripts/backup_subscriptions.sh` using SQLite's online `.backup`, and a Data Retention / GDPR section in `docs/SECURITY.md`. `requirements-dev.txt` adds `pip-audit` and `bandit`. Patched 6 transitive CVEs surfaced by pip-audit (pillow, python-dotenv, requests, pip). `bandit` MEDIUM/HIGH baseline is now zero; `pip-audit` reports "No known vulnerabilities". 7 new tests cover security headers, the Server-leak fix, and rate-limiter window/per-IP behavior. Total security regression suite: 29 tests, 131/131 in the full pytest run.
+- [x] **Layer-3 stress + fuzz pass** (`nba_model/tests/test_security_stress.py`, 26 cases): concurrent rate-limiter thread safety, parallel subscription upsert deadlock check, email-validator fuzz (homoglyphs / header injection / 254-byte boundary / SQL metacharacters / repeated `@`), webhook payload edge cases (no email / unknown event type / replay-too-old / poisoned email), DB resilience (corrupt file / missing table / non-traversal env path), 10k-IP rate-limiter memory + GC, TrustedHost rejection, signature-header fuzz (12 pathological forms), wrong-secret rejection, naive/garbage/epoch period_end handling, duplicate-event flood. **Found and fixed 4 real production bugs**: (1) Stripe SDK 15.x's `StripeObject` no longer subclasses `dict` so `obj.get("customer")` would have crashed every real event with `AttributeError` -> added `_safe_get`; (2) punycode IDN domains (`xn--*`) were accepted as emails (homograph attack vector) -> rejected; (3) `ValueError` from `upsert` on bad email would have 500'd the webhook and triggered infinite Stripe retries -> caught and 200-rejected; (4) no body-read timeout meant a slowloris attacker could exhaust workers -> added `asyncio.wait_for` (10s default, 408 on timeout). All findings + fixes documented in `docs/SECURITY.md`. Total tests now: 157/157.
+- [x] **Layer-4 AI/ML threat-model pass**: most OWASP-AI-Top-10 items target LLMs/neural nets and don't apply (no learned weights, no training-from-user, no generative output) but three **do** translate concretely: adversarial input manipulation, data poisoning, and compute DoS. New `nba_model/web/input_validation.py` module: `validate_line` with per-stat plausible ranges (rejects NaN/inf/unknown stat/9999.5 lines), `validate_american_odds` (rejects 0/inf/extreme), `validate_n_games` (200-cap), `validate_n_sims` (200k cap with 1000 floor), `validate_parlay_legs_count` (2-6). `is_plausible_betting_line` runs at insert time in `db_manager.insert_betting_lines_records` so scraper-poisoned rows ("Jokic 9999.5 points") are dropped before they pollute consensus mean / EV math. New `AdversarialInputTests`, `IngestionPoisoningTests`, `ComputeBoundsTests` classes in the stress suite. **Found and fixed 2 more real bugs**: unknown stat types fell through to a generic 1000-cap range (poison vector); SQLite "database is locked" flake under 16-thread parallel upserts (production analog: Stripe deliveries racing for the same email). Both fixed; 30 consecutive stress runs now flake-free. Final: 182/182 tests, scanners clean, AI threat model documented in `docs/SECURITY.md`.
+- [x] DB COVERAGE FACTS (as of 2026-05-08 audit): 11,675 game_logs across 181 distinct players from 2024-10-04 to 2025-06-22, all 30 NBA teams represented via parsed `matchup`. 2,493 betting_lines from 6 books (Bovada, BetRivers, DraftKings, BetMGM, BetOnline.ag, FanDuel) but only one game_date window (2026-03-14..15). 2,493 betting_line_snapshots, 30 team_defense rows for 2025-26, 268 predictions (POINTS ONLY -- assists/rebounds/pra missing), 120 web_prop_cards from underdog only.
+
+### Newly surfaced data-quality bugs (from the audit)
+- [ ] `players.team` is NULL for 93 of 94 rows -> Player Charts team-filter is broken (only LAL appears). Backfill from `game_logs.matchup` first-token (it's always TEAM as the first space-delimited token).
+- [ ] `predictions` covers only `points`. line_comparison + monthly_diagnostics will be sparse for assists/rebounds/pra until backfilled or the daily prediction job is widened.
+- [ ] `betting_lines` only has the 2026-03-14..15 window -- need a longer historical odds backfill before reverse-engineering can stabilize.
 
 ---
 

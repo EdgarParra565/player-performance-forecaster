@@ -1,4 +1,11 @@
-"""Parse visible web snapshot text into structured prop-card records."""
+"""Parse visible web snapshot text into structured prop-card records.
+
+Per-book regex / preprocessing lives under ``nba_model.scrapers``.  This
+module orchestrates: it pulls the visible-text snapshots from the DB, runs
+each registered book's preprocessor over them, applies a small set of
+generic ``Player Line Stat Side`` patterns, and writes the results to the
+``web_prop_cards`` table.
+"""
 
 import argparse
 import hashlib
@@ -8,6 +15,11 @@ from urllib.parse import urlparse
 
 from nba_model.data.database.db_manager import DatabaseManager
 from nba_model.model.web_text_ingestion import load_urls_from_file
+from nba_model.scrapers import SCRAPERS, get_scraper_for_url
+from nba_model.scrapers.base import NAME_STOP_WORDS
+# Re-exported for backward compatibility — tests import these from this module.
+from nba_model.scrapers.prizepicks import preprocess as _preprocess_prizepicks_text  # noqa: F401
+from nba_model.scrapers.underdog import preprocess as _preprocess_underdog_text  # noqa: F401
 
 PARSER_VERSION = "visible_text_v2"
 DEFAULT_MIN_PARSE_CONFIDENCE = 0.45
@@ -54,6 +66,8 @@ _STAT_ALIASES = {
     "ra": "ra",
     "threes": "three_pointers_made",
     "3pm": "three_pointers_made",
+    "3ptm": "three_pointers_made",
+    "3pt made": "three_pointers_made",
     "three pointers": "three_pointers_made",
     "three pointers made": "three_pointers_made",
     "steals": "steals",
@@ -89,65 +103,19 @@ _STAT_PATTERN = "|".join(
     for item in sorted(_STAT_ALIASES.keys(), key=len, reverse=True)
 )
 
-# Words that should never appear at the start of a player-name token.
-# Defined here (before _NAME_PATTERN) so _STOP_WORD_LOOKAHEAD can reference it.
-_NAME_STOP_WORDS = {
-    "and",
-    "nba",
-    "nfl",
-    "mlb",
-    "pick",
-    "pickem",
-    "higher",
-    "lower",
-    "over",
-    "under",
-    "more",
-    "less",
-    "loading",
-    "login",
-    "signin",
-    "sign",
-    "edt",
-    "est",
-    "cdt",
-    "cst",
-    "pdt",
-    "pst",
-    "popular",
-    "featured",
-    "champions",
-    "drafts",
-    "live",
-    "results",
-    "rankings",
-    "mobile",
-    "web",
-    "coming",
-    "soon",
-    "download",
-    "app",
-    "standard",
-    "flex",
-    "play",
-    "boost",
-    # sportsbook UI labels that appear before prop cards
-    "projections",
-    "projection",
-    "board",
-    "slate",
-    "lineup",
-    "entry",
-}
+# Words that should never appear at the start of a player-name token.  Kept
+# as a module-level alias so other code that imports _NAME_STOP_WORDS from
+# this module continues to work.
+_NAME_STOP_WORDS = NAME_STOP_WORDS
 
-# Negative-lookahead fragment: prevents any word in _NAME_STOP_WORDS from
+# Negative-lookahead fragment: prevents any word in NAME_STOP_WORDS from
 # starting a player-name token.  Applied case-insensitively (via IGNORECASE on
 # the parent regex), this stops words like "More", "Less", "Projections", "NBA"
 # from being captured as the beginning of a player name — which would otherwise
 # cause finditer to skip over the real player name that follows.
 _STOP_WORD_LOOKAHEAD = (
     "(?!"
-    + "|".join(re.escape(w) + r"\b" for w in sorted(_NAME_STOP_WORDS, key=len, reverse=True))
+    + "|".join(re.escape(w) + r"\b" for w in sorted(NAME_STOP_WORDS, key=len, reverse=True))
     + ")"
 )
 # (?-i:[A-Z]) turns off IGNORECASE for just this character class so the first
@@ -183,123 +151,7 @@ _CARD_PATTERNS = [
     ),
 ]
 
-# UnderDog name pattern: mixed-case words only (each word must contain at least
-# one lowercase letter), so all-uppercase team abbreviations are excluded.
-_UD_NAME_PAT = (
-    r"(?P<player>"
-    r"[A-Z][A-Za-z.\'\-]*[a-z][A-Za-z.\'\-]*"
-    r"(?:\s+[A-Z][A-Za-z.\'\-]*[a-z][A-Za-z.\'\-]*){1,3}"
-    r")"
-)
-_UNDERDOG_PROP_RE = re.compile(
-    _UD_NAME_PAT
-    + r"\s+[A-Z]{2,4}\s+(?:@|vs\.?)\s+[A-Z]{2,4}"
-      r"\s+-\s+.*?(?:EDT|EST|CDT|CST|PDT|PST|PM|AM)\s+"
-      r"(?P<line>\d{1,3}(?:\.\d+)?)"
-      r"\s+(?P<stat>[A-Za-z][A-Za-z +\']{1,30}?)"
-      r"\s+(?P<side>Higher|Lower|Over|Under)",
-    flags=re.IGNORECASE,
-)
-
-# PrizePicks name pattern: same mixed-case requirement as UnderDog, PLUS a
-# stop-word negative lookahead so that words like "Less", "More", "Projections"
-# cannot start a player-name token (even though they have lowercase letters).
-# Compiled WITHOUT re.IGNORECASE so [a-z] is truly case-sensitive.
-_PP_STOP_LOOKAHEAD = (
-    "(?!"
-    + "|".join(
-        # Include both lowercase and title-case forms since patterns are case-sensitive.
-        re.escape(w[0].upper() + w[1:]) + r"\b"
-        for w in sorted(_NAME_STOP_WORDS, key=len, reverse=True)
-        if w
-    )
-    + ")"
-)
-_PRIZEPICKS_NAME_WORD = _PP_STOP_LOOKAHEAD + r"[A-Z][A-Za-z.\'\-]*[a-z][A-Za-z.\'\-]*"
-_PRIZEPICKS_NAME_PAT = (
-    r"(?P<player>"
-    + _PRIZEPICKS_NAME_WORD
-    + r"(?:\s+" + _PRIZEPICKS_NAME_WORD + r"){1,3}"
-    + r")"
-)
-# Primary PrizePicks pattern: "Player TEAM Stat Line More|Less"
-# Not IGNORECASE: case sensitivity is needed to exclude all-uppercase tokens.
-_PRIZEPICKS_PROP_RE = re.compile(
-    _PRIZEPICKS_NAME_PAT
-    + r"\s+[A-Z]{2,4}\s+"             # team abbreviation (all-uppercase 2-4 chars)
-      r"(?P<stat>[A-Z][A-Za-z +\']{1,30}?)"  # stat label (starts uppercase)
-      r"\s+(?P<line>\d{1,3}(?:\.\d+)?)"
-      r"\s+(?P<side>More|Less|Over|Under|Higher|Lower)",
-)
-
-# Alternate PrizePicks pattern: "Player Line Stat More|Less" (line before stat)
-_PRIZEPICKS_ALT_RE = re.compile(
-    _PRIZEPICKS_NAME_PAT
-    + r"(?:\s+[A-Z]{2,5}(?:\s+(?:@|vs\.?)\s+[A-Z]{2,5})?)?"  # optional team context
-      r"\s+(?P<line>\d{1,3}(?:\.\d+)?)"
-      r"\s+(?P<stat>[A-Za-z][A-Za-z +\']{1,30}?)"
-      r"\s+(?P<side>More|Less|Over|Under|Higher|Lower)",
-)
-
-
-def _preprocess_underdog_text(text: str) -> str:
-    """
-    Strip UnderDog game-info segments so generic patterns can match.
-
-    Converts 'Player TEAM @ TEAM - TIME 11.5 Rebounds Higher 1.06x'
-    into     'Player 11.5 Rebounds Higher'
-    """
-    segments: list[str] = []
-    for m in _UNDERDOG_PROP_RE.finditer(text):
-        player = m.group("player").strip()
-        line = m.group("line").strip()
-        stat = m.group("stat").strip()
-        side = m.group("side").strip()
-        segments.append(f"{player} {line} {stat} {side}")
-    return " ".join(segments) if segments else ""
-
-
-def _preprocess_prizepicks_text(text: str) -> str:
-    """
-    Strip PrizePicks team/game segments so generic patterns can match.
-
-    Handles formats like:
-      'Player TEAM Stat 27.5 More Less'
-      'Player TEAM @ TEAM 27.5 Stat More Less'
-
-    Player names are validated via ``_clean_player_name`` before being added so
-    that UI labels like "Projections" that slip through the regex are filtered out.
-    """
-    segments: list[str] = []
-    seen: set[tuple] = set()
-    for pat in (_PRIZEPICKS_PROP_RE, _PRIZEPICKS_ALT_RE):
-        for m in pat.finditer(text):
-            raw_player = m.group("player").strip()
-            player = _clean_player_name(raw_player)
-            if not player:
-                continue
-            line = m.group("line").strip()
-            stat = m.group("stat").strip()
-            side = m.group("side").strip()
-            key = (player.lower(), line, stat.lower())
-            if key in seen:
-                continue
-            seen.add(key)
-            segments.append(f"{player} {line} {stat} {side}")
-    return " ".join(segments) if segments else ""
-
 _NOISE_HINTS = {"loading", "login", "sign in", "create account", "mobile web is coming"}
-_BOOK_NAME_MAP = {
-    "prizepicks.com": "prizepicks",
-    "fliff.com": "fliff",
-    "kalshi.com": "kalshi",
-    "underdogfantasy.com": "underdog",
-    "draftkings.com": "draftkings",
-    "fanduel.com": "fanduel",
-    "caesars.com": "caesars",
-    "betrivers.com": "betrivers",
-    "betmgm.com": "betmgm",
-}
 
 
 def _collapse_whitespace(text: str) -> str:
@@ -346,7 +198,7 @@ def _clean_player_name(raw_name: str) -> str:
     if len(parts) < 2:
         return ""
     lowered = [part.lower().strip(".") for part in parts]
-    if any(token in _NAME_STOP_WORDS for token in lowered):
+    if any(token in NAME_STOP_WORDS for token in lowered):
         return ""
     return " ".join(parts)
 
@@ -384,17 +236,15 @@ def _parse_line_value(raw_line: str) -> Optional[float]:
 
 
 def _infer_book_from_url(source_url: str) -> str:
-    """Infer sportsbook label from URL hostname."""
+    """Infer sportsbook label from URL hostname using the scraper registry."""
+    scraper = get_scraper_for_url(source_url)
+    if scraper is not None:
+        return scraper.name
     parsed = urlparse(str(source_url or "").strip())
     host = parsed.netloc.lower()
     if host.startswith("www."):
         host = host[4:]
     host = host.split(":")[0]
-    if host in _BOOK_NAME_MAP:
-        return _BOOK_NAME_MAP[host]
-    for domain, book_name in _BOOK_NAME_MAP.items():
-        if host.endswith(f".{domain}"):
-            return book_name
     if host:
         return host.split(".")[0]
     return "unknown"
@@ -445,6 +295,27 @@ def _build_record_sha256(
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def _run_book_preprocessors(text: str) -> str:
+    """Run every registered scraper's preprocessor over ``text``.
+
+    Each preprocessor that recognizes its book's UI shape returns a
+    normalized "Player Line Stat Side" segment.  The aggregated segments
+    are prepended to the original text so the generic ``_CARD_PATTERNS``
+    can match them.
+    """
+    parts: list[str] = []
+    for scraper in SCRAPERS:
+        if scraper.prop_preprocess is None:
+            continue
+        try:
+            chunk = scraper.prop_preprocess(text)
+        except Exception:
+            chunk = ""
+        if chunk:
+            parts.append(chunk)
+    return " ".join(parts)
+
+
 def extract_prop_cards_from_text(
     text_content: str,
     source_url: str,
@@ -461,15 +332,9 @@ def extract_prop_cards_from_text(
     if not text:
         return []
 
-    preprocessed_parts = []
-    ud = _preprocess_underdog_text(text)
-    if ud:
-        preprocessed_parts.append(ud)
-    pp = _preprocess_prizepicks_text(text)
-    if pp:
-        preprocessed_parts.append(pp)
-    if preprocessed_parts:
-        text = " ".join(preprocessed_parts) + " " + text
+    preprocessed = _run_book_preprocessors(text)
+    if preprocessed:
+        text = preprocessed + " " + text
 
     records: list[dict] = []
     seen_card_keys: set[tuple] = set()

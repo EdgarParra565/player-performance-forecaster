@@ -41,6 +41,36 @@ CREATE TABLE IF NOT EXISTS game_logs (
     UNIQUE(player_id, game_id)
 );
 
+-- Team-level NBA game results (one row per team per game = 2 rows per game).
+-- Sourced from nba_api leaguegamefinder; gives us schedule + scores +
+-- W/L for every team-game, which the frontend uses for the Game Results tab.
+CREATE TABLE IF NOT EXISTS games (
+    game_id        TEXT NOT NULL,             -- nba_api GAME_ID (10-char)
+    season         TEXT NOT NULL,             -- e.g. "2024-25"
+    season_type    TEXT NOT NULL,             -- "Regular Season" / "Playoffs" / "Pre Season"
+    game_date      DATE NOT NULL,
+    team_id        INTEGER NOT NULL,
+    team_abbrev    TEXT NOT NULL,             -- e.g. "NYK"
+    team_name      TEXT,                      -- e.g. "New York Knicks"
+    matchup        TEXT,                      -- e.g. "NYK vs. PHI" / "NYK @ PHI"
+    home_away      TEXT,                      -- 'home' / 'away'
+    opponent_abbrev TEXT,                     -- parsed from matchup
+    result         TEXT,                      -- 'W' / 'L' / NULL (future)
+    pts            INTEGER,
+    opp_pts        INTEGER,
+    plus_minus     INTEGER,
+    fg_pct         REAL,
+    fg3_pct        REAL,
+    ft_pct         REAL,
+    rebounds       INTEGER,
+    assists        INTEGER,
+    steals         INTEGER,
+    blocks         INTEGER,
+    turnovers      INTEGER,
+    last_updated   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (game_id, team_id)
+);
+
 -- Team defensive stats (for adjustments)
 CREATE TABLE IF NOT EXISTS team_defense (
     team_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -139,6 +169,31 @@ CREATE TABLE IF NOT EXISTS web_prop_cards (
     FOREIGN KEY (snapshot_id) REFERENCES web_text_snapshots(snapshot_id)
 );
 
+-- Parsed game-level (team) markets from visible text snapshots.
+-- One row per (book, game, market_type, side). For totals, side is
+-- 'over'/'under' and team is NULL. For spreads/moneylines, side is
+-- 'home'/'away' and team holds the canonical short name.
+CREATE TABLE IF NOT EXISTS web_team_lines (
+    line_id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    snapshot_id       INTEGER NOT NULL,
+    source_url        TEXT NOT NULL,
+    book              TEXT NOT NULL,
+    observed_at_utc   TIMESTAMP NOT NULL,
+    away_team         TEXT NOT NULL,             -- canonical short name, e.g. "Knicks"
+    home_team         TEXT NOT NULL,             -- canonical short name
+    market_type       TEXT NOT NULL,             -- spread, total, moneyline, team_total
+    side              TEXT NOT NULL,             -- home, away, over, under
+    team              TEXT,                      -- canonical name when market is team-specific
+    line_value        REAL,                      -- NULL for moneyline
+    odds_american     INTEGER,                   -- NULL when not posted
+    parse_confidence  REAL NOT NULL,
+    raw_text          TEXT,
+    parser_version    TEXT NOT NULL,
+    record_sha256     TEXT NOT NULL UNIQUE,
+    created_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (snapshot_id) REFERENCES web_text_snapshots(snapshot_id)
+);
+
 -- Model predictions (for evaluation)
 CREATE TABLE IF NOT EXISTS predictions (
     prediction_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -180,3 +235,9 @@ CREATE INDEX IF NOT EXISTS idx_active_players_ref_name ON nba_active_players_ref
 CREATE INDEX IF NOT EXISTS idx_web_prop_cards_snapshot ON web_prop_cards(snapshot_id, observed_at_utc DESC);
 CREATE INDEX IF NOT EXISTS idx_web_prop_cards_player_stat ON web_prop_cards(player_name, stat_type, observed_at_utc DESC);
 CREATE INDEX IF NOT EXISTS idx_web_prop_cards_book ON web_prop_cards(book, observed_at_utc DESC);
+CREATE INDEX IF NOT EXISTS idx_web_team_lines_snapshot ON web_team_lines(snapshot_id, observed_at_utc DESC);
+CREATE INDEX IF NOT EXISTS idx_web_team_lines_game ON web_team_lines(home_team, away_team, market_type, observed_at_utc DESC);
+CREATE INDEX IF NOT EXISTS idx_web_team_lines_book ON web_team_lines(book, observed_at_utc DESC);
+CREATE INDEX IF NOT EXISTS idx_games_date          ON games(game_date DESC, game_id);
+CREATE INDEX IF NOT EXISTS idx_games_team_date     ON games(team_abbrev, game_date DESC);
+CREATE INDEX IF NOT EXISTS idx_games_season        ON games(season, season_type, game_date DESC);

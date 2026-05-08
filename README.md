@@ -11,14 +11,35 @@ The current baseline is designed to be reproducible offline (synthetic benchmark
 - `run_model` supports executable demo modes for single props and correlated parlays.
 - Deterministic smoke tests are in place for features, probability math, and backtest integration.
 - Baseline benchmark artifacts are generated and saved under `nba_model/evaluation/artifacts/`.
+- Per-book scraper package (`nba_model/scrapers/`) registers 20 books — 9 actively producing parsed data (PrizePicks, Underdog, Pick6, ParlayPlay for player props; BetMGM, Caesars, DraftKings, Bovada, Kalshi for team lines). Cross-book consensus rolls into both player and team charts as `book mean X.X`.
+- NBA API ingest (`nba_model/data/nba_results_ingestion.py`) populates a `games` table (8K+ team-game rows) and bulk player game logs (90K+ rows across 3 seasons + 1K players) from `leaguegamefinder` / `playergamelogs`.
+- Streamlit + Tk UIs both expose Player charts, Team charts, Game Results, and Player Stats Browse. All graphing inputs go through `nba_model/web/input_validation.py` (stat type / team code / season / rolling window).
+- Production-ready auth + billing scaffold: native Streamlit OIDC (Google + Microsoft) sign-in, Stripe-powered Free vs Premium tiers, FastAPI webhook handler with HMAC verification, replay tolerance, idempotency, body-size cap (256 KiB), per-IP rate limiting (120/60s), slowloris timeout, and the OWASP-recommended HTTP security headers. Full threat model + 4-layer hardening pass + adversarial / data-poisoning input validation in [docs/SECURITY.md](docs/SECURITY.md).
+- 182/182 tests passing (regression + stress + adversarial + scanners). `bandit` MEDIUM/HIGH baseline = 0; `pip-audit` clean; 30 consecutive stress runs flake-free.
 
 ## Repository Layout
 
 - `nba_model/data/` - API loading, caching, and database utilities
+  - `nba_results_ingestion.py` - bulk team-game + player-game-log ingest from `nba_api`
 - `nba_model/model/` - feature engineering, probability, simulation, EV, parlay modeling
+  - `browser_prop_parser.py` / `team_line_parser.py` - orchestrators that run each scraper's preprocessor over stored web snapshots
+  - `web_text_ingestion.py` - generic fetch path (Playwright + CDP via Chrome :9222)
+- `nba_model/scrapers/` - per-book scraper registry
+  - `base.py` - `BookScraper` dataclass + shared regex helpers
+  - `team_names.py` - canonical NBA team-name normalizer (cross-book joining)
+  - one module per book: `prizepicks.py`, `underdog.py`, `pick6.py`, `parlayplay.py`, `betmgm.py`, `caesars.py`, `draftkings.py`, `bovada.py`, `kalshi.py`, plus 11 stub configs
 - `nba_model/evaluation/` - backtesting and benchmark runners
 - `nba_model/tests/` - smoke and integration-style tests
-- `nba_model/visualization/` - distribution plotting + Player Charts builders (`player_charts.py` powers the Player Charts UI tab)
+- `nba_model/visualization/` - distribution plotting + Player/Team chart builders (`player_charts.py` powers both UIs; also exposes `fetch_recent_games` / `fetch_player_recent_results` / `list_seasons` for the browse views)
+- `nba_model/web/` - Streamlit web frontend + auth + Stripe membership glue
+  - `app.py` - the Streamlit app (Player charts, Team charts, Game Results, Player Stats Browse, plus premium views)
+  - `auth.py` - native OIDC wrapper + tier-based feature gating
+  - `input_validation.py` - validators for all chart inputs + ingested odds
+  - `subscriptions.py` - SQLite-backed subscription store
+  - `stripe_helpers.py` - Checkout URL builder + signature helpers
+  - `webhook_app.py` - FastAPI app that handles Stripe webhooks
+  - `parlay_compare.py` - cross-comparison helpers for the Parlay analysis view
+- `data/DATABASE_INVENTORY.txt` - auto-generated snapshot of what's actually in the SQLite DB (refresh: `python3 -m nba_model.data.audit_db`)
 - `docs/API_TO_DATABASE.md` - how data flows from APIs to SQLite and how we clean it
 
 ## Setup
@@ -38,6 +59,167 @@ python3 -m nba_model.run_model --mode single --player "LeBron James" --n-games 1
 python3 -m nba_model.run_model --mode parlay --player "LeBron James" --n-games 100
 python3 -m nba_model.run_model --mode both --player "LeBron James" --n-games 100
 ```
+
+## Security
+
+The threat model and the full mitigation matrix live in
+**[docs/SECURITY.md](docs/SECURITY.md)**. Highlights:
+
+- **Auth**: native Streamlit OIDC (Google + Microsoft); session cookies signed
+  with `cookie_secret`; `st.logout` invalidates the cookie; admin override is
+  email-allowlist only.
+- **Authorization**: tier (`free` vs `premium`) is the single source of
+  truth, resolved on every request through `auth.current_user()`. Free-tier
+  users have a server-side player allowlist + stat allowlist + N-games cap
+  enforced inside dispatch (defense in depth, not just UI hiding).
+- **SQL injection**: all queries parameter-bound. The single f-string SQL
+  fragment (`fetch_team_chart_data`) interpolates only allowlisted
+  expressions and `assert`s at the call site.
+- **Webhook**: HMAC verified by `stripe.Webhook.construct_event` with a
+  300s replay tolerance; body size capped at 256 KiB before buffering;
+  `asyncio.wait_for` body-read timeout (slowloris defense, 408 on timeout);
+  per-IP sliding-window rate limit (default 120 req / 60 s, 429 with
+  `Retry-After`); idempotent on `event_id`; `TrustedHostMiddleware` honors
+  `WEBHOOK_TRUSTED_HOSTS`; `/docs`, `/redoc`, `/openapi.json` all return 404.
+- **HTTP security headers** (every webhook response): HSTS 2yr+preload, CSP
+  `default-src 'none'`, X-Content-Type-Options nosniff, X-Frame-Options
+  DENY, Referrer-Policy no-referrer, Permissions-Policy denying camera /
+  mic / geo / payment / USB, Cross-Origin-Opener-Policy + Cross-Origin-
+  Resource-Policy same-origin. `Server:` header overridden to "webhook" so
+  scanners can't fingerprint Uvicorn.
+- **Subscription DB**: `chmod 0600`, WAL mode, SQLite extensions disabled,
+  one-time `journal_mode=WAL` flip behind a process-wide `_INIT_LOCK` +
+  `busy_timeout=5000` on every connection (concurrent-write contention is
+  flake-free), email validated by regex + length + punycode/IDN reject
+  before being used as a primary key.
+- **Adversarial input + data-poisoning** (AI threat model): every numeric
+  user input goes through `nba_model/web/input_validation.py` (NaN / inf /
+  per-stat plausible range / hard caps on n_games, n_sims, parlay legs).
+  `is_plausible_betting_line` runs at insert time so scraper-poisoned rows
+  ("Jokic 9999.5 points", unknown stat types, zero-odds) are dropped before
+  they pollute consensus mean / EV math.
+- **Logging**: webhook never logs payload bodies, emails, or customer ids -
+  only event_id + event_type. Bad-signature attempts log only the exception
+  type, never the raw header.
+- **Dependencies**: pinned with `~=` ranges and a `requirements.lock` for
+  reproducible deploys. `pip-audit` + `bandit` + secret-pattern grep run
+  via `scripts/security_scan.sh` (currently clean: bandit MEDIUM/HIGH = 0,
+  pip-audit "No known vulnerabilities").
+
+Run the security regression tests + dependency / static analysis scans:
+
+```bash
+# 80+ security cases: regression (test_security.py) + stress + fuzz +
+# adversarial inputs (test_security_stress.py)
+.venv/bin/python3 -m pytest nba_model/tests/test_security.py \
+                              nba_model/tests/test_security_stress.py -v
+
+# pip-audit (CVEs in installed packages) + bandit (SAST) + secret-pattern grep
+.venv/bin/python3 -m pip install -r requirements-dev.txt
+./scripts/security_scan.sh
+
+# crash-consistent backup of the subscriptions DB (uses SQLite .backup)
+./scripts/backup_subscriptions.sh
+```
+
+## Production deployment (auth + Stripe memberships)
+
+The web app supports **Google + Microsoft OIDC sign-in** via Streamlit's
+native `st.login` (1.42+) and gates premium features behind a Stripe
+subscription. See **[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)** for the full
+deployment walkthrough — recommended target is **Streamlit Community Cloud**
+for the app + a small FastAPI webhook handler on Render/Railway/Fly.
+
+Quick summary of what's wired:
+
+- `nba_model/web/auth.py` — wraps `st.user`/`st.login`/`st.logout`, resolves
+  the current tier (`free` / `premium`), exposes `paywall(feature)` for
+  feature-gating callers, and an admin-email override for the project owner.
+- `nba_model/web/subscriptions.py` — SQLite store at
+  `data/database/subscriptions.db` with one row per email; idempotent
+  Stripe-event recording.
+- `nba_model/web/stripe_helpers.py` — builds the Checkout URL from either a
+  pre-built **Payment Link** or a server-side Checkout Session.
+- `nba_model/web/webhook_app.py` — FastAPI app on `/stripe/webhook` that
+  verifies signatures with the Stripe SDK and updates the subscription store
+  on `checkout.session.completed`, `customer.subscription.{created,updated,
+  deleted}`, `invoice.paid`, `invoice.payment_failed`.
+- `.streamlit/secrets.toml.example` — full template with placeholders for
+  OIDC + Stripe + admin allowlist. Copy to `secrets.toml` (gitignored).
+
+**Free vs Premium feature matrix** (configured in `auth.py`):
+
+| Feature                          | Free preview                          | Premium |
+|----------------------------------|---------------------------------------|---------|
+| Players viewable                 | `Nikola Jokic`, `LeBron James`        | All     |
+| Stats                            | `points`                              | All 7   |
+| Last N games                     | up to 5                               | up to 200 |
+| Player charts                    | yes                                   | yes     |
+| Team charts                      | yes (preview stats only)              | yes (all stats) |
+| Game Results browser             | yes                                   | yes     |
+| Player Stats Browse              | yes                                   | yes     |
+| All-stats overview               | locked                                | yes     |
+| Parlay analysis (single + multi) | locked                                | yes     |
+
+### 1a) Player Charts Web App (Streamlit)
+
+A browser frontend dedicated to the Player Charts feature. Pick a team / player /
+stat in the left sidebar; the main pane re-renders every chart and the EV
+summary on selection change. Switching player reloads everything live.
+
+```bash
+.venv/bin/python3 -m streamlit run nba_model/web/app.py
+```
+
+Then open http://localhost:8501. Layout:
+
+- **Sidebar**: DB path, team filter, player dropdown, **view mode** radio
+  (`Player charts | Team charts | Game Results | Player Stats Browse` for free,
+  premium adds `All stats overview` + `Parlay analysis`), stat, last-N games, rolling
+  window, distribution overlay checkboxes (normal / poisson / negative-binomial),
+  "Reload DB indexes" button to bust caches. All numeric/categorical inputs
+  (stat type, team code, season, n_games, rolling window) are validated through
+  `nba_model/web/input_validation.py` before they hit the DB or model code; bad
+  values surface as a friendly `st.error` instead of a stack trace.
+- **KPI row**: games / mean / std / market median line / count of `+EV` book sides.
+- **Tabs in the main pane:**
+  - **Overview** — recent-N-games chart with rolling mean, plus distribution
+    histogram with the selected fitted distribution overlays and a vertical
+    dashed line per book at that book's current line.
+  - **Splits** — home/away + rest-day-bucket chart, plus the same numbers in two
+    side-by-side tables.
+  - **Hit Rate + Custom Line** — historical-over-rate-per-book bar chart with a
+    tick at each book's break-even, then a sortable book-lines table with
+    progress-bar columns for `P(over)` and `hit_rate`, then a custom-line probe
+    form (line + American odds → fitted P(over), historical over-rate, EV per
+    unit for OVER and UNDER, plus a `+EV/-EV` verdict).
+  - **Raw data** — the actual game-log rows used to build the charts.
+
+The Player charts view above is one of six top-level view modes. The others:
+- **Team charts** (free + premium): per-game team aggregates with a
+  `book mean` reference line derived from the cross-book consensus
+  `(game_total - team_spread) / 2` per book (currently `points` only — the
+  only stat books surface at the lobby level). Free tier sees preview
+  stats; premium sees all of `points / assists / rebounds / pra / 3pm /
+  fgm / minutes`.
+- **Game Results** (free): recent NBA matchups with final scores + winner.
+  Filter by season / season type (Regular Season / Playoffs / Play-In /
+  Pre Season) / team. Reads from `games` (populated by
+  `nba_results_ingestion.py`).
+- **Player Stats Browse** (free): searchable league-wide recent player
+  game logs. Pair `Stat filter` + `Min value` to find e.g. "last 200 games
+  where someone scored ≥ 30." Player names resolve via
+  `nba_active_players_ref` (530 active players) so abbreviated rows still
+  show canonical names.
+- **All stats (overview)** (premium): every stat for the selected player on
+  one page.
+- **Parlay analysis** (premium): single-prop or multi-leg parlay with
+  cross-comparison of model + chart-data + historical results.
+
+The web app uses the same `nba_model/visualization/player_charts.py` module as
+the desktop UI, so any new figure builder added there automatically becomes
+available to both surfaces. The desktop UI mirrors the new browse views as
+the **Game Results** and **Player Stats Browse** notebook tabs.
 
 ### 1b) Simple Desktop UI
 
@@ -168,6 +350,115 @@ Notes:
 - For points backtests, minutes projection uses spread from game rows when available, then falls back to spread aliases in `betting_lines` (`spread`, `game_spread`, `line_spread`, `vegas_spread`, etc.).
 
 Artifacts are saved under `nba_model/evaluation/artifacts/` with timestamped filenames.
+
+### 4b) DB Inventory Audit
+
+`data/DATABASE_INVENTORY.txt` is an auto-generated snapshot of what's actually in
+the SQLite DB. Refresh it any time with:
+
+```bash
+.venv/bin/python3 -m nba_model.data.audit_db
+# or print to terminal as well:
+.venv/bin/python3 -m nba_model.data.audit_db --stdout
+# or print only (no file write):
+.venv/bin/python3 -m nba_model.data.audit_db --no-write --stdout
+```
+
+Sections in the report: tables + row counts, `game_logs` coverage by team
+(parsed from `matchup`) and date range, top players by games logged,
+`betting_lines` book × stat-type matrix, `betting_line_snapshots` ranges,
+`predictions` per stat, `team_defense` seasons, `web_text_snapshots` per URL,
+`web_prop_cards` per book, `players` table state, `nba_active_players_ref`
+freshness, and a **Known data-quality flags** section that explicitly calls out
+gaps (e.g. `players.team` empty for most rows, missing prediction stat types,
+orphan `betting_lines` rows).
+
+Same audit is also reachable from the desktop UI: **Operations tab → DB Audit →
+Refresh DB inventory** (writes the file *and* streams the full report to the
+operations log; an "Open inventory file" button reveals it in your OS file
+viewer).
+
+> Current snapshot (re-run after each ETL): the DB has 11k+ `game_logs` rows
+> covering all 30 teams via the parsed `matchup` field even though
+> `players.team` is only set for 1 row. The Player Charts team-filter dropdown
+> reads from `players.team`, which is why almost every team appears empty in
+> the UI today — backfilling from `matchup` is on the priority list.
+
+### 4c) Bulk NBA Results Ingestion (`leaguegamefinder` + `playergamelogs`)
+
+Fast bulk ingest of team-game results and league-wide player game logs from
+`nba_api`. Populates the `games` table (one row per team per game) and
+upserts into `game_logs`. This is the canonical way to refresh historical
+data — much faster than the legacy per-player `data_loader.py` path because
+it issues a single league-wide request per season.
+
+```bash
+# Default: regular season + playoffs for the current 3 seasons
+python3 -m nba_model.data.nba_results_ingestion
+
+# Custom seasons + games-only refresh (no player logs)
+python3 -m nba_model.data.nba_results_ingestion \
+  --seasons 2025-26 2024-25 2023-24 \
+  --skip-player-logs
+```
+
+Behavior:
+- `season_type` (Regular Season / Playoffs / Play-In / Pre Season) is derived
+  from the `SEASON_ID` prefix in `nba_api`'s response so playoff games are
+  correctly tagged even though the endpoint doesn't return `SEASON_TYPE`
+  directly.
+- `games` uses `INSERT OR REPLACE` on `(game_id, team_id)` so re-runs cleanly
+  refresh scores once the game finalizes.
+- `game_logs` uses `INSERT OR IGNORE` keyed on `(player_id, game_id)`.
+- Built-in retry with exponential backoff handles `nba_api`'s typical
+  `ReadTimeout`/throttle errors without surfacing to the caller.
+- Both passes are idempotent — safe to run on a cron / GitHub Actions
+  schedule without coordinating against the daily ETL.
+
+The frontends consume this directly:
+- Streamlit: `Game Results` and `Player Stats Browse` view modes (free tier).
+- Tk: `Game Results` and `Player Stats Browse` notebook tabs.
+- Programmatic: `pc.fetch_recent_games(...)` and `pc.fetch_player_recent_results(...)` from `nba_model.visualization.player_charts`.
+
+### 4d) Per-Book Scraper Registry (Cross-Book Consensus)
+
+The `nba_model/scrapers/` package registers 20 books that the chart UIs use
+to compute the cross-book "book mean" reference line (player props +
+implied team totals). Each book exports a `BookScraper` describing its
+domain(s), Playwright wait selectors, session markers (login-wall vs
+authenticated content), and optional parser hooks.
+
+**Currently producing parsed data (9 of 20):**
+
+| Book | Type | Mechanism |
+|---|---|---|
+| PrizePicks, Underdog, Pick6, ParlayPlay | Player props (DFS pickem) | Per-book `prop_preprocess` emits `"<name> <line> <stat> <side>"` segments; generic `_CARD_PATTERNS` in `browser_prop_parser.py` extract them. Pick6's parser expands abbreviated names (`J. Brunson`) via `nba_active_players_ref`. |
+| BetMGM, Caesars, DraftKings, Bovada | Team lines (spread/total/moneyline) | Per-book `team_line_extractor` returns one record per (game, market, side) using NBA team names normalized via `scrapers/team_names.py`. |
+| Kalshi | Team moneylines | Decimal-odds → American conversion; index page only exposes moneyline at the lobby level. |
+
+**Stub-only (config without parser yet):** fliff, sleeper, dabble, fanduel, betrivers, fanatics, espnbet, hardrockbet, oddsshark, vegasinsider, bettingpros. Their fetch path runs and stores snapshots; add a parser by implementing `prop_preprocess` (DFS shape) or `team_line_extractor` (sportsbook shape) in their `nba_model/scrapers/<book>.py` once an authenticated NBA-page sample is on disk.
+
+**End-to-end flow (single book):**
+```bash
+# 1. Snapshot via real Chrome on :9222 (after manual login in that Chrome window)
+python3 -m nba_model.model.web_text_ingestion \
+  --urls "https://app.prizepicks.com/board/nba" \
+  --chrome-debug-port 9222
+
+# 2. Parse stored snapshot into web_prop_cards
+python3 -m nba_model.model.browser_prop_parser \
+  --urls "https://app.prizepicks.com/board/nba"
+
+# 3. Parse stored snapshot into web_team_lines (sportsbooks)
+python3 -m nba_model.model.team_line_parser \
+  --urls "https://www.ma.betmgm.com/en/sports/basketball-7"
+```
+
+Cross-book consensus is read by the chart code via:
+- `db.get_consensus_prop_lines(player_name, stat_type, side, since_hours, min_books)`
+- `db.get_consensus_team_lines(away_team, home_team, market_type, side, since_hours, min_books)`
+
+Both return `mean_line`, `min_line`, `max_line`, `n_books`, and the contributing-book list. The chart's `book mean X.X` reference line is derived from these — for player charts directly, for team charts via `(game_total - team_spread) / 2` per book.
 
 ### 5) Daily ETL Runner (Game Logs + Defense + Odds + Reverse Engineering)
 

@@ -32,7 +32,12 @@ PLAYER_PROFILES = {
 
 
 def _stable_seed(value: str) -> int:
-    digest = hashlib.md5(value.encode("utf-8")).hexdigest()[:8]
+    # MD5 here is a fast non-cryptographic hash used purely as a deterministic
+    # seed for the synthetic-data RNG, never for security. usedforsecurity=False
+    # tells FIPS hosts + bandit (B324) that this is intentional.
+    digest = hashlib.md5(
+        value.encode("utf-8"), usedforsecurity=False,
+    ).hexdigest()[:8]
     return int(digest, 16)
 
 

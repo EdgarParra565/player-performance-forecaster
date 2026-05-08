@@ -1,0 +1,282 @@
+# NBA Probability Model - Database Inventory
+# Auto-generated. Re-run with: .venv/bin/python3 -m nba_model.data.audit_db
+
+db_path:        data/database/nba_data.db
+size_bytes:     4,157,440
+size_mb:        3.96
+generated_utc:  2026-05-08T18:38:33+00:00
+
+================================================================================
+== Tables and row counts
+================================================================================
+  table                           indexes 
+  ------------------------------  --------
+  betting_line_snapshots                 3
+  betting_lines                          1
+  game_logs                              2
+  nba_active_players_ref                 2
+  odds_poll_runs                         1
+  players                                1
+  prediction_configs                     1
+  predictions                            1
+  team_defense                           1
+  web_prop_cards                         4
+  web_text_snapshots                     1
+
+  row counts:
+    betting_line_snapshots                2,493
+    betting_lines                         2,493
+    game_logs                            11,675
+    nba_active_players_ref                  530
+    odds_poll_runs                          148
+    players                                  94
+    prediction_configs                      268
+    predictions                             268
+    team_defense                             30
+    web_prop_cards                          142
+    web_text_snapshots                       36
+
+================================================================================
+== game_logs: coverage
+================================================================================
+  total game-rows:   11,675
+  distinct players:  181
+  date range:        2024-10-04T00:00:00  ->  2025-06-22T00:00:00
+
+-- By team (parsed from matchup column)
+  team    games    players   earliest                latest                
+  ------  -------  --------  ----------------------  ----------------------
+  BOS         643         9  2024-10-04T00:00:00     2025-05-16T00:00:00   
+  MIL         618        11  2024-10-06T00:00:00     2025-04-29T00:00:00   
+  LAL         618        12  2024-10-04T00:00:00     2025-04-30T00:00:00   
+  ATL         585        12  2024-10-08T00:00:00     2025-04-18T00:00:00   
+  LAC         564        11  2024-10-05T00:00:00     2025-05-03T00:00:00   
+  MIA         548         9  2024-10-08T00:00:00     2025-04-28T00:00:00   
+  ORL         544         8  2024-10-07T00:00:00     2025-04-29T00:00:00   
+  DEN         517         7  2024-10-04T00:00:00     2025-05-18T00:00:00   
+  SAS         516         9  2024-10-07T00:00:00     2025-04-13T00:00:00   
+  WAS         481        10  2024-10-06T00:00:00     2025-04-13T00:00:00   
+  IND         447         5  2024-10-08T00:00:00     2025-06-22T00:00:00   
+  GSW         432         7  2024-10-05T00:00:00     2025-05-14T00:00:00   
+  OKC         426         6  2024-10-07T00:00:00     2025-06-22T00:00:00   
+  HOU         423         6  2024-10-07T00:00:00     2025-05-04T00:00:00   
+  SAC         418         8  2024-10-09T00:00:00     2025-04-16T00:00:00   
+  BKN         380         9  2024-10-08T00:00:00     2025-04-13T00:00:00   
+  CLE         375         6  2024-10-08T00:00:00     2025-05-13T00:00:00   
+  DET         288         6  2024-10-06T00:00:00     2025-05-01T00:00:00   
+  MIN         283         4  2024-10-04T00:00:00     2025-05-28T00:00:00   
+  MEM         277         6  2024-10-07T00:00:00     2025-04-26T00:00:00   
+  POR         276         5  2024-10-11T00:00:00     2025-04-13T00:00:00   
+  CHA         267         5  2024-10-06T00:00:00     2025-04-13T00:00:00   
+  PHX         253         5  2024-10-06T00:00:00     2025-04-13T00:00:00   
+  CHI         244         4  2024-10-08T00:00:00     2025-04-16T00:00:00   
+  UTA         243         4  2024-10-04T00:00:00     2025-04-13T00:00:00   
+  PHI         228         6  2024-10-07T00:00:00     2025-04-13T00:00:00   
+  DAL         227         7  2024-10-07T00:00:00     2025-04-18T00:00:00   
+  NYK         193         3  2024-10-06T00:00:00     2025-05-31T00:00:00   
+  NOP         182         5  2024-10-07T00:00:00     2025-04-13T00:00:00   
+  TOR         137         5  2024-10-06T00:00:00     2025-04-13T00:00:00   
+
+-- Top 30 players by games logged
+  player_id   name                          games   earliest                latest                
+  ----------  ----------------------------  ------  ----------------------  ----------------------
+     1630598  ?                                103  2024-10-07T00:00:00     2025-06-22T00:00:00   
+     1627741  ?                                101  2024-10-05T00:00:00     2025-05-14T00:00:00   
+     1629638  Nickeil Alexander-Walker         101  2024-10-04T00:00:00     2025-05-28T00:00:00   
+     1626167  Myles Turner                      98  2024-10-10T00:00:00     2025-06-22T00:00:00   
+     1631097  Bennedict Mathurin                98  2024-10-08T00:00:00     2025-06-22T00:00:00   
+     1631128  Christian Braun                   98  2024-10-04T00:00:00     2025-05-18T00:00:00   
+     1630162  ?                                 97  2024-10-11T00:00:00     2025-05-28T00:00:00   
+     1630202  Payton Pritchard                  96  2024-10-04T00:00:00     2025-05-16T00:00:00   
+     1641717  ?                                 96  2024-10-07T00:00:00     2025-06-22T00:00:00   
+     1629614  ?                                 92  2024-10-08T00:00:00     2025-06-22T00:00:00   
+      201566  Russell Westbrook                 91  2024-10-04T00:00:00     2025-05-18T00:00:00   
+     1626166  Cameron Payne                     91  2024-10-06T00:00:00     2025-05-23T00:00:00   
+     1628401  Derrick White                     91  2024-10-04T00:00:00     2025-05-16T00:00:00   
+      203999  Nikola Jokic                      90  2024-10-04T00:00:00     2025-05-18T00:00:00   
+      201572  Brook Lopez                       89  2024-10-06T00:00:00     2025-04-29T00:00:00   
+     1630578  ?                                 89  2024-10-07T00:00:00     2025-05-04T00:00:00   
+     1642264  Stephon Castle                    89  2024-10-07T00:00:00     2025-04-13T00:00:00   
+      203501  Tim Hardaway Jr                   88  2024-10-06T00:00:00     2025-05-01T00:00:00   
+     1627884  Derrick Jones                     88  2024-10-05T00:00:00     2025-05-03T00:00:00   
+     1628389  Bam Adebayo                       88  2024-10-08T00:00:00     2025-04-28T00:00:00   
+     1641710  ?                                 88  2024-10-07T00:00:00     2025-04-29T00:00:00   
+     1641767  ?                                 88  2024-10-08T00:00:00     2025-06-22T00:00:00   
+     1642261  ?                                 88  2024-10-04T00:00:00     2025-04-25T00:00:00   
+     1642267  ?                                 88  2024-10-06T00:00:00     2025-04-13T00:00:00   
+     1629639  Tyler Herro                       87  2024-10-13T00:00:00     2025-04-28T00:00:00   
+     1630577  Julian Champagnie                 87  2024-10-07T00:00:00     2025-04-13T00:00:00   
+      202685  Jonas Valanciunas                 86  2024-10-06T00:00:00     2025-04-16T00:00:00   
+      203110  ?                                 86  2024-10-05T00:00:00     2025-05-14T00:00:00   
+     1628369  Jayson Tatum                      86  2024-10-04T00:00:00     2025-05-12T00:00:00   
+      101108  ?                                 85  2024-10-09T00:00:00     2025-04-13T00:00:00   
+
+================================================================================
+== betting_lines
+================================================================================
+  rows:              2,493
+  distinct books:    6
+  distinct players:  94
+  date range:        2026-03-14  ->  2026-03-15
+
+-- Rows per book
+  book                  rows    
+  --------------------  --------
+  Bovada                    1072
+  BetRivers                  355
+  DraftKings                 293
+  BetMGM                     271
+  BetOnline.ag               259
+  FanDuel                    243
+
+-- Rows per stat_type
+  stat_type        rows    
+  ---------------  --------
+  points               1020
+  pra                   596
+  rebounds              545
+  assists               332
+
+-- book x stat_type matrix
+  book                  stat_type        rows    
+  --------------------  ---------------  --------
+  BetMGM                points                 79
+  BetMGM                pra                    78
+  BetMGM                rebounds               67
+  BetMGM                assists                47
+  BetOnline.ag          points                 73
+  BetOnline.ag          rebounds               72
+  BetOnline.ag          pra                    65
+  BetOnline.ag          assists                49
+  BetRivers             points                173
+  BetRivers             pra                    92
+  BetRivers             rebounds               58
+  BetRivers             assists                32
+  Bovada                points                518
+  Bovada                pra                   250
+  Bovada                rebounds              195
+  Bovada                assists               109
+  DraftKings            points                 89
+  DraftKings            rebounds               83
+  DraftKings            pra                    64
+  DraftKings            assists                57
+  FanDuel               points                 88
+  FanDuel               rebounds               70
+  FanDuel               pra                    47
+  FanDuel               assists                38
+
+================================================================================
+== betting_line_snapshots
+================================================================================
+  rows:              2,493
+  distinct books:    6
+  snapshot ts range: 2026-03-14T17:49:22.332180+00:00  ->  2026-03-14T17:49:22.332180+00:00
+
+-- Rows per book
+  book                  rows    
+  --------------------  --------
+  Bovada                    1072
+  BetRivers                  355
+  DraftKings                 293
+  BetMGM                     271
+  BetOnline.ag               259
+  FanDuel                    243
+
+================================================================================
+== predictions
+================================================================================
+  rows:              268
+  distinct players:  1
+
+-- Per stat_type
+  stat_type        rows    
+  ---------------  --------
+  points                268
+
+================================================================================
+== team_defense
+================================================================================
+  rows:              30
+  distinct seasons:  1
+
+-- By season
+  season      teams   
+  ----------  --------
+  2025-26           30
+
+================================================================================
+== web_text_snapshots
+================================================================================
+  rows:              36
+  distinct urls:     21
+
+-- Rows per source URL
+  url                                                           rows    last_fetch            
+  ------------------------------------------------------------  ------  ----------------------
+  http://example.com                                                 5  2026-03-25T12:55:01.151691+00:00
+  https://app.underdogfantasy.com/pick-em/higher-lower/all/NBA       3  2026-03-26T19:39:55.274545+00:00
+  https://app.underdogfantasy.com/pick-em/higher-lower/all/NBA?filter_id=0d33e7f2-6601-486b-9f9e-cbe268d8fc88&filter_type=PickemStat       3  2026-03-26T19:43:01.267304+00:00
+  https://app.underdogfantasy.com/pick-em/higher-lower/all/NBA?filter_id=590e7c83-99fc-419f-bdd8-78bb0a691f8b&filter_type=PickemStat       3  2026-03-26T19:41:59.614527+00:00
+  https://app.underdogfantasy.com/pick-em/higher-lower/all/NBA?filter_id=8d718cf2-1487-401e-88f7-f9f799e85871&filter_type=PickemStat       3  2026-03-26T19:40:57.971506+00:00
+  https://app.underdogfantasy.com/pick-em/higher-lower/all/NBA?filter_id=e3bc1aaa-7964-4a84-bcfa-2d92a4d477a2&filter_type=PickemStat       3  2026-03-26T19:44:03.981829+00:00
+  https://app.prizepicks.com/board/nba                               2  2026-05-08T18:24:54.073549+00:00
+  https://app.prizepicks.com/                                        1  2026-05-08T18:37:09.079024+00:00
+  https://app.underdogsports.com/pick-em/higher-lower/all/featured       1  2026-05-08T18:37:10.048646+00:00
+  https://co.betrivers.com/?page=sportsbook                          1  2026-05-08T18:22:15.180689+00:00
+  https://kalshi.com/                                                1  2026-05-08T18:37:08.314973+00:00
+  https://sports.betmgm.com/en/sports/basketball-7/betting/usa-9/nba-6004       1  2026-05-08T18:22:14.397577+00:00
+  https://sports.getfliff.com/                                       1  2026-05-08T18:22:12.646506+00:00
+  https://sportsbook.caesars.com/basketball?id=5806c896-4eec-4de1-874f-afed93114b8c       1  2026-05-08T18:36:36.287117+00:00
+  https://sportsbook.caesars.com/us/co/bet/basketball                1  2026-05-08T18:22:14.868823+00:00
+  https://sportsbook.draftkings.com/leagues/basketball/nba           1  2026-05-08T18:22:13.291790+00:00
+  https://sportsbook.fanduel.com/navigation/nba                      1  2026-05-08T18:22:13.501278+00:00
+  https://underdogfantasy.com/pick-em/higher-lower/all/NBA           1  2026-05-08T18:22:12.355688+00:00
+  https://www.draftkings.com/fantasy-basketball                      1  2026-05-08T18:36:37.586635+00:00
+  https://www.fanduel.com/contests/nba/5043                          1  2026-05-08T18:36:58.613045+00:00
+  https://www.ma.betmgm.com/en/sports                                1  2026-05-08T18:36:35.468959+00:00
+
+================================================================================
+== web_prop_cards
+================================================================================
+  rows:              142
+
+-- Per book
+  book                  rows    
+  --------------------  --------
+  underdog                   120
+  prizepicks                  22
+
+-- Per stat_type
+  stat_type        rows    
+  ---------------  --------
+  rebounds               49
+  points                 40
+  assists                32
+  pra                    17
+  three_pointers_made         2
+  ra                      2
+
+================================================================================
+== players
+================================================================================
+  rows:              94
+  with team set:     1
+
+-- Players per team (where set)
+  team    players 
+  ------  --------
+  LAL            1
+
+================================================================================
+== nba_active_players_ref
+================================================================================
+  rows:              530
+  last synced:       2026-03-21T02:08:56.759944+00:00
+
+================================================================================
+== Known data-quality flags
+================================================================================
+  1. players.team is empty for 93 of 94 rows. The Player Charts team-filter dropdown reads from this column, so almost every team appears empty. Backfill from game_logs.matchup.
+  2. predictions covers only ['points'] -- missing ['assists', 'field_goals_made', 'pra', 'rebounds', 'three_pointers_made']. line_comparison + monthly diagnostics will be sparse for those stats.
+
+# end of inventory

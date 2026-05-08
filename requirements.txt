@@ -1,8 +1,32 @@
-pandas
-numpy
-scipy
-matplotlib
-nba_api
-requests
+# Pinned dependencies. Use a compatible-release range (~=) so patch + minor
+# bumps for security fixes flow through but breaking-major upgrades require an
+# intentional bump after re-running the test suite. Exact versions are
+# captured in `requirements.lock` for reproducible deploys.
+#
+# When you change any line here:
+#   .venv/bin/python3 -m pip install -r requirements.txt
+#   .venv/bin/python3 -m pip freeze > requirements.lock
+#   .venv/bin/python3 -m pytest
 
-python-dotenv
+# Data + math
+pandas~=3.0
+numpy~=2.4
+scipy~=1.17
+matplotlib~=3.10
+
+# NBA / external APIs
+nba_api~=1.11
+requests~=2.32
+
+# Env management
+python-dotenv~=1.2
+
+# Web UI
+streamlit~=1.57            # native OIDC requires >=1.42
+
+# Membership / billing
+stripe~=15.0               # API version pinned in webhook_app.py
+fastapi~=0.136
+uvicorn[standard]~=0.46
+authlib~=1.7
+httpx~=0.28              # only used by the webhook test suite (TestClient)

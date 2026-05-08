@@ -145,22 +145,27 @@ def build_team_defense_validation_report(
     Report fields include row count, unique teams present, missing teams and
     latest update timestamp for the requested season.
     """
-    where_clause = "WHERE season = ?" if season else ""
-    params = (season,) if season else ()
+    # SECURITY: bandit B608 - the f-string concatenation is *only* between
+    # two compile-time string literals chosen by an `if season` boolean; no
+    # user input ever flows into the SQL. The actual `season` value is bound
+    # via the parameterized `?` placeholder. We pre-build the full query
+    # strings here so bandit can verify there's no string interpolation at
+    # the execute() call site.
+    if season:
+        count_sql = "SELECT COUNT(*) FROM team_defense WHERE season = ?"
+        latest_sql = "SELECT MAX(last_updated) FROM team_defense WHERE season = ?"
+        teams_sql = "SELECT team_abbrev FROM team_defense WHERE season = ?"
+        params: tuple = (season,)
+    else:
+        count_sql = "SELECT COUNT(*) FROM team_defense"
+        latest_sql = "SELECT MAX(last_updated) FROM team_defense"
+        teams_sql = "SELECT team_abbrev FROM team_defense"
+        params = ()
 
     with DatabaseManager(db_path=db_path) as db:
-        row_count = db.conn.execute(
-            f"SELECT COUNT(*) FROM team_defense {where_clause}",
-            params,
-        ).fetchone()[0]
-        latest_updated = db.conn.execute(
-            f"SELECT MAX(last_updated) FROM team_defense {where_clause}",
-            params,
-        ).fetchone()[0]
-        rows = db.conn.execute(
-            f"SELECT team_abbrev FROM team_defense {where_clause}",
-            params,
-        ).fetchall()
+        row_count = db.conn.execute(count_sql, params).fetchone()[0]
+        latest_updated = db.conn.execute(latest_sql, params).fetchone()[0]
+        rows = db.conn.execute(teams_sql, params).fetchall()
 
     loaded_teams = {
         str(row[0]).strip().upper()

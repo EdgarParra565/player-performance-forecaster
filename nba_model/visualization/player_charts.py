@@ -14,14 +14,45 @@ from matplotlib.figure import Figure
 from scipy.stats import norm, poisson, nbinom
 
 from nba_model.data.database.db_manager import DatabaseManager
+from nba_model.scrapers.team_names import team_code_to_canonical
 
 DISTRIBUTION_CHOICES = ("normal", "poisson", "negative_binomial")
+
+# The set of books we'd expect to see for a major-market NBA player+stat.
+# Lowercase canonical names; matched case-insensitively. Used to compute
+# `books_missing` so the UI can call out coverage gaps.
+EXPECTED_BOOKS: tuple[str, ...] = (
+    "fanduel",
+    "draftkings",
+    "betmgm",
+    "caesars",
+    "betrivers",
+    "bovada",
+    "betonline.ag",
+    "fanatics",
+    "prizepicks",
+    "underdog",
+)
 
 STAT_COLUMN_BY_TYPE = {
     "points": "points",
     "assists": "assists",
     "rebounds": "rebounds",
     "minutes": "minutes",
+    "three_pointers_made": "fg3m",
+    "field_goals_made": "fgm",
+}
+
+# Aliases the UI may pass; collapsed to canonical names. Books and
+# web_prop_cards sometimes use shorter labels (e.g. "3pm", "fgm").
+STAT_TYPE_ALIASES = {
+    "3pm": "three_pointers_made",
+    "three_pointers": "three_pointers_made",
+    "3-pointers": "three_pointers_made",
+    "threes": "three_pointers_made",
+    "fgm": "field_goals_made",
+    "field_goals": "field_goals_made",
+    "ra": "ra",  # rebounds + assists (present in web_prop_cards)
 }
 
 
@@ -33,8 +64,13 @@ class PlayerChartData:
     games: pd.DataFrame
     values: np.ndarray
     book_lines: pd.DataFrame = field(default_factory=pd.DataFrame)
-    market_median_line: Optional[float] = None
+    market_consensus_line: Optional[float] = None
     notes: list[str] = field(default_factory=list)
+
+    @property
+    def market_median_line(self) -> Optional[float]:
+        """Backward-compat alias — returns the consensus (mean) line."""
+        return self.market_consensus_line
 
     @property
     def mu(self) -> float:
@@ -47,9 +83,14 @@ class PlayerChartData:
         return float(np.std(self.values, ddof=1))
 
 
+def _canonical_stat_type(stat_type: str) -> str:
+    s = (stat_type or "").strip().lower().replace("-", "_").replace(" ", "_")
+    return STAT_TYPE_ALIASES.get(s, s)
+
+
 def _series_for_stat(games: pd.DataFrame, stat_type: str) -> np.ndarray:
-    """Return numeric stat series, computing PRA on demand."""
-    stat_type = (stat_type or "").lower()
+    """Return numeric stat series, computing PRA / RA on demand."""
+    stat_type = _canonical_stat_type(stat_type)
     if stat_type == "pra":
         for col in ("points", "rebounds", "assists"):
             if col not in games.columns:
@@ -59,6 +100,12 @@ def _series_for_stat(games: pd.DataFrame, stat_type: str) -> np.ndarray:
             + games["rebounds"].fillna(0)
             + games["assists"].fillna(0)
         )
+        return s.astype(float).to_numpy()
+    if stat_type == "ra":
+        for col in ("rebounds", "assists"):
+            if col not in games.columns:
+                return np.array([], dtype=float)
+        s = games["rebounds"].fillna(0) + games["assists"].fillna(0)
         return s.astype(float).to_numpy()
     col = STAT_COLUMN_BY_TYPE.get(stat_type)
     if not col or col not in games.columns:
@@ -75,36 +122,50 @@ def fetch_player_chart_data(
 ) -> PlayerChartData:
     """Pull recent game logs + most-recent book lines for a player+stat."""
     notes: list[str] = []
+    canonical = _canonical_stat_type(stat_type)
     with DatabaseManager(db_path=db_path) as db:
         games = db.get_player_games(player_id, n_games=max(1, int(n_games)))
         # ASC for plotting (oldest -> newest); db returns DESC.
         games = games.sort_values("game_date", ascending=True).reset_index(drop=True)
-        values = _series_for_stat(games, stat_type)
+        values = _series_for_stat(games, canonical)
 
-        book_lines = _fetch_latest_book_lines(db, player_id, stat_type)
-        market_line = _market_median_line(book_lines)
+        book_lines = _fetch_latest_book_lines(
+            db, player_id, canonical, player_name=player_name,
+        )
+        market_line = _market_consensus_line(book_lines)
 
     if games.empty:
         notes.append("No game logs found for this player.")
     if book_lines.empty:
-        notes.append(f"No book lines found for {stat_type}.")
+        notes.append(f"No book lines found for {canonical}.")
 
     return PlayerChartData(
         player_id=int(player_id),
         player_name=str(player_name),
-        stat_type=str(stat_type),
+        stat_type=canonical,
         games=games,
         values=values,
         book_lines=book_lines,
-        market_median_line=market_line,
+        market_consensus_line=market_line,
         notes=notes,
     )
 
 
 def _fetch_latest_book_lines(
-    db: DatabaseManager, player_id: int, stat_type: str,
+    db: DatabaseManager,
+    player_id: int,
+    stat_type: str,
+    player_name: Optional[str] = None,
+    web_lookback_hours: float = 48.0,
 ) -> pd.DataFrame:
-    """Return the most recent betting_lines row per book for the player+stat."""
+    """Return the most recent betting_lines + web_prop_cards row per book.
+
+    The `player_name` argument is used to join `web_prop_cards` directly,
+    avoiding the indirection through the sparse `players` table.  When it's
+    not supplied we fall back to the canonical name from
+    `nba_active_players_ref` (530+ rows, kept in sync by the scraper) and
+    finally `players` (94 rows, mostly stale).
+    """
     query = """
         WITH ranked AS (
             SELECT book, line_value, over_odds, under_odds, game_date,
@@ -120,49 +181,158 @@ def _fetch_latest_book_lines(
         ORDER BY book ASC
     """
     df = pd.read_sql_query(query, db.conn, params=(int(player_id), str(stat_type)))
-    # Also pick up web_prop_cards latest if betting_lines is sparse for this stat.
-    web_query = """
-        WITH ranked AS (
-            SELECT book, line_value, side, observed_at_utc,
-                   ROW_NUMBER() OVER (
-                       PARTITION BY book, side
-                       ORDER BY observed_at_utc DESC
-                   ) AS rn
-            FROM web_prop_cards
-            WHERE lower(player_name) = lower((
-                    SELECT name FROM players WHERE player_id = ?))
-              AND lower(stat_type) = lower(?)
+
+    resolved_name = (player_name or "").strip()
+    if not resolved_name:
+        row = db.conn.execute(
+            "SELECT player_name FROM nba_active_players_ref WHERE player_id = ?",
+            (int(player_id),),
+        ).fetchone()
+        if row and row[0]:
+            resolved_name = str(row[0])
+    if not resolved_name:
+        row = db.conn.execute(
+            "SELECT name FROM players WHERE player_id = ?", (int(player_id),)
+        ).fetchone()
+        if row and row[0]:
+            resolved_name = str(row[0])
+
+    if resolved_name:
+        # Latest line per (book, side) for this player+stat, restricted to the
+        # configured lookback window so stale snapshots from previous slates
+        # don't pollute today's consensus.
+        web_query = """
+            WITH ranked AS (
+                SELECT book, line_value, side, observed_at_utc,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY lower(book), lower(side)
+                           ORDER BY observed_at_utc DESC
+                       ) AS rn
+                FROM web_prop_cards
+                WHERE lower(player_name) = lower(?)
+                  AND lower(stat_type) = lower(?)
+                  AND observed_at_utc >= datetime('now', ?)
+            )
+            SELECT book, line_value, side, observed_at_utc
+            FROM ranked WHERE rn = 1
+        """
+        web_df = pd.read_sql_query(
+            web_query,
+            db.conn,
+            params=(resolved_name, str(stat_type),
+                    f"-{float(web_lookback_hours)} hours"),
         )
-        SELECT book, line_value, side, observed_at_utc
-        FROM ranked WHERE rn = 1
-    """
-    web_df = pd.read_sql_query(
-        web_query, db.conn, params=(int(player_id), str(stat_type)),
-    )
-    if not web_df.empty:
-        # Collapse over/under sides into a single row per book.
-        agg = (
-            web_df.groupby("book", as_index=False)
-            .agg(line_value=("line_value", "median"),
-                 game_date=("observed_at_utc", "max"))
-        )
-        agg["over_odds"] = None
-        agg["under_odds"] = None
-        agg = agg[["book", "line_value", "over_odds", "under_odds", "game_date"]]
-        # Prefer betting_lines book entries; only add web books not already present.
-        existing_books = set(df["book"].str.lower()) if not df.empty else set()
-        agg = agg[~agg["book"].str.lower().isin(existing_books)]
-        df = pd.concat([df, agg], ignore_index=True) if not agg.empty else df
+        if not web_df.empty:
+            agg = (
+                web_df.groupby("book", as_index=False)
+                .agg(line_value=("line_value", "median"),
+                     game_date=("observed_at_utc", "max"))
+            )
+            agg["over_odds"] = None
+            agg["under_odds"] = None
+            agg = agg[["book", "line_value", "over_odds", "under_odds", "game_date"]]
+            existing_books = set(df["book"].str.lower()) if not df.empty else set()
+            agg = agg[~agg["book"].str.lower().isin(existing_books)]
+            df = pd.concat([df, agg], ignore_index=True) if not agg.empty else df
     return df.sort_values("book").reset_index(drop=True)
 
 
-def _market_median_line(book_lines: pd.DataFrame) -> Optional[float]:
+def _market_consensus_line(book_lines: pd.DataFrame) -> Optional[float]:
+    """Mean line across all books that posted a value for this player+stat.
+
+    Each book contributes one value (the latest, deduped upstream in
+    ``_fetch_latest_book_lines``).  This is the "consensus" reference line
+    surfaced on the recent-games chart.
+    """
     if book_lines.empty:
         return None
     vals = pd.to_numeric(book_lines["line_value"], errors="coerce").dropna()
     if vals.empty:
         return None
-    return float(np.median(vals))
+    return float(np.mean(vals))
+
+
+def compute_market_consensus(
+    data: "PlayerChartData",
+    expected_books: tuple[str, ...] = EXPECTED_BOOKS,
+) -> dict:
+    """Aggregate book lines into a market-consensus view.
+
+    Returns:
+        {
+          "mean":        float | None,    # average of book lines
+          "stdev":       float | None,    # population stdev across books
+          "spread":      float | None,    # max - min
+          "n_books":     int,
+          "books_used":  list[str],       # books that contributed
+          "books_missing": list[str],     # in expected_books but absent
+          "per_book": [{                  # one entry per book, mean-relative
+              "book": str,
+              "line": float,
+              "delta": float,             # line - mean
+              "pct_from_mean": float,     # (line - mean) / mean * 100
+              "pct_from_mean_str": str,   # formatted to 3 decimals, signed
+          }],
+        }
+
+    `expected_books` is matched case-insensitively. Books present in the data
+    that aren't in the expected set are still counted in `books_used`.
+    """
+    out = {
+        "mean": None,
+        "stdev": None,
+        "spread": None,
+        "n_books": 0,
+        "books_used": [],
+        "books_missing": [],
+        "per_book": [],
+    }
+    bl = data.book_lines
+    if bl is None or bl.empty:
+        out["books_missing"] = sorted(set(b.lower() for b in expected_books))
+        return out
+
+    rows = []
+    for _, row in bl.iterrows():
+        try:
+            lv = float(row["line_value"])
+        except (TypeError, ValueError):
+            continue
+        rows.append({"book": str(row.get("book") or "").strip(), "line": lv})
+    if not rows:
+        out["books_missing"] = sorted(set(b.lower() for b in expected_books))
+        return out
+
+    vals = np.array([r["line"] for r in rows], dtype=float)
+    mean = float(np.mean(vals))
+    stdev = float(np.std(vals, ddof=0)) if vals.size > 1 else 0.0
+    spread = float(vals.max() - vals.min()) if vals.size > 1 else 0.0
+    used_lower = {r["book"].lower() for r in rows if r["book"]}
+    missing = sorted(b.lower() for b in expected_books if b.lower() not in used_lower)
+
+    per_book = []
+    for r in rows:
+        delta = r["line"] - mean
+        pct = (delta / mean * 100.0) if mean != 0 else 0.0
+        per_book.append({
+            "book": r["book"],
+            "line": r["line"],
+            "delta": float(delta),
+            "pct_from_mean": float(pct),
+            "pct_from_mean_str": f"{pct:+.3f}%",
+        })
+    per_book.sort(key=lambda p: p["pct_from_mean"])
+
+    out.update({
+        "mean": mean,
+        "stdev": stdev,
+        "spread": spread,
+        "n_books": len(rows),
+        "books_used": [r["book"] for r in rows if r["book"]],
+        "books_missing": missing,
+        "per_book": per_book,
+    })
+    return out
 
 
 def build_recent_games_figure(
@@ -189,10 +359,10 @@ def build_recent_games_figure(
         ax.plot(xs, roll, color="#cc4125", linewidth=2,
                 label=f"rolling-{rolling_window} mean")
 
-    if data.market_median_line is not None:
+    if data.market_consensus_line is not None:
         ax.axhline(
-            data.market_median_line, color="#666", linestyle="--",
-            linewidth=1.2, label=f"book median {data.market_median_line:.1f}",
+            data.market_consensus_line, color="#666", linestyle="--",
+            linewidth=1.2, label=f"book mean {data.market_consensus_line:.1f}",
         )
 
     tick_step = max(1, n // 10)
@@ -299,6 +469,20 @@ def build_distribution_figure(
                         linewidth=2, marker="x", markersize=4,
                         label=dist_styles["negative_binomial"][2])
 
+    # Market consensus across books: bold line at mean, shaded +/- 1 stdev band.
+    consensus = compute_market_consensus(data)
+    consensus_lookup = {p["book"].lower(): p for p in consensus["per_book"]}
+    if consensus["mean"] is not None:
+        m = consensus["mean"]
+        s = consensus["stdev"] or 0.0
+        if s > 0:
+            ax.axvspan(m - s, m + s, color="#444", alpha=0.08,
+                       label=f"book +/-1sigma ({s:.3f})")
+        ax.axvline(
+            m, color="#111", linestyle="-", linewidth=2.4, alpha=0.95,
+            label=f"book mean {m:.3f} (n={consensus['n_books']})",
+        )
+
     if data.book_lines is not None and not data.book_lines.empty:
         for idx, row in data.book_lines.reset_index(drop=True).iterrows():
             book = str(row.get("book") or "").strip()
@@ -307,15 +491,23 @@ def build_distribution_figure(
             except (TypeError, ValueError):
                 continue
             color = _book_color(book, idx)
+            pct_str = ""
+            entry = consensus_lookup.get(book.lower())
+            if entry is not None:
+                pct_str = f" ({entry['pct_from_mean_str']})"
             ax.axvline(lv, color=color, linestyle="--", linewidth=1.6,
-                       alpha=0.9, label=f"{book} {lv:.1f}")
+                       alpha=0.9, label=f"{book} {lv:.1f}{pct_str}")
 
     ax.set_xlabel(data.stat_type)
     ax.set_ylabel("density")
-    ax.set_title(
-        f"{data.player_name} - {data.stat_type} distribution "
-        f"(n={data.values.size})"
-    )
+    title = (f"{data.player_name} - {data.stat_type} distribution "
+             f"(n={data.values.size})")
+    if consensus["mean"] is not None and consensus["stdev"] is not None:
+        title += (f"  |  book mean={consensus['mean']:.3f}"
+                  f"  sigma={consensus['stdev']:.3f}"
+                  f"  ({consensus['n_books']} book"
+                  f"{'s' if consensus['n_books'] != 1 else ''})")
+    ax.set_title(title)
     ax.grid(axis="y", linestyle=":", alpha=0.4)
     ax.legend(loc="upper right", fontsize=7, framealpha=0.85, ncol=1)
     return fig
@@ -572,14 +764,27 @@ def book_lines_summary_text(data: PlayerChartData) -> str:
         lines.append("No book lines available.")
         return "\n".join(lines)
 
+    consensus = compute_market_consensus(data)
+    if consensus["mean"] is not None:
+        lines.append(
+            f"market consensus across {consensus['n_books']} book"
+            f"{'s' if consensus['n_books'] != 1 else ''}: "
+            f"mean={consensus['mean']:.3f}  "
+            f"sigma={consensus['stdev']:.3f}  "
+            f"spread={consensus['spread']:.3f}"
+        )
+    pct_lookup = {p["book"].lower(): p for p in consensus["per_book"]}
+
     n = int(data.values.size)
-    header = (f"{'book':<14}{'line':>6}{'odds_o':>8}{'odds_u':>8}"
+    header = (f"{'book':<14}{'line':>6}{'%fromMu':>10}"
+              f"{'odds_o':>8}{'odds_u':>8}"
               f"{'P(over)':>10}{'EV_o':>9}{'EV_u':>9}{'hit%':>8}")
     lines.append("")
     lines.append(header)
     lines.append("-" * len(header))
     for _, row in data.book_lines.iterrows():
-        book = str(row.get("book") or "")[:14]
+        book_full = str(row.get("book") or "")
+        book = book_full[:14]
         try:
             lv = float(row.get("line_value"))
         except (TypeError, ValueError):
@@ -595,9 +800,18 @@ def book_lines_summary_text(data: PlayerChartData) -> str:
         p_over_text = f"{p_over:.1%}" if p_over is not None else ""
         ev_o_text = f"{ev_o:+.2f}" if ev_o is not None else ""
         ev_u_text = f"{ev_u:+.2f}" if ev_u is not None else ""
+        entry = pct_lookup.get(book_full.lower())
+        pct_text = entry["pct_from_mean_str"] if entry else ""
         lines.append(
-            f"{book:<14}{lv:>6.1f}{oo_text:>8}{uo_text:>8}"
+            f"{book:<14}{lv:>6.1f}{pct_text:>10}{oo_text:>8}{uo_text:>8}"
             f"{p_over_text:>10}{ev_o_text:>9}{ev_u_text:>9}{hit:>8.0%}"
+        )
+
+    if consensus["books_missing"]:
+        lines.append("")
+        lines.append(
+            "books MISSING (expected but no current line): "
+            + ", ".join(consensus["books_missing"])
         )
 
     splits = compute_home_away_split(data)
@@ -622,39 +836,399 @@ def book_lines_summary_text(data: PlayerChartData) -> str:
 def list_players_with_data(
     db_path: str, team: Optional[str] = None,
 ) -> pd.DataFrame:
-    """List players that have any game logs OR betting lines, filtered by team."""
+    """List players that have game logs (or betting lines), filtered by team.
+
+    Each player's team is derived from their **most recent ``game_logs``
+    row's ``matchup``** — that field's first whitespace-delimited token is
+    the team they played for in that game, and ``game_logs`` has full
+    coverage for every active player (~530 players, all 30 teams).  We
+    used to read ``players.team`` here, but that column is mostly NULL in
+    the snapshot DB, which collapsed every team filter to a single roster.
+
+    Player names come from ``nba_active_players_ref`` (530 rows, kept in
+    sync by the scraper) with a fallback to the sparse ``players`` table
+    so legacy rows still resolve.
+    """
+    team_clean = (team or "").strip()
+    apply_team_filter = bool(team_clean) and team_clean.lower() not in {
+        "all", "any",
+    }
+    params: tuple = ()
+    where_clause = ""
+    if apply_team_filter:
+        where_clause = "AND upper(pt.team) = upper(?)"
+        params = (team_clean,)
+
+    query = f"""
+        WITH player_team_history AS (
+            SELECT
+                g.player_id,
+                upper(trim(substr(g.matchup, 1, instr(g.matchup, ' ') - 1))) AS team,
+                ROW_NUMBER() OVER (
+                    PARTITION BY g.player_id
+                    ORDER BY g.game_date DESC, g.game_log_id DESC
+                ) AS rn
+            FROM game_logs g
+            WHERE g.matchup IS NOT NULL AND instr(g.matchup, ' ') > 0
+        ),
+        player_team AS (
+            SELECT player_id, team
+            FROM player_team_history
+            WHERE rn = 1
+        )
+        SELECT
+            pt.player_id,
+            COALESCE(r.player_name, p.name, 'Player ' || pt.player_id) AS player_name,
+            pt.team
+        FROM player_team pt
+        LEFT JOIN nba_active_players_ref r ON r.player_id = pt.player_id
+        LEFT JOIN players p ON p.player_id = pt.player_id
+        WHERE COALESCE(r.player_name, p.name) IS NOT NULL
+          {where_clause}
+        ORDER BY player_name ASC
+    """
+
     with DatabaseManager(db_path=db_path) as db:
-        if team and team.strip().lower() not in {"", "all", "any"}:
-            df = pd.read_sql_query(
+        df = pd.read_sql_query(query, db.conn, params=params)
+
+    # Backfill: pull players that appear ONLY in betting_lines (no game logs
+    # yet) so the dropdown still surfaces them when the team filter is off.
+    if not apply_team_filter:
+        with DatabaseManager(db_path=db_path) as db:
+            extras = pd.read_sql_query(
                 """
-                SELECT DISTINCT p.player_id, p.name AS player_name, p.team
-                FROM players p
-                WHERE upper(p.team) = upper(?)
-                ORDER BY p.name ASC
-                """,
-                db.conn,
-                params=(team.strip(),),
-            )
-        else:
-            df = pd.read_sql_query(
-                """
-                SELECT DISTINCT p.player_id, p.name AS player_name, p.team
-                FROM players p
-                WHERE EXISTS (SELECT 1 FROM game_logs g WHERE g.player_id = p.player_id)
-                   OR EXISTS (SELECT 1 FROM betting_lines b WHERE b.player_id = p.player_id)
-                ORDER BY p.name ASC
+                SELECT DISTINCT
+                    b.player_id,
+                    COALESCE(r.player_name, p.name) AS player_name,
+                    NULL AS team
+                FROM betting_lines b
+                LEFT JOIN nba_active_players_ref r ON r.player_id = b.player_id
+                LEFT JOIN players p ON p.player_id = b.player_id
+                WHERE COALESCE(r.player_name, p.name) IS NOT NULL
+                  AND b.player_id NOT IN (SELECT player_id FROM game_logs)
                 """,
                 db.conn,
             )
-    return df
+        if not extras.empty:
+            df = pd.concat([df, extras], ignore_index=True)
+            df = df.drop_duplicates(subset=["player_id"]).sort_values("player_name")
+
+    return df.reset_index(drop=True)
+
+
+def _team_value_sql_expr(canonical_stat: str) -> Optional[str]:
+    """Return a SUM(..) SQL expression that aggregates the per-game team value.
+
+    Returns None for stats that don't have a clean team-level aggregation
+    (e.g. minutes, percentages).
+    """
+    column_map = {
+        "points": "points",
+        "assists": "assists",
+        "rebounds": "rebounds",
+        "three_pointers_made": "fg3m",
+        "field_goals_made": "fgm",
+    }
+    if canonical_stat in column_map:
+        col = column_map[canonical_stat]
+        return f"SUM(COALESCE({col}, 0))"
+    if canonical_stat == "pra":
+        return ("SUM(COALESCE(points, 0) + COALESCE(rebounds, 0) "
+                "+ COALESCE(assists, 0))")
+    if canonical_stat == "ra":
+        return "SUM(COALESCE(rebounds, 0) + COALESCE(assists, 0))"
+    return None
+
+
+def _fetch_latest_team_book_lines(
+    db: DatabaseManager,
+    team_code: str,
+    canonical_stat: str,
+    web_lookback_hours: float = 48.0,
+) -> pd.DataFrame:
+    """Per-book implied team-total rows for the team's most recent game.
+
+    Books expose game total + spread on the lobby; the team's *implied total*
+    is ``(game_total - team_spread) / 2`` (sign of spread naturally handles
+    favorite vs. underdog).  Returned shape mirrors the player path so the
+    same chart code re-uses it: book, line_value, over_odds, under_odds, game_date.
+
+    Currently only the ``points`` stat has a meaningful book reference.  For
+    other team stats (assists, rebounds, ...) the books don't surface a line
+    at the lobby level, so we return an empty frame.
+    """
+    if canonical_stat != "points":
+        return pd.DataFrame()
+    canonical = team_code_to_canonical(team_code)
+    if canonical is None:
+        return pd.DataFrame()
+
+    # Pull every (book, market, side) for the team's most recent game in the
+    # web_team_lines window.  We compute implied_total per-book downstream.
+    query = """
+        WITH latest_game AS (
+            SELECT away_team, home_team, MAX(observed_at_utc) AS observed_at_utc
+            FROM web_team_lines
+            WHERE (lower(away_team) = lower(?) OR lower(home_team) = lower(?))
+              AND observed_at_utc >= datetime('now', ?)
+            GROUP BY away_team, home_team
+            ORDER BY observed_at_utc DESC LIMIT 1
+        )
+        SELECT t.book, t.market_type, t.side, t.team,
+               t.line_value, t.observed_at_utc
+        FROM web_team_lines t
+        JOIN latest_game lg
+          ON t.away_team = lg.away_team AND t.home_team = lg.home_team
+        WHERE t.observed_at_utc >= datetime('now', ?)
+        ORDER BY t.book ASC, t.observed_at_utc DESC
+    """
+    lookback = f"-{float(web_lookback_hours)} hours"
+    rows = db.conn.execute(
+        query, (canonical, canonical, lookback, lookback),
+    ).fetchall()
+    if not rows:
+        return pd.DataFrame()
+
+    # Per-book latest spread (for our team) and game total.
+    by_book: dict[str, dict] = {}
+    for book, market, side, team, line, obs_at in rows:
+        slot = by_book.setdefault(
+            book.lower(),
+            {"book": book, "spread": None, "total": None, "date": obs_at},
+        )
+        if market == "spread" and team and team.lower() == canonical.lower():
+            if slot["spread"] is None:
+                slot["spread"] = float(line) if line is not None else None
+        elif market == "total" and side == "over":
+            if slot["total"] is None:
+                slot["total"] = float(line) if line is not None else None
+
+    out = []
+    for slot in by_book.values():
+        if slot["spread"] is None or slot["total"] is None:
+            continue
+        implied = (slot["total"] - slot["spread"]) / 2.0
+        out.append(
+            {
+                "book": slot["book"],
+                "line_value": float(implied),
+                "over_odds": None,
+                "under_odds": None,
+                "game_date": slot["date"],
+            }
+        )
+    if not out:
+        return pd.DataFrame()
+    return pd.DataFrame(out).sort_values("book").reset_index(drop=True)
+
+
+def fetch_recent_games(
+    db_path: str,
+    n: int = 50,
+    season: Optional[str] = None,
+    season_type: Optional[str] = None,
+    team_abbrev: Optional[str] = None,
+) -> pd.DataFrame:
+    """Frontend-facing wrapper for ``DatabaseManager.get_recent_games``.
+
+    Returns one row per matchup with both teams' final scores and a
+    ``winner`` column.  All filters are optional.
+    """
+    with DatabaseManager(db_path=db_path) as db:
+        rows = db.get_recent_games(
+            n=n, season=season, season_type=season_type, team_abbrev=team_abbrev,
+        )
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows)
+
+
+def fetch_player_recent_results(
+    db_path: str,
+    n: int = 200,
+    player_id: Optional[int] = None,
+    team_abbrev: Optional[str] = None,
+    season: Optional[str] = None,
+    stat: Optional[str] = None,
+    min_value: Optional[float] = None,
+) -> pd.DataFrame:
+    """Frontend-facing wrapper for ``DatabaseManager.get_player_recent_results``.
+
+    Useful for the "Player Stats Browse" surface to scan league-wide
+    recent results, optionally filtered by player, team, season, or "show
+    me players with at least N points last game".
+    """
+    with DatabaseManager(db_path=db_path) as db:
+        rows = db.get_player_recent_results(
+            n=n, player_id=player_id, team_abbrev=team_abbrev,
+            season=season, stat=stat, min_value=min_value,
+        )
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows)
+
+
+def list_seasons(db_path: str) -> list[str]:
+    """Distinct seasons available in the games table (newest first)."""
+    with DatabaseManager(db_path=db_path) as db:
+        rows = db.conn.execute(
+            "SELECT DISTINCT season FROM games ORDER BY season DESC"
+        ).fetchall()
+    return [r[0] for r in rows if r[0]]
+
+
+def list_team_codes(db_path: str) -> list[str]:
+    """Return the 30 NBA team codes that appear in ``game_logs.matchup``.
+
+    ``players.team`` is unreliable (audit shows ~93/94 NULL), so we parse
+    the team from ``game_logs.matchup`` (first whitespace-delimited token).
+    Filtered against the canonical NBA-team set in
+    ``nba_model.web.input_validation.KNOWN_TEAM_CODES`` to drop foreign /
+    exhibition codes (FIBA, EuroLeague, etc.) that ``playergamelogs``
+    sometimes returns when an NBA player suited up in an international game.
+    """
+    # Local import to avoid cycle: input_validation imports nothing from
+    # this module, but this module shouldn't pull validation at import time.
+    from nba_model.web.input_validation import KNOWN_TEAM_CODES
+
+    with DatabaseManager(db_path=db_path) as db:
+        df = pd.read_sql_query(
+            """
+            SELECT DISTINCT
+                upper(trim(substr(matchup, 1, instr(matchup, ' ') - 1))) AS team
+            FROM game_logs
+            WHERE matchup IS NOT NULL AND instr(matchup, ' ') > 0
+            ORDER BY team
+            """,
+            db.conn,
+        )
+    return [
+        t for t in df["team"].dropna().astype(str).tolist()
+        if t and t in KNOWN_TEAM_CODES
+    ]
+
+
+def fetch_team_chart_data(
+    db_path: str,
+    team: str,
+    stat_type: str,
+    n_games: int = 25,
+) -> "PlayerChartData":
+    """Aggregate game_logs into a team-level series for the figure builders.
+
+    Sums each player-game row in the team's last N games to get one team
+    value per game (e.g. team total points, team total 3PM). Returns the same
+    `PlayerChartData` shape so every existing figure builder works unchanged.
+    book_lines is always empty since team-totals odds aren't stored yet.
+    """
+    canonical = _canonical_stat_type(stat_type)
+    notes: list[str] = []
+    expr = _team_value_sql_expr(canonical)
+    team_code = (team or "").strip().upper()
+
+    if expr is None:
+        return PlayerChartData(
+            player_id=0,
+            player_name=team_code,
+            stat_type=canonical,
+            games=pd.DataFrame(),
+            values=np.array([], dtype=float),
+            book_lines=pd.DataFrame(),
+            market_consensus_line=None,
+            notes=[f"Team-level aggregation not supported for '{canonical}'."],
+        )
+
+    # SECURITY: `expr` is interpolated into the SQL string below. It MUST come
+    # from the controlled allowlist in `_team_value_sql_expr` and never from
+    # user input. The assert below makes that requirement explicit so future
+    # edits don't accidentally introduce a SQL-injection vector.
+    _allowed_exprs = {
+        "SUM(COALESCE(points, 0))",
+        "SUM(COALESCE(assists, 0))",
+        "SUM(COALESCE(rebounds, 0))",
+        "SUM(COALESCE(fg3m, 0))",
+        "SUM(COALESCE(fgm, 0))",
+        "SUM(COALESCE(points, 0) + COALESCE(rebounds, 0) + COALESCE(assists, 0))",
+        "SUM(COALESCE(rebounds, 0) + COALESCE(assists, 0))",
+    }
+    assert expr in _allowed_exprs, (
+        f"Refusing to interpolate untrusted SQL expression: {expr!r}. "
+        "Add it to _team_value_sql_expr's allowlist if legitimate."
+    )
+
+    with DatabaseManager(db_path=db_path) as db:
+        query = f"""
+            SELECT
+                game_date,
+                MAX(game_id)   AS game_id,
+                MAX(matchup)   AS matchup,
+                MAX(home_away) AS home_away,
+                MAX(result)    AS result,
+                {expr}         AS team_value,
+                COUNT(*)       AS players_in_game
+            FROM game_logs
+            WHERE upper(trim(substr(matchup, 1,
+                                    instr(matchup, ' ') - 1))) = ?
+            GROUP BY game_date, game_id
+            ORDER BY game_date DESC
+            LIMIT ?
+        """
+        df = pd.read_sql_query(
+            query, db.conn, params=(team_code, max(1, int(n_games))),
+        )
+
+    if df.empty:
+        notes.append(f"No game logs found for team '{team_code}'.")
+        return PlayerChartData(
+            player_id=0,
+            player_name=team_code,
+            stat_type=canonical,
+            games=df,
+            values=np.array([], dtype=float),
+            book_lines=pd.DataFrame(),
+            market_consensus_line=None,
+            notes=notes,
+        )
+
+    # Plot oldest -> newest like the player path.
+    df = df.sort_values("game_date", ascending=True).reset_index(drop=True)
+    values = df["team_value"].fillna(0).astype(float).to_numpy()
+    notes.append(
+        f"Team values are sums across {int(df['players_in_game'].mean()):.0f} "
+        "players per game on average."
+    )
+
+    # Pull cross-book consensus for the team's most recent game.  Currently
+    # only the ``points`` stat has a meaningful book reference (derived from
+    # game total + spread); other team stats return an empty frame.
+    with DatabaseManager(db_path=db_path) as db:
+        team_book_lines = _fetch_latest_team_book_lines(db, team_code, canonical)
+    market_line = _market_consensus_line(team_book_lines)
+    if not team_book_lines.empty and market_line is not None:
+        notes.append(
+            f"Book mean derived from {len(team_book_lines)} book(s): "
+            f"implied team total = (game_total - team_spread) / 2."
+        )
+
+    return PlayerChartData(
+        player_id=0,
+        player_name=team_code,
+        stat_type=canonical,
+        games=df,
+        values=values,
+        book_lines=team_book_lines,
+        market_consensus_line=market_line,
+        notes=notes,
+    )
 
 
 def list_teams(db_path: str) -> list[str]:
-    """Distinct non-null team codes present in the players table."""
-    with DatabaseManager(db_path=db_path) as db:
-        df = pd.read_sql_query(
-            "SELECT DISTINCT team FROM players "
-            "WHERE team IS NOT NULL AND TRIM(team) <> '' ORDER BY team",
-            db.conn,
-        )
-    return [str(t) for t in df["team"].tolist()]
+    """Distinct team codes that have at least one player game log.
+
+    The ``players.team`` column is mostly NULL (audit shows ~93/94 rows
+    unset), so reading it directly used to leave the sidebar dropdown with
+    a single team.  We parse the same value from ``game_logs.matchup``
+    (the first whitespace-delimited token), which has full coverage for
+    all 30 teams.
+    """
+    return list_team_codes(db_path)

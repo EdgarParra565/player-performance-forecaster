@@ -234,17 +234,23 @@ class SimpleModelUI:
         parlay_tab = ttk.Frame(notebook)
         manual_tab = ttk.Frame(notebook)
         charts_tab = ttk.Frame(notebook)
+        games_tab = ttk.Frame(notebook)
+        browse_tab = ttk.Frame(notebook)
         ops_tab = ttk.Frame(notebook)
         notebook.add(single_tab, text="Single Prop")
         notebook.add(parlay_tab, text="Parlay")
         notebook.add(manual_tab, text="Manual Lines Import")
         notebook.add(charts_tab, text="Player Charts")
+        notebook.add(games_tab, text="Game Results")
+        notebook.add(browse_tab, text="Player Stats Browse")
         notebook.add(ops_tab, text="Operations")
 
         self._build_single_tab(single_tab)
         self._build_parlay_tab(parlay_tab)
         self._build_manual_tab(manual_tab)
         self._build_player_charts_tab(charts_tab)
+        self._build_game_results_tab(games_tab)
+        self._build_player_browse_tab(browse_tab)
         self._build_operations_tab(ops_tab)
 
     @staticmethod
@@ -1231,7 +1237,8 @@ class SimpleModelUI:
         self.charts_stat = tk.StringVar(value="points")
         ttk.Combobox(
             controls, textvariable=self.charts_stat, state="readonly",
-            values=["points", "assists", "rebounds", "pra", "minutes"],
+            values=["points", "assists", "rebounds", "pra",
+                    "three_pointers_made", "field_goals_made", "minutes"],
             width=12,
         ).grid(row=2, column=1, sticky="w", padx=6, pady=4)
 
@@ -1506,6 +1513,279 @@ class SimpleModelUI:
         canvas.get_tk_widget().pack(fill="both", expand=True)
         setattr(self, canvas_attr, canvas)
 
+    # ---- Game Results tab --------------------------------------------------
+
+    def _build_game_results_tab(self, tab):
+        """Browse recent NBA games (one row per matchup with final scores)."""
+        outer = ttk.Frame(tab)
+        outer.pack(fill="both", expand=True, padx=8, pady=8)
+
+        # Filters row
+        filt = ttk.Frame(outer)
+        filt.pack(fill="x", pady=(0, 6))
+        ttk.Label(filt, text="DB path:").grid(row=0, column=0, sticky="w", padx=4)
+        self.games_db_path = tk.StringVar(value="data/database/nba_data.db")
+        ttk.Entry(filt, textvariable=self.games_db_path, width=32).grid(
+            row=0, column=1, padx=4, sticky="w")
+
+        ttk.Label(filt, text="Season:").grid(row=0, column=2, sticky="w", padx=8)
+        self.games_season = tk.StringVar(value="(all)")
+        self.games_season_combo = ttk.Combobox(
+            filt, textvariable=self.games_season,
+            values=["(all)"], state="readonly", width=10,
+        )
+        self.games_season_combo.grid(row=0, column=3, padx=4)
+
+        ttk.Label(filt, text="Type:").grid(row=0, column=4, sticky="w", padx=8)
+        self.games_season_type = tk.StringVar(value="(all)")
+        ttk.Combobox(
+            filt, textvariable=self.games_season_type,
+            values=["(all)", "Regular Season", "Playoffs", "Play-In", "Pre Season"],
+            state="readonly", width=14,
+        ).grid(row=0, column=5, padx=4)
+
+        ttk.Label(filt, text="Team:").grid(row=0, column=6, sticky="w", padx=8)
+        self.games_team = tk.StringVar(value="(all)")
+        self.games_team_combo = ttk.Combobox(
+            filt, textvariable=self.games_team, values=["(all)"],
+            state="readonly", width=8,
+        )
+        self.games_team_combo.grid(row=0, column=7, padx=4)
+
+        ttk.Label(filt, text="Limit:").grid(row=0, column=8, sticky="w", padx=8)
+        self.games_limit = tk.StringVar(value="100")
+        ttk.Entry(filt, textvariable=self.games_limit, width=6).grid(
+            row=0, column=9, padx=4)
+
+        ttk.Button(filt, text="Load games",
+                   command=self._load_game_results).grid(
+            row=0, column=10, padx=8)
+
+        # Table
+        table_frame = ttk.Frame(outer)
+        table_frame.pack(fill="both", expand=True)
+        cols = ("date", "season", "type", "matchup", "score", "winner")
+        self.games_table = ttk.Treeview(
+            table_frame, columns=cols, show="headings", height=24)
+        widths = {"date": 90, "season": 70, "type": 110, "matchup": 130,
+                  "score": 90, "winner": 70}
+        for c in cols:
+            self.games_table.heading(c, text=c.title())
+            self.games_table.column(c, width=widths[c],
+                                    anchor="center" if c != "matchup" else "w")
+        yscroll = ttk.Scrollbar(table_frame, orient="vertical",
+                                command=self.games_table.yview)
+        self.games_table.configure(yscrollcommand=yscroll.set)
+        self.games_table.pack(side="left", fill="both", expand=True)
+        yscroll.pack(side="right", fill="y")
+
+        self.games_status = tk.StringVar(value="")
+        ttk.Label(outer, textvariable=self.games_status, foreground="#555").pack(
+            fill="x", pady=(4, 0))
+
+        # Populate season + team dropdowns from DB on first render.
+        self.root.after(150, self._populate_games_filters)
+
+    def _populate_games_filters(self):
+        try:
+            from nba_model.visualization import player_charts as pc
+            seasons = ["(all)"] + pc.list_seasons(self.games_db_path.get())
+            teams = ["(all)"] + pc.list_team_codes(self.games_db_path.get())
+        except Exception as exc:
+            self.games_status.set(f"Filter load failed: {exc}")
+            return
+        self.games_season_combo.configure(values=seasons)
+        self.games_team_combo.configure(values=teams)
+
+    def _load_game_results(self):
+        try:
+            from nba_model.visualization import player_charts as pc
+            from nba_model.web import input_validation as iv
+            limit = iv.validate_n_games(self.games_limit.get() or "100",
+                                        min_value=10)
+            season_arg = (None if self.games_season.get() == "(all)"
+                          else iv.validate_season(self.games_season.get()))
+            team_arg = (None if self.games_team.get() == "(all)"
+                        else iv.validate_team_code(self.games_team.get()))
+            df = pc.fetch_recent_games(
+                db_path=self.games_db_path.get(),
+                n=limit,
+                season=season_arg,
+                season_type=(None if self.games_season_type.get() == "(all)"
+                             else self.games_season_type.get()),
+                team_abbrev=team_arg,
+            )
+        except iv.ValidationError as exc:
+            self.games_status.set(f"Invalid filter: {exc}")
+            return
+        except Exception as exc:
+            self.games_status.set(f"Query failed: {exc}")
+            return
+        for row in self.games_table.get_children():
+            self.games_table.delete(row)
+        if df.empty:
+            self.games_status.set("No games match those filters.")
+            return
+        for _, r in df.iterrows():
+            try:
+                score = (f"{int(r['away_pts'])}–{int(r['home_pts'])}"
+                         if r['away_pts'] is not None and r['home_pts'] is not None
+                         else "—")
+            except (TypeError, ValueError):
+                score = "—"
+            self.games_table.insert(
+                "", "end",
+                values=(
+                    str(r["game_date"])[:10],
+                    r["season"],
+                    r["season_type"],
+                    f"{r['away_abbrev']} @ {r['home_abbrev']}",
+                    score,
+                    r["winner"] or "—",
+                ),
+            )
+        self.games_status.set(f"Loaded {len(df)} game(s).")
+
+    # ---- Player Stats Browse tab ------------------------------------------
+
+    def _build_player_browse_tab(self, tab):
+        """League-wide recent player game logs with stat-threshold filtering."""
+        outer = ttk.Frame(tab)
+        outer.pack(fill="both", expand=True, padx=8, pady=8)
+
+        filt = ttk.Frame(outer)
+        filt.pack(fill="x", pady=(0, 6))
+        ttk.Label(filt, text="Season:").grid(row=0, column=0, sticky="w", padx=4)
+        self.browse_season = tk.StringVar(value="(any)")
+        self.browse_season_combo = ttk.Combobox(
+            filt, textvariable=self.browse_season, values=["(any)"],
+            state="readonly", width=10,
+        )
+        self.browse_season_combo.grid(row=0, column=1, padx=4)
+
+        ttk.Label(filt, text="Team:").grid(row=0, column=2, sticky="w", padx=8)
+        self.browse_team = tk.StringVar(value="(any)")
+        self.browse_team_combo = ttk.Combobox(
+            filt, textvariable=self.browse_team, values=["(any)"],
+            state="readonly", width=8,
+        )
+        self.browse_team_combo.grid(row=0, column=3, padx=4)
+
+        ttk.Label(filt, text="Stat ≥").grid(row=0, column=4, sticky="w", padx=8)
+        self.browse_stat = tk.StringVar(value="(none)")
+        ttk.Combobox(
+            filt, textvariable=self.browse_stat,
+            values=["(none)", "points", "rebounds", "assists",
+                    "steals", "blocks", "fg3m", "minutes"],
+            state="readonly", width=10,
+        ).grid(row=0, column=5, padx=4)
+        self.browse_min_value = tk.StringVar(value="")
+        ttk.Entry(filt, textvariable=self.browse_min_value, width=6).grid(
+            row=0, column=6, padx=4)
+
+        ttk.Label(filt, text="Limit:").grid(row=0, column=7, sticky="w", padx=8)
+        self.browse_limit = tk.StringVar(value="200")
+        ttk.Entry(filt, textvariable=self.browse_limit, width=6).grid(
+            row=0, column=8, padx=4)
+
+        ttk.Button(filt, text="Load",
+                   command=self._load_player_browse).grid(
+            row=0, column=9, padx=8)
+
+        # Table
+        table_frame = ttk.Frame(outer)
+        table_frame.pack(fill="both", expand=True)
+        cols = ("date", "player", "matchup", "result", "min",
+                "pts", "reb", "ast", "stl", "blk", "to", "3pm", "+/-")
+        self.browse_table = ttk.Treeview(
+            table_frame, columns=cols, show="headings", height=22)
+        widths = {"date": 85, "player": 160, "matchup": 110, "result": 50,
+                  "min": 45, "pts": 45, "reb": 45, "ast": 45,
+                  "stl": 40, "blk": 40, "to": 40, "3pm": 45, "+/-": 50}
+        for c in cols:
+            self.browse_table.heading(c, text=c)
+            self.browse_table.column(c, width=widths[c],
+                                     anchor=("w" if c == "player" else "center"))
+        yscroll = ttk.Scrollbar(table_frame, orient="vertical",
+                                command=self.browse_table.yview)
+        self.browse_table.configure(yscrollcommand=yscroll.set)
+        self.browse_table.pack(side="left", fill="both", expand=True)
+        yscroll.pack(side="right", fill="y")
+
+        self.browse_status = tk.StringVar(value="")
+        ttk.Label(outer, textvariable=self.browse_status, foreground="#555").pack(
+            fill="x", pady=(4, 0))
+
+        self.root.after(150, self._populate_browse_filters)
+
+    def _populate_browse_filters(self):
+        try:
+            from nba_model.visualization import player_charts as pc
+            seasons = ["(any)"] + pc.list_seasons("data/database/nba_data.db")
+            teams = ["(any)"] + pc.list_team_codes("data/database/nba_data.db")
+        except Exception as exc:
+            self.browse_status.set(f"Filter load failed: {exc}")
+            return
+        self.browse_season_combo.configure(values=seasons)
+        self.browse_team_combo.configure(values=teams)
+
+    def _load_player_browse(self):
+        try:
+            from nba_model.visualization import player_charts as pc
+            from nba_model.web import input_validation as iv
+            min_val_text = self.browse_min_value.get().strip()
+            min_val = float(min_val_text) if min_val_text else None
+            stat = (None if self.browse_stat.get() == "(none)"
+                    else iv.validate_stat_type(self.browse_stat.get()))
+            limit = iv.validate_n_games(self.browse_limit.get() or "200",
+                                        min_value=10)
+            team_arg = (None if self.browse_team.get() == "(any)"
+                        else iv.validate_team_code(self.browse_team.get()))
+            season_arg = (None if self.browse_season.get() == "(any)"
+                          else iv.validate_season(self.browse_season.get()))
+            df = pc.fetch_player_recent_results(
+                db_path="data/database/nba_data.db",
+                n=limit,
+                team_abbrev=team_arg,
+                season=season_arg,
+                stat=stat,
+                min_value=min_val if stat else None,
+            )
+        except (iv.ValidationError, ValueError) as exc:
+            self.browse_status.set(f"Invalid filter: {exc}")
+            return
+        except Exception as exc:
+            self.browse_status.set(f"Query failed: {exc}")
+            return
+        for row in self.browse_table.get_children():
+            self.browse_table.delete(row)
+        if df.empty:
+            self.browse_status.set("No player games match those filters.")
+            return
+        for _, r in df.iterrows():
+            self.browse_table.insert(
+                "", "end",
+                values=(
+                    str(r["game_date"])[:10],
+                    r.get("player_name") or "",
+                    r.get("matchup") or "",
+                    r.get("result") or "",
+                    f"{r['minutes']:.0f}" if r.get("minutes") is not None else "",
+                    r.get("points") if r.get("points") is not None else "",
+                    r.get("rebounds") if r.get("rebounds") is not None else "",
+                    r.get("assists") if r.get("assists") is not None else "",
+                    r.get("steals") if r.get("steals") is not None else "",
+                    r.get("blocks") if r.get("blocks") is not None else "",
+                    r.get("turnovers") if r.get("turnovers") is not None else "",
+                    r.get("fg3m") if r.get("fg3m") is not None else "",
+                    r.get("plus_minus") if r.get("plus_minus") is not None else "",
+                ),
+            )
+        n_players = df["player_name"].nunique() if "player_name" in df.columns else 0
+        self.browse_status.set(
+            f"Loaded {len(df)} game(s) across {n_players} player(s)."
+        )
+
     # ---- Operations tab ----------------------------------------------------
 
     def _build_operations_tab(self, tab):
@@ -1522,11 +1802,13 @@ class SimpleModelUI:
         parser_frame = ttk.Frame(ops_nb)
         eval_frame = ttk.Frame(ops_nb)
         revx_frame = ttk.Frame(ops_nb)
+        audit_frame = ttk.Frame(ops_nb)
         ops_nb.add(etl_frame, text="Daily ETL")
         ops_nb.add(web_frame, text="Web Text")
         ops_nb.add(parser_frame, text="Browser Parser")
         ops_nb.add(eval_frame, text="Evaluation")
         ops_nb.add(revx_frame, text="Reverse-Engineering")
+        ops_nb.add(audit_frame, text="DB Audit")
 
         # Shared output panel + control buttons.
         bottom = ttk.Frame(outer)
@@ -1555,6 +1837,7 @@ class SimpleModelUI:
         self._build_ops_parser(parser_frame)
         self._build_ops_eval(eval_frame)
         self._build_ops_revx(revx_frame)
+        self._build_ops_audit(audit_frame)
 
     @staticmethod
     def _ops_field(parent, row, label, default="", width=46):
@@ -1740,6 +2023,59 @@ class SimpleModelUI:
         ttk.Button(frame, text="Run Reverse-Engineering",
                    command=self._ops_run_reverse_engineering).grid(
             row=8, column=0, sticky="w", padx=6, pady=10)
+
+    def _build_ops_audit(self, frame):
+        """DB inventory audit: refresh data/DATABASE_INVENTORY.txt."""
+        frame.columnconfigure(1, weight=1)
+        ttk.Label(
+            frame,
+            text=(
+                "Generates a per-table breakdown of what's in the SQLite DB.\n"
+                "Output is written to data/DATABASE_INVENTORY.txt and printed\n"
+                "below. Re-run any time to refresh the snapshot."
+            ),
+            justify="left",
+        ).grid(row=0, column=0, columnspan=3, sticky="w", padx=6, pady=(6, 8))
+        self.audit_db_path = self._ops_field(
+            frame, 1, "DB path", "data/database/nba_data.db")
+        self.audit_output = self._ops_field(
+            frame, 2, "Output file", "data/DATABASE_INVENTORY.txt")
+        self.audit_print_stdout = self._ops_check(
+            frame, 3, "also print full report to operations log", default=True)
+        ttk.Button(frame, text="Refresh DB inventory",
+                   command=self._ops_run_audit).grid(
+            row=4, column=0, sticky="w", padx=6, pady=10)
+        ttk.Button(frame, text="Open inventory file",
+                   command=self._ops_open_inventory).grid(
+            row=4, column=1, sticky="w", padx=6, pady=10)
+
+    def _ops_run_audit(self) -> None:
+        args: list[str] = []
+        self._opt_if(args, "--db-path", self.audit_db_path.get())
+        self._opt_if(args, "--output", self.audit_output.get())
+        if self.audit_print_stdout.get():
+            args.append("--stdout")
+        self._ops_launch("DB Audit", "nba_model.data.audit_db", args)
+
+    def _ops_open_inventory(self) -> None:
+        path = (self.audit_output.get() or "data/DATABASE_INVENTORY.txt").strip()
+        if not Path(path).is_absolute():
+            path = str(Path.cwd() / path)
+        if not Path(path).exists():
+            messagebox.showinfo(
+                "Inventory file missing",
+                f"No inventory file at {path}. Click 'Refresh DB inventory' first.",
+            )
+            return
+        try:
+            if sys.platform == "darwin":
+                subprocess.Popen(["open", path])
+            elif sys.platform.startswith("win"):
+                os.startfile(path)  # type: ignore[attr-defined]
+            else:
+                subprocess.Popen(["xdg-open", path])
+        except Exception as exc:
+            messagebox.showerror("Open inventory", f"Could not open: {exc}")
 
     # ---- Operations: helpers and command launchers --------------------------
 

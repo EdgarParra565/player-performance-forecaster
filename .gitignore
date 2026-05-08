@@ -55,5 +55,9 @@ nba_model/data/artifacts/
 # Browser auth/session artifacts
 data/config/auth/
 
+# Streamlit / deployment secrets
+.streamlit/secrets.toml
+data/database/subscriptions.db
+
 # Claude AI agent artifacts
 .claude/

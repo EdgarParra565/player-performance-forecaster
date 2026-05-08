@@ -15,6 +15,7 @@ import requests
 from nba_api.stats.static import players as nba_players
 
 from nba_model.data.database.db_manager import DatabaseManager
+from nba_model.scrapers import get_scraper_for_url
 
 logger = logging.getLogger(__name__)
 
@@ -33,100 +34,10 @@ DEFAULT_WEB_TEXT_USER_AGENT = (
     "Chrome/124.0.0.0 Safari/537.36"
 )
 
-_BOOK_WAIT_SELECTORS: dict[str, list[str]] = {
-    "underdogfantasy.com": [
-        "[class*='pick-em']",
-        "[class*='player-pick']",
-        "[class*='stat-line']",
-        "[data-testid*='pick']",
-        "[class*='higher-lower']",
-    ],
-    "prizepicks.com": [
-        # broad class-name fragment matches — PrizePicks uses CSS modules so names vary
-        "[class*='Projection']",
-        "[class*='projection']",
-        "[class*='ProjectionCard']",
-        "[class*='StatLine']",
-        "[class*='stat-line']",
-        "[class*='Pick']",
-        "[class*='pick']",
-        "[data-testid*='projection']",
-        "[data-testid*='pick']",
-        # semantic fallback — PP wraps each card in an article or li
-        "article",
-        "ul li",
-    ],
-    "draftkings.com": [
-        "[class*='sportsbook-outcome']",
-        "[class*='player-prop']",
-    ],
-    "fanduel.com": [
-        "[class*='player-prop']",
-        "[class*='alternate-line']",
-    ],
-}
-
-_BOOK_EXTRA_WAIT_SECONDS: dict[str, float] = {
-    "underdogfantasy.com": 5.0,
-    "prizepicks.com": 8.0,  # extra time for React SPA lazy render
-    "draftkings.com": 4.0,
-    "fanduel.com": 4.0,
-}
-
-# Book-specific session-validation markers.
-# login_wall: substrings that (when found in page text) indicate an unauthenticated state.
-# authenticated: substrings that should appear when the user IS logged in with live content.
-# min_authenticated_hits: how many authenticated markers must be present to confirm a valid session.
-_BOOK_SESSION_MARKERS: dict[str, dict] = {
-    "prizepicks.com": {
-        "login_wall": [
-            "enter your phone number",
-            "enter phone number",
-            "log in to prizepicks",
-            "create a new account",
-            "sign up for prizepicks",
-            "verify your identity",
-        ],
-        "authenticated": [
-            "more",
-            "less",
-            "projections",
-            "nba",
-            "points",
-            "rebounds",
-            "assists",
-        ],
-        "min_authenticated_hits": 4,
-    },
-    "underdogfantasy.com": {
-        "login_wall": [
-            "sign in to continue",
-            "enter your email",
-            "forgot password",
-        ],
-        "authenticated": [
-            "higher",
-            "lower",
-            "nba",
-            "pick",
-            "points",
-        ],
-        "min_authenticated_hits": 3,
-    },
-}
-
-
 def _match_book_domain(url: str) -> Optional[str]:
-    """Return the book domain key from _BOOK_WAIT_SELECTORS that matches url."""
-    try:
-        from urllib.parse import urlparse
-        host = urlparse(url).netloc.lower()
-    except Exception:
-        return None
-    for domain in _BOOK_WAIT_SELECTORS:
-        if host == domain or host.endswith(f".{domain}"):
-            return domain
-    return None
+    """Return the matching book domain key from the scrapers registry."""
+    scraper = get_scraper_for_url(url)
+    return scraper.domain if scraper is not None else None
 
 
 class _VisibleTextParser(HTMLParser):
@@ -652,19 +563,18 @@ def _check_session_content(text: str, url: str, min_content_length: int) -> tupl
     the URL matches a known sportsbook domain; falls back to generic heuristics.
     """
     text_lower = text.lower()
-    book_domain = _match_book_domain(url)
-    markers = _BOOK_SESSION_MARKERS.get(book_domain or "", {})
+    scraper = get_scraper_for_url(url)
+    markers = scraper.session_markers if scraper is not None else None
 
-    if markers:
+    if markers and (markers.login_wall or markers.authenticated):
         # Book-specific: check for explicit login-wall phrases.
-        login_wall_phrases = markers.get("login_wall", [])
-        for phrase in login_wall_phrases:
+        for phrase in markers.login_wall:
             if phrase in text_lower:
                 return False, f"Login-wall phrase detected: '{phrase}'"
 
         # Book-specific: require a minimum number of authenticated content markers.
-        auth_phrases = markers.get("authenticated", [])
-        min_hits = int(markers.get("min_authenticated_hits", 3))
+        auth_phrases = markers.authenticated
+        min_hits = int(markers.min_authenticated_hits)
         hit_count = sum(1 for phrase in auth_phrases if phrase in text_lower)
         if len(text) < min_content_length:
             return False, (
@@ -865,11 +775,10 @@ def _detect_login_wall_early(page, url: str) -> bool:
     Returns True when book-specific login-wall phrases are found so we can
     skip the expensive per-selector wait loop and avoid multi-minute hangs.
     """
-    book_domain = _match_book_domain(url)
-    markers = _BOOK_SESSION_MARKERS.get(book_domain or "", {})
-    login_wall_phrases = markers.get("login_wall", [])
-    if not login_wall_phrases:
+    scraper = get_scraper_for_url(url)
+    if scraper is None or not scraper.session_markers.login_wall:
         return False
+    login_wall_phrases = scraper.session_markers.login_wall
     try:
         text = page.inner_text("body")
         text_lower = str(text or "").lower()
@@ -890,9 +799,10 @@ def _wait_for_dynamic_content(page, url: str, base_wait_seconds: float) -> None:
         logger.info("Login wall detected early for %s — skipping extended content waits.", url)
         return
 
-    book_domain = _match_book_domain(url)
-    selectors = _BOOK_WAIT_SELECTORS.get(book_domain or "", [])
-    extra_wait = _BOOK_EXTRA_WAIT_SECONDS.get(book_domain or "", 0.0)
+    scraper = get_scraper_for_url(url)
+    selectors = scraper.wait_selectors if scraper is not None else ()
+    extra_wait = scraper.extra_wait_seconds if scraper is not None else 0.0
+    book_domain = scraper.domain if scraper is not None else None
 
     selector_found = False
     for selector in selectors:
@@ -927,55 +837,6 @@ def _wait_for_dynamic_content(page, url: str, base_wait_seconds: float) -> None:
             pass
 
 
-def _extract_prizepicks_text_js(page) -> str:
-    """
-    Extract PrizePicks projection card text via targeted JavaScript DOM traversal.
-
-    PrizePicks uses a React SPA with CSS-module class names that change between
-    deploys. This approach queries a broad set of structural selectors and returns
-    the deduplicated visible text of matching elements.
-    """
-    try:
-        result = page.evaluate(
-            """
-            () => {
-                const selectors = [
-                    '[class*="Projection"]',
-                    '[class*="projection"]',
-                    '[class*="StatLine"]',
-                    '[class*="stat-line"]',
-                    '[class*="PlayerCard"]',
-                    '[class*="player-card"]',
-                    '[class*="Pick"]',
-                    '[class*="pick"]',
-                    '[class*="Board"]',
-                    '[class*="board"]',
-                    '[data-testid*="projection"]',
-                    '[data-testid*="pick"]',
-                    'article',
-                ];
-                const texts = [];
-                const seen = new Set();
-                for (const sel of selectors) {
-                    try {
-                        document.querySelectorAll(sel).forEach(el => {
-                            const t = (el.innerText || '').trim().replace(/\\s+/g, ' ');
-                            if (t.length > 8 && !seen.has(t)) {
-                                seen.add(t);
-                                texts.push(t);
-                            }
-                        });
-                    } catch (e) {}
-                }
-                return texts.join(' ');
-            }
-            """
-        )
-        return _collapse_whitespace(str(result or ""))
-    except Exception:
-        return ""
-
-
 def _extract_page_text(page, url: str = "") -> str:
     """Extract visible text from page using multiple strategies."""
     body_html = page.content() or ""
@@ -1001,16 +862,20 @@ def _extract_page_text(page, url: str = "") -> str:
         except Exception:
             pass
 
-    # For PrizePicks, supplement with a targeted JS extraction of projection cards,
-    # which may not be captured reliably by the generic HTML/innerText strategies.
-    book_domain = _match_book_domain(url)
-    if book_domain == "prizepicks.com":
-        pp_text = _extract_prizepicks_text_js(page)
-        if pp_text and len(pp_text) > len(visible_text):
-            logger.info("PrizePicks JS extraction yielded %d chars (vs %d HTML)", len(pp_text), len(visible_text))
-            visible_text = pp_text
-        elif pp_text:
-            visible_text = visible_text + " " + pp_text
+    # If this URL belongs to a book whose scraper exposes a JS extractor,
+    # supplement with its targeted DOM extraction (handles cases where the
+    # generic HTML / innerText strategies miss CSS-module React content).
+    scraper = get_scraper_for_url(url)
+    if scraper is not None and scraper.js_extractor is not None:
+        extra = _collapse_whitespace(scraper.js_extractor(page) or "")
+        if extra and len(extra) > len(visible_text):
+            logger.info(
+                "%s JS extraction yielded %d chars (vs %d HTML)",
+                scraper.name, len(extra), len(visible_text),
+            )
+            visible_text = extra
+        elif extra:
+            visible_text = visible_text + " " + extra
 
     return visible_text
 

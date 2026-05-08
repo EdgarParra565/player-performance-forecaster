@@ -1,0 +1,9 @@
+# Dev-only tools. Install with:
+#     .venv/bin/python3 -m pip install -r requirements-dev.txt
+# These should NEVER be in the production image - only the test/CI matrix.
+
+-r requirements.txt
+
+pytest~=8.4
+pip-audit~=2.7    # SCA: scan installed packages for known CVEs
+bandit~=1.7       # SAST: scan our own source for common Python issues
