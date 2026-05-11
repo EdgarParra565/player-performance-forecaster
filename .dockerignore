@@ -1,0 +1,73 @@
+# Keep the build context small + never bake secrets / local state into the image.
+# Anything matched here is invisible to the Dockerfile.
+
+# Local virtualenvs
+.venv/
+venv/
+env/
+ENV/
+
+# Python build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# IDE / OS noise
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Secrets - critical: NEVER let these leak into a built image
+.streamlit/secrets.toml
+.env
+.env.local
+data/database/subscriptions.db
+data/state/watchlists.json
+data/config/auth/
+
+# Large / regenerable data we don't need at build time. Real DBs are
+# mounted at runtime via docker-compose volumes.
+data/raw/
+data/artifacts/
+data/logs/
+nba_model/data/artifacts/
+nba_model/data/logs/
+backups/
+backtest_results.csv
+
+# Browser automation artifacts (desktop / scraping path, not web)
+.playwright-browsers/
+
+# Docs / dev tooling not needed at runtime
+docs/
+scripts/
+notes.txt
+.git/
+.gitignore
+.dockerignore
+Dockerfile
+docker-compose*.yml
+README.md
+requirements-dev.txt
+
+# Tests don't run inside the image (CI handles them separately)
+nba_model/tests/
+
+# Agent / build artifacts
+.claude/

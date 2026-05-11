@@ -1,6 +1,6 @@
 # NBA Player Performance Forecaster - Working Notes
 
-Last updated: 2026-05-08
+Last updated: 2026-05-11
 
 This file is the active project tracker. It keeps only:
 - current architecture
@@ -10,10 +10,206 @@ This file is the active project tracker. It keeps only:
 
 
 Near-term objective:
-- increase historical coverage quality (game logs + line snapshots + aligned predictions)
-- select production defaults from real benchmark outputs
 - expand the Player Charts UI as the marquee analysis surface
 - broaden cross-book consensus by activating more scrapers (currently 9 of 20)
+- wire team-line priors (implied totals / pace / devig win-prob) into the
+  player-projection model so the consensus feeds back into the chart-driven EV
+---
+
+## 0) End-of-Day Status (2026-05-11)
+
+### Added/fixed today (correctness + use-the-data + productionize batch)
+
+**Correctness fixes (block downstream work):**
+- [x] **American-odds averaging fix** in `get_consensus_team_lines`. Naive
+  `AVG(odds_american)` silently produced bogus values when the sample mixed
+  + and - (e.g. Spurs/Wolves home spread `+100, -105, -108` averaged to
+  `-37.7`; Knicks/76ers ML away `+100, +105, -110, -110, +115` averaged to
+  `+68`). Path now: American → implied prob → mean prob → American.
+  Returns both `mean_odds` (correct) and `mean_odds_naive` (legacy, for
+  inspection). Real-data verification: Knicks ML away corrected from
+  `+68` → `+108`; Spurs spread home corrected from `-38` → `-104`.
+  Added `_american_to_implied_prob` and `_implied_prob_to_american` module
+  helpers in `db_manager.py`.
+- [x] **Backfill `players` table.** Before: 94 rows, 1 with `team` set.
+  After: 531 rows, 528 with team derived from each player's most-recent
+  `game_logs.matchup`, 30 distinct teams.  New `db.sync_players_table()`
+  reads `nba_active_players_ref` + ranks `game_logs` per player by date
+  to determine current team. Kills the indirection through the sparse
+  legacy table that we worked around in chart helpers.
+
+**Use the data we just ingested (Priority A from the prior notes):**
+- [x] **Real-data benchmark pass** (`run_real_data_benchmark.py`) on 12
+  star players (LeBron, Curry, Tatum, Jokic, Luka, Giannis, Embiid,
+  Edwards, SGA, Lillard, Brunson, KAT) × windows 5/7/10/15 × stats
+  points/assists/rebounds/pra × distributions normal/poisson. All
+  player-window groups statistically significant vs 52.4% breakeven
+  (p ≈ 0 for the heavy-volume players, lowest p = 7e-3 for SGA's
+  single-window run).  Artifacts at
+  `nba_model/evaluation/artifacts/real_data_2026-05-11_*`.
+- [x] **Distribution sweep** (`run_distribution_sweep.py`) on the same
+  10-player cohort. Output shows points is the discriminating stat
+  (normal 56.1% / poisson 56.3% win rate against line=25.5); pra is
+  91.6% win at the same line (line is systematically too low for PRA).
+  Artifacts at
+  `nba_model/evaluation/artifacts/distribution_sweep_2026-05-11_*`.
+- [x] **Predictions outcome backfill.** All 18,460 pending predictions
+  settled against current `game_logs`. New
+  `db.backfill_predictions_outcomes()` matches `(player_id, game_date)`,
+  computes `actual_result` per stat (incl. derived PRA/RA), and assigns
+  `outcome` ∈ {`over`, `under`, `push`}. Settled outcomes can now drive
+  retrospective Brier / hit-rate / EV analysis.  Hit-rate by stat:
+  points 54.5% over, pra 91.6%, rebounds/assists 0% over (lines used at
+  prediction time were systematically off, which is itself a useful signal).
+
+**Make cross-book consensus drive the model:**
+- [x] **Team-line reverse-engineering.** New
+  `nba_model/model/team_line_reverse_engineering.py` derives priors per
+  matchup from cross-book consensus:
+    - implied team totals: `(consensus_total ± spread) / 2`
+    - devigged win probabilities via two-way proportional de-vig
+      (each side's raw implied / sum of raw implieds)
+    - pace proxy: `total / 228` (league-average baseline)
+  Stored in a new `team_priors` table; CLI:
+  `python -m nba_model.model.team_line_reverse_engineering --since-hours 168 --min-books 2`.
+  Live verification: 4 NBA playoff matchups, all 5-book consensus.
+  Example output (Thunder @ Lakers): implied totals 110.1 / 101.8, devig
+  win prob 0.245 / 0.755, pace factor 0.929.
+  Adds `db.upsert_team_priors()` + `db.get_team_prior()` query helpers.
+- [x] **Shared player-name alias resolver** in
+  `nba_model/scrapers/player_names.py`. Centralizes the matching matrix
+  (exact, suffix-stripped, initial+surname, surname-only-when-unique,
+  "Last, First" comma form) so every scraper / DB join can resolve
+  variants without duplicating logic. Pick6's abbreviated-name expansion
+  now delegates to this resolver (was hand-rolled in `pick6.py`).
+  Public API: `resolve_player_name(raw, active_names)` returning
+  canonical name or `None` on ambiguity.
+
+**Productionize:**
+- [x] **Wired `nba_results_ingestion` into `daily_etl.py`.** New
+  `bulk_results_ingest` step runs BEFORE the per-player game-logs step
+  so the heavy bulk endpoint populates `games` + `game_logs` once per
+  season; per-player retries then only have to backfill what the bulk
+  pass missed. Flags: `--skip-bulk-results-ingest` and
+  `--bulk-results-seasons 2025-26 2024-25` for control.
+- [x] **GitHub Actions workflow** `.github/workflows/nba_results_ingest.yml`
+  runs the bulk ingest on its own schedule (08:30 UTC daily, 30 min
+  after the main `daily_etl.yml` kicks off). Supports
+  `workflow_dispatch` with inputs for seasons + skip-player-logs.
+
+**Tests added (194 passing total, was 174 at start of this batch):**
+- [x] `test_player_names_resolver.py` — 13 tests covering exact /
+  case-insensitive / punctuation / suffix / initial / surname-only /
+  "Last, First" / ambiguous / unknown.
+- [x] `test_odds_consensus.py` — 7 tests covering odds round-trip
+  conversion across the +/- range, the 3-book sign-mixed consensus
+  case (the original bug), and the team-priors derivation
+  (implied totals + devig win probs).
+
+### Added/fixed today — Session 2 (frontend track + Docker)
+
+User chose to defer the pre-launch billing/Postgres migration and instead
+prioritize product-visible features + UX polish to test demand:
+
+**Billing temporarily deactivated (code preserved):**
+- [x] New `BILLING_ENABLED` flag in `nba_model/web/auth.py`. Default = False,
+  flips on via env var `BILLING_ENABLED=1`. When off: every visitor is
+  treated as Premium, no paywall renders, `render_user_card()` returns
+  nothing, `paywall()` is a no-op. The whole Stripe + OIDC + subscription
+  + webhook code path is untouched and ready to re-engage in one env-var
+  flip. Title-suffix and "Free preview mode" banner are also gated on
+  `BILLING_ENABLED` so the open-launch site shows no upsell.
+
+**Product-visible frontend features:**
+- [x] **URL query-string state**: `?player=Nikola+Jokic&stat=points&n_games=20&view=Player+charts`
+  is shareable and the browser back/forward button preserves selections.
+  Six params wired: `team`, `player`, `stat`, `n_games`, `view`, `rolling`.
+  New `_qp_get` / `_qp_get_int` / `_qp_set` / `_index_or_zero` helpers in
+  `nba_model/web/app.py`.
+- [x] **Multi-player compare view**: new "Compare players" view-mode option
+  that overlays 2-3 players' distributions for the same stat on one chart.
+  New `build_multi_player_distribution_figure` in `player_charts.py`
+  (translucent histograms + fitted normals + per-player book-mean markers
+  in matching color families). Player-by-player summary table + CSV export.
+- [x] **CSV download buttons** on three tables via new `_csv_download_button`
+  helper: book-lines table (`<player>_<stat>_book_lines.csv`), raw game
+  logs (`<player>_<stat>_last<N>_games.csv`), custom-line probe history
+  (`custom_line_probe_history.csv`). The probe panel now keeps a per-session
+  ring buffer (cap 100) so power users can iterate through lines and export
+  the audit log; "Clear history" button included.
+
+**UX upgrades:**
+- [x] **Plotly migration (marquee distribution chart)**: new
+  `nba_model/visualization/plotly_charts.py` module. Streamlit views now use
+  Plotly for the distribution histogram (hover-for-exact-values, click-
+  legend-to-isolate-per-book, zoom + pan, double-click to reset). Other
+  charts (recent games / hit-rate / splits) stay matplotlib for now — the
+  Tk desktop UI still uses `player_charts.py` matplotlib path unchanged.
+  `plotly~=6.7` added to requirements.txt.
+- [x] **Live ETL status sidebar widget**: new `nba_model/web/etl_status.py`
+  reads the most recent `daily_etl_report_*.json`, surfaces "Data freshness
+  - 4h ago" with per-step badges (success / partial / failed / skipped) in
+  an expander. Degrades gracefully when no report exists. Trust signal +
+  stale-deploy detector.
+- [x] **Watchlist**: new `nba_model/web/watchlist.py`. Per-session via
+  `st.session_state`; when `BILLING_ENABLED` and signed in, also persists
+  to `data/state/watchlists.json` keyed by email (chmod 0600, capped at
+  25 entries). Sidebar widget: click an entry to jump to that player
+  (writes URL param so the view re-renders), per-row delete, clear-all.
+  "Pin <player> to watchlist" button on the player view.
+
+**Docker (containerized testing + self-host target):**
+- [x] **Dockerfile** for the Streamlit web app: Python 3.11-slim base,
+  non-root `app` user (UID 10001), tini PID 1, `HEALTHCHECK` against
+  `/_stcore/health`. Installs from `requirements.txt` (compatible-release
+  `~=` ranges) instead of `requirements.lock` to dodge the
+  pycookiecheat ↔ cryptography conflict — the web container doesn't need
+  pycookiecheat anyway since browser scraping still requires real Chrome
+  on the developer's host.
+- [x] **`.dockerignore`** strips `.venv`, secrets, large data, tests, scripts,
+  docs from the build context. Explicit safety on `secrets.toml`,
+  `subscriptions.db`, `data/state/watchlists.json`, `data/config/auth/`.
+- [x] **`docker-compose.yml`** with four services: `streamlit` (default,
+  port 8501), `tests` + `etl-bulk` (profile `tools`), `webhook` (profile
+  `billing`, port 8000). Bind-mounts `./data:/app/data` so SQLite state
+  persists; commented bind-mount for `.streamlit/secrets.toml` when
+  billing is re-engaged.
+- [x] **Verified end-to-end**: `docker build` succeeds, container boots
+  healthy in ~2s, `/_stcore/health` returns `ok`, query-string URL pattern
+  returns 200, image size = 1.39 GB, runtime memory = ~70 MB.
+- [x] **Docs**: new "Docker (web app)" section in README + new "7a. Docker
+  for local testing + self-host deployment" section in DEPLOYMENT.md with
+  the four compose commands and the billing-re-engage workflow.
+
+### Session 2 follow-ups (open)
+- Migrate `subscriptions.py` from SQLite to managed Postgres (real launch
+  blocker once billing is re-engaged — Streamlit Cloud ephemeral disk).
+- Stripe Customer Portal link so users can self-cancel without emailing us.
+- Promote recent-games / hit-rate / splits charts to Plotly too (only the
+  distribution chart migrated this session).
+- Persist anonymous watchlists via cookie or short-lived browser store so
+  pre-billing visitors keep their pins across sessions.
+
+### Known limitations (carry-forward)
+- 11 of 20 scrapers still parser-less (open authenticated-snapshot work).
+- Team-chart book reference is `points`-only (no team_total markets at lobby).
+- `team_priors` derives from current cross-book consensus only; historical
+  back-test of priors-as-features hasn't been wired into the player model yet
+  (that's the natural follow-up — blend `pace_factor` and `home_team_total`
+  into player projections during simulation).
+- Benchmark line=25.5 was kept fixed; for production-default selection we'd
+  want a parameterized sweep across realistic per-stat lines, not a single
+  fixed value.
+- `daily_etl.py` line 1140 still uses `datetime.utcnow()` (DeprecationWarning).
+  Cosmetic; can be swapped to `datetime.now(timezone.utc)` whenever.
+
+### Next step (proposed)
+- Blend `team_priors.pace_factor` and `home_team_total` into the player
+  projection during `simulation.py` so the chart's `book mean` references
+  AND the model's predicted_mean both pull from the same cross-book signal.
+- Parameterized distribution-sweep across per-stat lines (use book consensus
+  as the line rather than a fixed 25.5) to pick production defaults.
+
 ---
 
 ## 0) End-of-Day Status (2026-05-08)

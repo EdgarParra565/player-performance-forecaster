@@ -194,6 +194,26 @@ CREATE TABLE IF NOT EXISTS web_team_lines (
     FOREIGN KEY (snapshot_id) REFERENCES web_text_snapshots(snapshot_id)
 );
 
+-- Reverse-engineered team-level priors derived from cross-book consensus.
+-- One row per upcoming/recent NBA matchup; populated by
+-- nba_model.model.team_line_reverse_engineering.
+CREATE TABLE IF NOT EXISTS team_priors (
+    away_team             TEXT NOT NULL,
+    home_team             TEXT NOT NULL,
+    computed_at_utc       TIMESTAMP NOT NULL,
+    consensus_total       REAL,
+    home_spread           REAL,
+    away_spread           REAL,
+    home_team_total       REAL,
+    away_team_total       REAL,
+    home_win_prob_devig   REAL,
+    away_win_prob_devig   REAL,
+    pace_factor           REAL,
+    n_books               INTEGER,
+    latest_observed_at    TIMESTAMP,
+    PRIMARY KEY (away_team, home_team)
+);
+
 -- Model predictions (for evaluation)
 CREATE TABLE IF NOT EXISTS predictions (
     prediction_id INTEGER PRIMARY KEY AUTOINCREMENT,

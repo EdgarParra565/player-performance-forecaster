@@ -22,9 +22,90 @@ import pandas as pd
 import streamlit as st
 
 from nba_model.visualization import player_charts as pc
+from nba_model.visualization import plotly_charts as plc
 from nba_model.web import auth as web_auth
+from nba_model.web import etl_status
 from nba_model.web import input_validation as iv
 from nba_model.web import parlay_compare as parlay
+from nba_model.web import watchlist as wl
+
+
+# ---------------------------------------------------------------------------
+# URL query-string state
+# ---------------------------------------------------------------------------
+#
+# We use `st.query_params` (mutable dict-like, Streamlit 1.30+) so URLs like
+#   https://.../?player=Nikola+Jokic&stat=points&n_games=25&view=Player+charts
+# are shareable and the browser back/forward button preserves selections.
+# Each input below reads its default from `_qp_get(...)` and writes back via
+# `_qp_set(...)` when the user changes it.
+_QP_PLAYER = "player"
+_QP_TEAM   = "team"
+_QP_STAT   = "stat"
+_QP_NGAMES = "n_games"
+_QP_VIEW   = "view"
+_QP_ROLL   = "rolling"
+
+
+def _qp_get(key: str, default: str = "") -> str:
+    """Read a single query-param value as a string."""
+    try:
+        return str(st.query_params.get(key, default) or default)
+    except Exception:  # noqa: BLE001
+        return default
+
+
+def _qp_get_int(key: str, default: int) -> int:
+    try:
+        return int(_qp_get(key, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _qp_set(**kwargs) -> None:
+    """Write query-params; pass None / '' to clear a key.
+
+    Wrapped because `st.query_params` raises on missing keys and we want
+    set + clear to look the same to the caller.
+    """
+    try:
+        for k, v in kwargs.items():
+            if v is None or v == "":
+                if k in st.query_params:
+                    del st.query_params[k]
+            else:
+                st.query_params[k] = str(v)
+    except Exception:  # noqa: BLE001
+        # Older Streamlit versions in CI; silently ignore so the app still loads.
+        pass
+
+
+def _index_or_zero(choices, value):
+    """Helper: return the index of `value` in `choices`, or 0 if absent."""
+    try:
+        return list(choices).index(value)
+    except (ValueError, TypeError):
+        return 0
+
+
+def _csv_download_button(df: pd.DataFrame, label: str, filename: str,
+                         key: Optional[str] = None) -> None:
+    """Compact `st.download_button` wrapper that emits a CSV of `df`.
+
+    No-op when `df` is empty (we don't want a button that downloads an empty
+    file). Buttons for distinct tables need distinct `key`s if they share a
+    label, but the label is usually unique enough.
+    """
+    if df is None or df.empty:
+        return
+    csv_bytes = df.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        label=label,
+        data=csv_bytes,
+        file_name=filename,
+        mime="text/csv",
+        key=key,
+    )
 
 DEFAULT_DB_PATH = "data/database/nba_data.db"
 STAT_CHOICES = (
@@ -167,8 +248,9 @@ def _render_book_lines_table(data: pc.PlayerChartData) -> None:
     if not rows:
         st.info("No numeric book lines.")
         return
+    book_lines_df = pd.DataFrame(rows)
     st.dataframe(
-        pd.DataFrame(rows),
+        book_lines_df,
         use_container_width=True,
         column_config={
             "P(over)": st.column_config.ProgressColumn(
@@ -177,6 +259,15 @@ def _render_book_lines_table(data: pc.PlayerChartData) -> None:
                 "hit_rate", min_value=0.0, max_value=1.0, format="%.0f%%"),
         },
         hide_index=True,
+    )
+    _csv_download_button(
+        book_lines_df,
+        label="Download book lines as CSV",
+        filename=(
+            f"{data.player_name.replace(' ', '_')}_"
+            f"{data.stat_type}_book_lines.csv"
+        ),
+        key=f"csv_book_lines_{data.player_id}_{data.stat_type}",
     )
     if consensus["books_missing"]:
         st.caption(
@@ -230,6 +321,38 @@ def _custom_line_panel(data: pc.PlayerChartData) -> None:
         verdict = "+EV" if best_ev > 0 else "-EV"
         side = "OVER" if best_over else "UNDER"
         st.success(f"Best side: **{side}** — {verdict} ({best_ev:+.3f} per unit)")
+
+    # Probe history: keep a running list per-session so power users can
+    # iterate through lines and then export the whole audit as CSV.
+    from datetime import datetime as _dt
+    history = st.session_state.setdefault("custom_line_history", [])
+    history.append({
+        "ts": _dt.utcnow().isoformat(timespec="seconds"),
+        "player": data.player_name,
+        "stat": data.stat_type,
+        "line": line_val,
+        "odds": odds_val,
+        "p_over": p,
+        "historical_over_rate": res["historical_over_rate"],
+        "ev_over": res["ev_over_per_unit"],
+        "ev_under": res["ev_under_per_unit"],
+        "n_games": res["n"],
+    })
+    # Cap history so a long session doesn't grow unbounded.
+    if len(history) > 100:
+        del history[: len(history) - 100]
+    with st.expander(f"Probe history ({len(history)} entries)", expanded=False):
+        hist_df = pd.DataFrame(history)
+        st.dataframe(hist_df, hide_index=True, use_container_width=True)
+        _csv_download_button(
+            hist_df,
+            label="Download probe history as CSV",
+            filename="custom_line_probe_history.csv",
+            key="csv_probe_history",
+        )
+        if st.button("Clear history", key="clear_probe_history"):
+            st.session_state["custom_line_history"] = []
+            st.rerun()
 
 
 ALL_STATS_DEFAULT = (
@@ -316,10 +439,11 @@ def _all_stats_overview(
         # Two charts side by side: distribution + hit-rate
         c_left, c_right = st.columns(2)
         with c_left:
-            st.caption("Distribution + book-line markers")
-            st.pyplot(
-                pc.build_distribution_figure(data, distributions=overlays),
+            st.caption("Distribution + book-line markers (hover / zoom enabled)")
+            st.plotly_chart(
+                plc.build_distribution_figure(data, distributions=overlays),
                 use_container_width=True,
+                key=f"plotly_dist_overview_{data.player_id}_{data.stat_type}",
             )
         with c_right:
             st.caption("Hit-rate vs each book line")
@@ -407,10 +531,11 @@ def _team_overview(
                 use_container_width=True,
             )
         with c_right:
-            st.caption("Distribution + fitted overlays")
-            st.pyplot(
-                pc.build_distribution_figure(data, distributions=overlays),
+            st.caption("Distribution + fitted overlays (hover / zoom enabled)")
+            st.plotly_chart(
+                plc.build_distribution_figure(data, distributions=overlays),
                 use_container_width=True,
+                key=f"plotly_dist_team_{data.player_id}_{data.stat_type}",
             )
 
         with st.expander(f"Splits ({stat_type})"):
@@ -932,6 +1057,173 @@ def _player_browse_view(db_path: str) -> None:
     st.caption(f"Showing {len(show)} game(s) across {show['player_name'].nunique()} player(s).")
 
 
+def _render_watchlist_widget(available_players: list[str]) -> Optional[str]:
+    """Sidebar watchlist. Returns a selected player name if the user clicked
+    one of their watchlist entries, else None.
+
+    The caller passes the current player list so the widget can offer "Add
+    selected" without re-querying the DB. Picking an entry sets the URL
+    query-param so the right-side view re-renders with that player.
+    """
+    items = wl.get()
+    with st.sidebar.expander(
+        f":bookmark_tabs: Watchlist ({len(items)})",
+        expanded=bool(items),
+    ):
+        clicked: Optional[str] = None
+        if items:
+            for name in items:
+                col_pick, col_rm = st.columns([4, 1])
+                if col_pick.button(name, key=f"wl_pick_{name}",
+                                   use_container_width=True):
+                    clicked = name
+                if col_rm.button(":x:", key=f"wl_rm_{name}",
+                                 help=f"Remove {name}"):
+                    wl.remove(name)
+                    st.rerun()
+        else:
+            st.caption("Empty. Pin a player from the chart view below.")
+        if st.button("Clear watchlist", key="wl_clear",
+                     use_container_width=True, disabled=not items):
+            wl.clear()
+            st.rerun()
+    return clicked
+
+
+def _render_etl_status_widget() -> None:
+    """Sidebar widget: data freshness signal from the latest ETL report.
+
+    Always renders, but degrades gracefully when no report exists (the
+    Streamlit Cloud deploy might not have run the ETL yet). Trust signal:
+    a user can see we're pushing data updates and that they're recent.
+    """
+    summary = etl_status.summarize_report(etl_status.load_latest_report())
+    with st.sidebar:
+        with st.expander(
+            f":satellite_antenna: Data freshness - {summary['age_text']}",
+            expanded=False,
+        ):
+            if not summary["found"]:
+                st.caption(
+                    "No ETL report found at `nba_model/data/artifacts/`. "
+                    "The site is reading whatever's in the bundled SQLite DB."
+                )
+                return
+            status = summary["status"]
+            badge = {
+                "success": ":white_check_mark: success",
+                "partial_success": ":warning: partial success",
+                "failed": ":x: failed",
+            }.get(status, f":grey_question: {status}")
+            st.markdown(
+                f"**Last run:** {badge}  \n"
+                f"**Finished:** {summary['age_text']}  \n"
+                + (
+                    f"**Elapsed:** {summary['elapsed_ms']/1000:.1f}s  \n"
+                    if isinstance(summary["elapsed_ms"], (int, float))
+                    else ""
+                )
+            )
+            if summary["steps"]:
+                lines = []
+                for name, st_ in summary["steps"]:
+                    lines.append(f"- `{name}` {etl_status.step_badge(st_)}")
+                st.markdown("**Steps:**\n" + "\n".join(lines))
+
+
+def _compare_players_view(
+    db_path: str,
+    players_df: pd.DataFrame,
+    default_player: str,
+    stat_type: str,
+    n_games: int,
+) -> None:
+    """Overlay 2-3 players' distributions for the same stat.
+
+    Pure local-DB view (no external API calls), so this is fast enough to
+    re-render on every dropdown change.
+    """
+    st.subheader(f"Compare players — {stat_type} (last {n_games} games each)")
+    st.caption(
+        "Pick 2 or 3 players to overlay. Each player's histogram is "
+        "density-normalized so the heights are comparable even if sample "
+        "sizes differ. Dashed verticals are each player's book-consensus "
+        "mean across all stored sportsbooks."
+    )
+    all_names = players_df["player_name"].dropna().astype(str).tolist()
+    if not all_names:
+        st.warning("No players in the local DB to compare.")
+        return
+
+    default_pre = [default_player] if default_player in all_names else all_names[:1]
+    # Pre-fill the second slot with another famous player if available.
+    for candidate in ("LeBron James", "Nikola Jokic", "Stephen Curry"):
+        if candidate in all_names and candidate not in default_pre:
+            default_pre.append(candidate)
+            break
+
+    picks = st.multiselect(
+        "Players (2-3)",
+        all_names,
+        default=default_pre[:2],
+        max_selections=3,
+        help="2 or 3 players for a clean overlay; 4+ becomes hard to read.",
+    )
+    if len(picks) < 2:
+        st.info("Pick at least 2 players to compare.")
+        return
+
+    # Pull data for each pick.
+    datasets: list[pc.PlayerChartData] = []
+    summary_rows: list[dict] = []
+    for name in picks:
+        pid, resolved = _resolve_player_id(players_df, name)
+        try:
+            d = pc.fetch_player_chart_data(
+                db_path=db_path,
+                player_id=pid,
+                player_name=resolved,
+                stat_type=stat_type,
+                n_games=int(n_games),
+            )
+        except Exception as exc:  # noqa: BLE001
+            st.error(f"{name}: failed to load - {exc}")
+            continue
+        datasets.append(d)
+        consensus = pc.compute_market_consensus(d)
+        summary_rows.append({
+            "player": resolved,
+            "n": int(d.values.size),
+            "mu": round(float(d.mu), 3) if d.values.size else None,
+            "sigma": round(float(d.sigma), 3) if d.values.size else None,
+            "book_mean": (
+                round(consensus["mean"], 3) if consensus["mean"] is not None else None
+            ),
+            "book_sigma": (
+                round(consensus["stdev"], 3) if consensus["stdev"] is not None else None
+            ),
+            "n_books": consensus["n_books"],
+        })
+
+    if not datasets:
+        return
+
+    st.pyplot(
+        pc.build_multi_player_distribution_figure(datasets),
+        use_container_width=True,
+    )
+
+    st.markdown("**Player-by-player summary**")
+    summary_df = pd.DataFrame(summary_rows)
+    st.dataframe(summary_df, hide_index=True, use_container_width=True)
+    _csv_download_button(
+        summary_df,
+        label="Download summary as CSV",
+        filename=f"compare_players_{stat_type}_n{n_games}.csv",
+        key="csv_compare_summary",
+    )
+
+
 def main() -> None:
     st.set_page_config(
         page_title="NBA Player Charts",
@@ -943,9 +1235,14 @@ def main() -> None:
     user = web_auth.current_user()
     web_auth.render_user_card(sidebar=True)
 
-    title_suffix = " - Premium" if user.is_premium else " - Free preview"
+    # Title suffix only when billing is on; otherwise the open site says
+    # nothing about Free/Premium.
+    if web_auth.BILLING_ENABLED:
+        title_suffix = " - Premium" if user.is_premium else " - Free preview"
+    else:
+        title_suffix = ""
     st.title("NBA Player Charts" + title_suffix)
-    if not user.is_premium:
+    if web_auth.BILLING_ENABLED and not user.is_premium:
         st.info(
             ":lock: **Free preview mode.** You can view "
             f"{', '.join(web_auth.PREVIEW_PLAYERS)} (last "
@@ -956,6 +1253,7 @@ def main() -> None:
         )
 
     # ---- Sidebar -------------------------------------------------------
+    _render_etl_status_widget()
     with st.sidebar:
         st.divider()
         st.header("Selection")
@@ -979,17 +1277,70 @@ def main() -> None:
         except Exception as exc:  # noqa: BLE001
             st.error(f"Could not read teams from {db_path}: {exc}")
             return
-        team_pick = st.selectbox("Team", teams, index=0)
+        team_default = _qp_get(_QP_TEAM, teams[0])
+        team_pick = st.selectbox(
+            "Team", teams,
+            index=_index_or_zero(teams, team_default),
+        )
         team_val = "" if team_pick == "(any)" else team_pick
+        _qp_set(team=team_val or None)
 
         try:
             players_df = _cached_players(db_path, team_val)
         except Exception as exc:  # noqa: BLE001
             st.error(f"Could not list players: {exc}")
             return
-        names = players_df["player_name"].dropna().astype(str).tolist()
-        if not names:
+        if players_df.empty:
             st.warning("No players in DB for that filter.")
+            return
+        # Backstop: older cached frames may not carry n_books yet.
+        if "n_books" not in players_df.columns:
+            players_df = players_df.assign(n_books=0)
+
+        # Sidebar controls: filter to currently-scraped players + sort by book
+        # count. Defaults are tuned for the "test demand" open launch — we
+        # want first-time visitors to immediately land on a player who has
+        # real cross-book data (LeBron, Jokic, Wembanyama etc.) rather than
+        # the alphabetical first hit which is often a deep bench player with
+        # zero books.
+        only_scraped = st.checkbox(
+            "Only players with current book lines",
+            value=True,
+            help=(
+                "Hide players who aren't in any sportsbook's slate right now. "
+                "Uncheck to browse the full active roster (~530 players)."
+            ),
+        )
+        sort_mode = st.radio(
+            "Sort players by",
+            ["Book coverage (most books first)", "Alphabetical"],
+            index=0,
+            horizontal=False,
+            help="Book coverage = number of sportsbooks currently posting a "
+                 "line for the player.",
+        )
+
+        # Apply filter + sort BEFORE the free-tier allowlist trim, so the
+        # filter actually affects free-tier visitors (they only see Jokic /
+        # LeBron either way, but the default smart pick still works).
+        view_df = players_df
+        if only_scraped:
+            scraped = view_df[view_df["n_books"] > 0]
+            # Don't silently empty the list — if the filter would hide
+            # everything (some team filters + free tier), drop back to the
+            # unfiltered list so the dropdown is never empty.
+            if not scraped.empty:
+                view_df = scraped
+        if sort_mode.startswith("Book"):
+            view_df = view_df.sort_values(
+                ["n_books", "player_name"], ascending=[False, True]
+            )
+        else:
+            view_df = view_df.sort_values("player_name", ascending=True)
+
+        names = view_df["player_name"].dropna().astype(str).tolist()
+        if not names:
+            st.warning("No players match the current filter.")
             return
 
         # Free tier sees only the preview allowlist; premium sees everything.
@@ -1004,9 +1355,36 @@ def main() -> None:
                     "set Team to (any)."
                 )
                 return
+        # Watchlist: click an entry to jump to that player (writes URL param).
+        watchlist_pick = _render_watchlist_widget(names)
+        if watchlist_pick and watchlist_pick in names:
+            _qp_set(player=watchlist_pick)
+            player_default = watchlist_pick
+        else:
+            # Smart default for first-time visitors with no URL state:
+            # pick the highest-coverage player currently in the dropdown.
+            smart_default = names[0]
+            url_player = _qp_get(_QP_PLAYER, "")
+            player_default = url_player if url_player in names else smart_default
+
+        # Pre-compute formatted labels showing the book count, so the
+        # dropdown itself tells the user which players are live in the
+        # market right now.
+        n_books_lookup = dict(
+            zip(
+                view_df["player_name"].astype(str),
+                view_df["n_books"].fillna(0).astype(int),
+            )
+        )
+
+        def _label(n: str) -> str:
+            nb = n_books_lookup.get(n, 0)
+            return f"{n}  ({nb} books)" if nb else n
+
         player_name = st.selectbox(
             "Player", names,
-            index=0,
+            index=_index_or_zero(names, player_default),
+            format_func=_label,
             help=(
                 "Switching player reloads every chart on the right. "
                 "Free tier: only "
@@ -1014,6 +1392,14 @@ def main() -> None:
                 if not user.is_premium else "Switching player reloads every chart."
             ),
         )
+        _qp_set(player=player_name)
+        if st.button(
+            f":bookmark: Pin {player_name} to watchlist",
+            use_container_width=True, key="wl_add_current",
+            disabled=(player_name in wl.get()),
+        ):
+            wl.add(player_name)
+            st.rerun()
 
         # Player + Team charts are top-level peers in the main page so users
         # can pick either entry point immediately.  The two stats-browse
@@ -1022,22 +1408,25 @@ def main() -> None:
         free_views = [
             "Player charts",
             "Team charts",
+            "Compare players",
             "Game Results",
             "Player Stats Browse",
         ]
         premium_views = [
             "Player charts",
             "Team charts",
+            "Compare players",
             "All stats (overview)",
             "Parlay analysis",
             "Game Results",
             "Player Stats Browse",
         ]
         view_options = premium_views if user.is_premium else free_views
+        view_default = _qp_get(_QP_VIEW, view_options[0])
         view_mode = st.radio(
             "View mode",
             view_options,
-            index=0,
+            index=_index_or_zero(view_options, view_default),
             help=(
                 "Player charts: full chart suite for one player + stat. "
                 "Team charts: per-team aggregates with cross-book consensus line. "
@@ -1047,10 +1436,12 @@ def main() -> None:
                 "Player Stats Browse: searchable league-wide player game logs."
             ),
         )
+        _qp_set(view=view_mode)
         is_overview = view_mode.startswith("All stats")
         is_team_view = view_mode.startswith("Team charts")
         is_player_view = view_mode.startswith("Player charts")
         is_parlay_view = view_mode.startswith("Parlay")
+        is_compare_view = view_mode.startswith("Compare")
         is_game_results = view_mode.startswith("Game Results")
         is_player_browse = view_mode.startswith("Player Stats Browse")
 
@@ -1078,14 +1469,17 @@ def main() -> None:
         stat_choices_for_user = (
             web_auth.PREVIEW_STATS if not user.is_premium else STAT_CHOICES
         )
+        stat_default = _qp_get(_QP_STAT, stat_choices_for_user[0])
         stat_type_raw = st.selectbox(
-            "Stat (single-stat mode)", stat_choices_for_user, index=0,
+            "Stat (single-stat mode)", stat_choices_for_user,
+            index=_index_or_zero(stat_choices_for_user, stat_default),
             disabled=(is_overview),
             help=(
                 "Free preview: points only. Premium unlocks all stats."
                 if not user.is_premium else None
             ),
         )
+        _qp_set(stat=stat_type_raw)
         try:
             stat_type = iv.validate_stat_type(
                 stat_type_raw, allowed=stat_choices_for_user,
@@ -1095,7 +1489,8 @@ def main() -> None:
             return
 
         n_games_max = web_auth.PREVIEW_MAX_GAMES if not user.is_premium else 200
-        n_games_default = min(25, n_games_max)
+        n_games_default = min(_qp_get_int(_QP_NGAMES, 25), n_games_max)
+        n_games_default = max(3, n_games_default)
         n_games_raw = st.number_input(
             "Last N games", min_value=3, max_value=n_games_max,
             value=n_games_default, step=1,
@@ -1105,6 +1500,7 @@ def main() -> None:
                 if not user.is_premium else None
             ),
         )
+        _qp_set(n_games=int(n_games_raw))
         try:
             n_games = iv.validate_n_games(n_games_raw, min_value=3)
         except iv.ValidationError as exc:
@@ -1143,6 +1539,15 @@ def main() -> None:
         return
     if is_player_browse:
         _player_browse_view(db_path)
+        return
+    if is_compare_view:
+        _compare_players_view(
+            db_path=db_path,
+            players_df=players_df,
+            default_player=player_name,
+            stat_type=stat_type,
+            n_games=int(n_games),
+        )
         return
 
     # ---- Data fetch ----------------------------------------------------
@@ -1234,11 +1639,12 @@ def main() -> None:
                 use_container_width=True,
             )
         with c2:
-            st.caption("Distribution + book-line markers")
-            st.pyplot(
-                pc.build_distribution_figure(
+            st.caption("Distribution + book-line markers (hover / zoom enabled)")
+            st.plotly_chart(
+                plc.build_distribution_figure(
                     data, distributions=tuple(overlays)),
                 use_container_width=True,
+                key=f"plotly_dist_single_{data.player_id}_{data.stat_type}",
             )
 
     with tab_splits:
@@ -1279,6 +1685,15 @@ def main() -> None:
         view_df = data.games.copy()
         view_df.insert(0, "value", data.values)
         st.dataframe(view_df, use_container_width=True, hide_index=True)
+        _csv_download_button(
+            view_df,
+            label="Download game logs as CSV",
+            filename=(
+                f"{data.player_name.replace(' ', '_')}_"
+                f"{data.stat_type}_last{data.values.size}_games.csv"
+            ),
+            key=f"csv_game_logs_{data.player_id}_{data.stat_type}",
+        )
         if data.notes:
             for note in data.notes:
                 st.info(note)

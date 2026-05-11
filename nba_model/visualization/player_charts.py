@@ -400,6 +400,82 @@ def _book_color(name: str, idx: int) -> str:
     return palette[idx % len(palette)]
 
 
+def build_multi_player_distribution_figure(
+    datasets: list["PlayerChartData"],
+    figsize: tuple[float, float] = (7.5, 4.0),
+    bins: int = 18,
+) -> Figure:
+    """Overlay distribution histograms + fitted normals for 2-3 players.
+
+    Each player gets a translucent histogram (density-normalized so heights
+    are comparable across different sample sizes) and a thicker fitted-normal
+    curve in the same color. Their book-consensus means are drawn as dashed
+    vertical markers labeled with the player's name.
+
+    Used by the "Multi-player compare" view in the Streamlit app to spot
+    which leg is the strongest fit for a parlay.
+    """
+    fig = Figure(figsize=figsize, dpi=100, layout="constrained")
+    ax = fig.add_subplot(111)
+    palette = [
+        "#1f77b4", "#cc4125", "#2ca02c", "#9467bd", "#ff7f0e", "#17becf",
+    ]
+    drawn = 0
+    x_lo: Optional[float] = None
+    x_hi: Optional[float] = None
+    for idx, data in enumerate(datasets):
+        if data.values.size == 0:
+            continue
+        color = palette[idx % len(palette)]
+        ax.hist(
+            data.values, bins=max(3, int(bins)), density=True,
+            color=color, alpha=0.30, edgecolor="white",
+            label=f"{data.player_name} (n={data.values.size})",
+        )
+        mu = float(np.mean(data.values))
+        sigma = float(np.std(data.values, ddof=1)) if data.values.size >= 2 else 0.0
+        if sigma > 0:
+            span = (mu - 4 * sigma, mu + 4 * sigma)
+        else:
+            span = (data.values.min() - 1, data.values.max() + 1)
+        x_lo = span[0] if x_lo is None else min(x_lo, span[0])
+        x_hi = span[1] if x_hi is None else max(x_hi, span[1])
+        if sigma > 0:
+            xs = np.linspace(span[0], span[1], 200)
+            ax.plot(
+                xs, norm.pdf(xs, mu, sigma),
+                color=color, linewidth=2,
+                label=f"  fit: mu={mu:.2f}, sigma={sigma:.2f}",
+            )
+        # Consensus marker.
+        cm = data.market_consensus_line
+        if cm is not None:
+            ax.axvline(
+                cm, color=color, linestyle="--", linewidth=1.4, alpha=0.85,
+                label=f"  {data.player_name} book mean {cm:.2f}",
+            )
+        drawn += 1
+
+    if drawn == 0:
+        ax.text(0.5, 0.5, "No game data for any selected player",
+                ha="center", va="center", transform=ax.transAxes,
+                fontsize=12, color="#666")
+        ax.set_axis_off()
+        return fig
+
+    if x_lo is not None and x_hi is not None and x_hi > x_lo:
+        ax.set_xlim(max(0.0, x_lo), x_hi)
+    stat_label = ", ".join(
+        sorted({d.stat_type for d in datasets if d.values.size})
+    )
+    ax.set_xlabel(stat_label or "value")
+    ax.set_ylabel("density")
+    ax.set_title(f"Multi-player distribution overlay ({stat_label})")
+    ax.grid(axis="y", linestyle=":", alpha=0.4)
+    ax.legend(loc="upper right", fontsize=7, framealpha=0.9, ncol=1)
+    return fig
+
+
 def build_distribution_figure(
     data: PlayerChartData,
     figsize: tuple[float, float] = (7.0, 3.6),
@@ -848,6 +924,13 @@ def list_players_with_data(
     Player names come from ``nba_active_players_ref`` (530 rows, kept in
     sync by the scraper) with a fallback to the sparse ``players`` table
     so legacy rows still resolve.
+
+    The returned frame also includes an `n_books` column counting how many
+    distinct sportsbooks currently have a line for the player (across the
+    union of `betting_lines` and `web_prop_cards`).  Callers can use this
+    to surface players who are actively in this slate's market - e.g. the
+    Streamlit sidebar offers a "Only players with current book lines"
+    toggle that filters to `n_books > 0`.
     """
     team_clean = (team or "").strip()
     apply_team_filter = bool(team_clean) and team_clean.lower() not in {
@@ -912,6 +995,48 @@ def list_players_with_data(
         if not extras.empty:
             df = pd.concat([df, extras], ignore_index=True)
             df = df.drop_duplicates(subset=["player_id"]).sort_values("player_name")
+
+    # Attach the cross-book count: how many distinct sportsbooks currently
+    # have a line for each player. `betting_lines.player_id` is the canonical
+    # join key; `web_prop_cards.player_name` is name-only, so we approximate
+    # by name-matching against the player_id->name map we already have.
+    if not df.empty:
+        with DatabaseManager(db_path=db_path) as db:
+            bl_books = pd.read_sql_query(
+                """
+                SELECT player_id, COUNT(DISTINCT lower(book)) AS n_books
+                FROM betting_lines
+                WHERE book IS NOT NULL
+                GROUP BY player_id
+                """,
+                db.conn,
+            )
+            wp_books = pd.read_sql_query(
+                """
+                SELECT lower(player_name) AS lower_name,
+                       COUNT(DISTINCT lower(book)) AS n_books
+                FROM web_prop_cards
+                WHERE book IS NOT NULL AND player_name IS NOT NULL
+                GROUP BY lower(player_name)
+                """,
+                db.conn,
+            )
+        df = df.merge(bl_books, on="player_id", how="left")
+        df["n_books"] = df["n_books"].fillna(0).astype(int)
+        if not wp_books.empty:
+            df["__lower_name__"] = df["player_name"].str.lower()
+            df = df.merge(
+                wp_books, left_on="__lower_name__", right_on="lower_name",
+                how="left", suffixes=("", "_wp"),
+            )
+            df["n_books"] = (
+                df["n_books"].fillna(0).astype(int)
+                + df["n_books_wp"].fillna(0).astype(int)
+            )
+            df = df.drop(columns=["__lower_name__", "lower_name", "n_books_wp"],
+                         errors="ignore")
+    else:
+        df["n_books"] = 0
 
     return df.reset_index(drop=True)
 

@@ -1,0 +1,152 @@
+# Local dev / test orchestration.
+#
+# Quick reference:
+#   docker compose up streamlit          # bring up the web UI on :8501
+#   docker compose run --rm tests         # run the full pytest suite once
+#   docker compose run --rm etl-bulk      # one-shot bulk NBA-API ingest
+#   docker compose up webhook             # FastAPI Stripe webhook on :8000
+#   docker compose down                   # tear everything down
+#
+# Notes:
+# - The `data/` dir is bind-mounted so the SQLite DB persists between
+#   container restarts and so the local ETL output is visible to the
+#   container without rebuilding.
+# - `BILLING_ENABLED` is unset by default → full open access (matches the
+#   current launch state). Flip to "1" to re-engage Stripe + OIDC.
+# - The tests service mounts the WHOLE repo (not just data/) so test files
+#   live outside the image (.dockerignore omits them by design) while still
+#   being executable in-container.
+# - Playwright / Chromium are deliberately not in the image — scraper paths
+#   depend on real Chrome on `:9222` on the developer's host, which a
+#   container can't replicate without losing the auth session anyway.
+
+services:
+  # ---- Web UI ----------------------------------------------------------
+  streamlit:
+    build: .
+    image: nba-model:latest
+    container_name: nba-model-streamlit
+    ports:
+      - "8501:8501"
+    environment:
+      - BILLING_ENABLED=${BILLING_ENABLED:-0}
+      # Streamlit prod hardening (also set in the Dockerfile defaults).
+      - STREAMLIT_BROWSER_GATHER_USAGE_STATS=false
+      - STREAMLIT_SERVER_HEADLESS=true
+    volumes:
+      - ./data:/app/data
+      # Mount secrets.toml read-only ONLY when billing is on. Keep this
+      # commented out for normal open-access development.
+      # - ./.streamlit/secrets.toml:/app/.streamlit/secrets.toml:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8501/_stcore/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  # Back-compat alias: existing `docker compose up web` keeps working.
+  # Docker Compose lets multiple service names share an image+config; the
+  # cleanest way to alias without duplicating config is via `extends`.
+  web:
+    extends:
+      service: streamlit
+    container_name: nba-model-web
+
+  # ---- Pytest runner ---------------------------------------------------
+  # Runs the full test suite once and exits.  Use `docker compose run --rm tests`
+  # so the container is cleaned up after the run.  Bind-mounts the whole
+  # repo (not just /app/data) because `nba_model/tests/` is excluded from
+  # the image at build time (.dockerignore) to keep the prod image lean.
+  tests:
+    build: .
+    image: nba-model:latest
+    container_name: nba-model-tests
+    working_dir: /app
+    # pytest isn't bundled in the production image (the lockfile has a
+    # cryptography↔pycookiecheat conflict that pip's resolver drops dev
+    # packages on; production runtime works fine without them).  Install
+    # pytest just-in-time here so the prod image stays lean.
+    command:
+      - bash
+      - -c
+      - |
+        set -e
+        pip install --quiet --no-cache-dir 'pytest>=8.0' 2>&1 | tail -5
+        exec python -m pytest -q \
+            --ignore=nba_model/tests/test_smoke.py \
+            nba_model/tests/ "$@"
+      - --
+    environment:
+      - PYTHONPATH=/app
+      # Tests that hit the DB use the bind-mounted SQLite file.
+      - NBA_DB_PATH=/app/data/database/nba_data.db
+    volumes:
+      # Whole-repo mount: tests live outside the image.
+      - .:/app
+    profiles:
+      - tools
+
+  # ---- One-shot bulk NBA-API ingest ------------------------------------
+  # Runs `nba_results_ingestion` once to refresh games + game_logs from
+  # nba_api.  Override SEASONS via the env var.
+  #   docker compose run --rm etl-bulk
+  #   docker compose run --rm -e SEASONS="2025-26 2024-25" etl-bulk
+  etl-bulk:
+    build: .
+    image: nba-model:latest
+    container_name: nba-model-etl-bulk
+    working_dir: /app
+    command:
+      - bash
+      - -c
+      - |
+        set -e
+        SEASONS="${SEASONS:-2025-26}"
+        echo "Running bulk ingest for seasons: $$SEASONS"
+        # `sh -c` doesn't word-split a single env var the way argv would,
+        # so we just trust the user-supplied value verbatim.
+        python -m nba_model.data.nba_results_ingestion --seasons $$SEASONS
+    environment:
+      - SEASONS=${SEASONS:-2025-26}
+    volumes:
+      - ./data:/app/data
+    profiles:
+      - tools
+
+  # ---- FastAPI Stripe webhook -----------------------------------------
+  # The webhook needs real Stripe credentials to do anything meaningful.
+  # In dev it boots and serves /healthz so you can validate the route.
+  webhook:
+    build: .
+    image: nba-model:latest
+    container_name: nba-model-webhook
+    command:
+      - uvicorn
+      - nba_model.web.webhook_app:app
+      - --host=0.0.0.0
+      - --port=8000
+      - --no-server-header
+      - --forwarded-allow-ips=*
+      - --proxy-headers
+    ports:
+      - "8000:8000"
+    environment:
+      - STRIPE_WEBHOOK_SECRET=${STRIPE_WEBHOOK_SECRET:-}
+      - STRIPE_SECRET_KEY=${STRIPE_SECRET_KEY:-}
+      - SUBSCRIPTIONS_DB_PATH=/app/data/database/subscriptions.db
+      - WEBHOOK_TRUSTED_HOSTS=${WEBHOOK_TRUSTED_HOSTS:-*}
+      - WEBHOOK_RATE_MAX=${WEBHOOK_RATE_MAX:-120}
+      - WEBHOOK_RATE_WINDOW_SECONDS=${WEBHOOK_RATE_WINDOW_SECONDS:-60}
+    volumes:
+      - ./data:/app/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+    profiles:
+      - billing

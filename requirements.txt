@@ -30,3 +30,4 @@ fastapi~=0.136
 uvicorn[standard]~=0.46
 authlib~=1.7
 httpx~=0.28              # only used by the webhook test suite (TestClient)
+plotly~=6.7              # interactive distribution charts in the Streamlit app

@@ -6,10 +6,20 @@ calls a small, stable surface (`current_user`, `is_authenticated`, `tier_for`,
 
 OIDC providers (Google, Microsoft) are configured in `.streamlit/secrets.toml`
 - see `.streamlit/secrets.toml.example` for the template.
+
+================================================================================
+BILLING FEATURE FLAG (2026-05-11)
+================================================================================
+`BILLING_ENABLED` controls whether the Free/Premium paywall is active. While
+we're validating product-market fit, set this to False to give every visitor
+full access without sign-in. Flip to True (or set env BILLING_ENABLED=1) to
+re-engage the existing Stripe + OIDC + tier-gating code — no other change
+needed; all that logic is still here.
 """
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Optional
 
@@ -20,9 +30,16 @@ from nba_model.web import subscriptions
 TIER_FREE = "free"
 TIER_PREMIUM = "premium"
 
+# Master switch. When False (the launch default), every visitor is treated as
+# premium and no paywall ever renders. When True, the full Free/Premium gating
+# kicks back in. Env var takes precedence so deploys can flip it without a
+# code change.
+_FLAG = os.environ.get("BILLING_ENABLED", "").strip().lower()
+BILLING_ENABLED: bool = _FLAG in {"1", "true", "yes", "on"}
+
 # Players + teams a NOT-logged-in or free-tier user is allowed to view in
 # preview mode. Keep this short and high-profile so the app is still useful
-# as a teaser without giving away the marquee.
+# as a teaser without giving away the marquee. Only used when BILLING_ENABLED.
 PREVIEW_PLAYERS: tuple[str, ...] = (
     "Nikola Jokic",
     "LeBron James",
@@ -87,11 +104,14 @@ def tier_for(email: Optional[str]) -> str:
     """Resolve a user's current tier.
 
     Order of precedence:
+        0. BILLING_ENABLED is False (the launch default) -> everyone is premium
         1. anonymous -> free
         2. email in [auth.admins] -> premium (override for the dev/owner)
         3. subscriptions table entry with active premium -> premium
         4. otherwise -> free
     """
+    if not BILLING_ENABLED:
+        return TIER_PREMIUM
     if not email:
         return TIER_FREE
     email_lower = email.strip().lower()
@@ -101,6 +121,12 @@ def tier_for(email: Optional[str]) -> str:
 
 
 def current_user() -> CurrentUser:
+    # When billing is disabled, every visitor is treated as a (pseudo-)premium
+    # user without any login state. The OIDC + Stripe code still exists and is
+    # exercised the moment BILLING_ENABLED flips back on.
+    if not BILLING_ENABLED:
+        return CurrentUser(is_authenticated=False, email=None, name=None,
+                           tier=TIER_PREMIUM)
     user = _streamlit_user()
     if user is None or not getattr(user, "is_logged_in", False):
         return CurrentUser(is_authenticated=False, email=None, name=None,
@@ -135,7 +161,14 @@ def login_buttons(label_prefix: str = "Sign in with") -> None:
 
 
 def render_user_card(sidebar=True) -> None:
-    """Show the current user's email + tier badge + login/logout buttons."""
+    """Show the current user's email + tier badge + login/logout buttons.
+
+    When BILLING_ENABLED is False (launch default), renders nothing - we
+    don't want to clutter the sidebar with a 'sign in' prompt that does
+    nothing useful while the paywall is disabled.
+    """
+    if not BILLING_ENABLED:
+        return
     container = st.sidebar if sidebar else st
     user = current_user()
     if user.is_authenticated:
@@ -173,7 +206,14 @@ def paywall(feature: str, allow_preview: bool = True) -> None:
 
     `feature` is a short label like "Parlay analysis".
     `allow_preview` controls whether we hint at the preview the free tier gets.
+
+    When BILLING_ENABLED is False, this is a no-op so the caller never
+    actually paywalls anything (current_user().is_premium is always True
+    in that mode, so callers won't reach paywall(...) anyway — this guard
+    is belt-and-suspenders).
     """
+    if not BILLING_ENABLED:
+        return
     user = current_user()
     if not user.is_authenticated:
         st.warning(

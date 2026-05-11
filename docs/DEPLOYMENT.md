@@ -173,6 +173,70 @@ stripe listen --forward-to localhost:8081/stripe/webhook
 `stripe listen` prints a `whsec_...` secret you can use as
 `STRIPE_WEBHOOK_SECRET` for local-only testing.
 
+## 7a. Docker for local testing + self-host deployment
+
+The repo ships with a single-stage `Dockerfile` and a `docker-compose.yml`
+that wires four services (`streamlit`, `tests`, `etl-bulk`, `webhook`).
+Useful for matching the production environment exactly when reproducing a
+bug, and for self-host targets (VPS / Fly / Railway / Render).
+
+### Build + run the web app
+
+```bash
+docker build -t nba-model .
+
+# Default = open access (BILLING_ENABLED=0, no secrets required)
+docker run --rm -p 8501:8501 -v "$(pwd)/data:/app/data" nba-model
+
+# Or via compose
+docker compose up streamlit
+```
+
+Open http://localhost:8501. Healthcheck endpoint: `/_stcore/health`.
+
+### Re-engage billing in the container
+
+```bash
+# 1. Fill in .streamlit/secrets.toml (see secrets.toml.example).
+# 2. Uncomment the bind-mount line in docker-compose.yml:
+#       - ./.streamlit/secrets.toml:/app/.streamlit/secrets.toml:ro
+# 3. Boot both web + webhook services:
+BILLING_ENABLED=1 \
+STRIPE_WEBHOOK_SECRET=whsec_... \
+STRIPE_SECRET_KEY=sk_... \
+docker compose --profile billing up streamlit webhook
+```
+
+The `tests` and `etl-bulk` services are behind the `tools` profile so they
+don't boot with the default `docker compose up`. Run them explicitly:
+
+```bash
+docker compose run --rm tests                    # full pytest suite
+docker compose run --rm etl-bulk                 # default seasons
+docker compose run --rm -e SEASONS="2025-26 2024-25" etl-bulk
+```
+
+### Production self-host on a VPS
+
+```bash
+# On the server:
+git clone <your-fork> && cd nba-probability-model
+docker compose --profile billing up -d streamlit webhook
+# Put nginx / Caddy in front with TLS and proxy to :8501 + :8000.
+```
+
+The image is `~1.4 GB`. The runtime memory is `~70 MB` for the web service
+and `~50 MB` for the webhook. Volume mounts:
+
+| Mount | Why |
+|---|---|
+| `./data:/app/data` | SQLite DBs (`nba_data.db`, `subscriptions.db`) persist across restarts |
+| `./.streamlit/secrets.toml:/app/.streamlit/secrets.toml:ro` | OIDC + Stripe credentials when billing is on |
+
+> **Streamlit Community Cloud users** should ignore this section — Streamlit
+> Cloud builds the image for you. Docker is only relevant for self-host
+> deploys or reproducing a prod environment locally.
+
 ## 8. Free vs Premium feature matrix
 
 | Feature                          | Free preview                          | Premium |

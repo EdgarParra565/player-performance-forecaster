@@ -36,6 +36,34 @@ def _safe_float(value):
     return f
 
 
+def _american_to_implied_prob(odds):
+    """Convert American odds to implied probability in (0, 1).
+
+    + odds → 100 / (odds + 100)        e.g. +150 → 0.40
+    - odds → -odds / (-odds + 100)     e.g. -110 → 0.524
+    """
+    o = _safe_float(odds)
+    if o is None or o == 0:
+        return None
+    if o > 0:
+        return 100.0 / (o + 100.0)
+    return -o / (-o + 100.0)
+
+
+def _implied_prob_to_american(prob):
+    """Convert implied probability in (0, 1) back to American odds.
+
+    p <= 0.5 → +(100 * (1-p)/p)          underdog
+    p >  0.5 → -(100 * p/(1-p))          favorite
+    """
+    p = _safe_float(prob)
+    if p is None or not (0.0 < p < 1.0):
+        return None
+    if p <= 0.5:
+        return int(round(100.0 * (1.0 - p) / p))
+    return int(round(-100.0 * p / (1.0 - p)))
+
+
 class DatabaseManager:
     """Manages all database operations for NBA data."""
 
@@ -55,6 +83,233 @@ class DatabaseManager:
             self.conn.executescript(f.read())
 
         logger.info("Database initialized at %s", self.db_path)
+
+    def upsert_team_priors(self, records):
+        """Upsert reverse-engineered priors (one row per matchup)."""
+        if not records:
+            return {"upserted": 0, "attempted": 0}
+        query = """
+            INSERT OR REPLACE INTO team_priors (
+                away_team, home_team, computed_at_utc,
+                consensus_total, home_spread, away_spread,
+                home_team_total, away_team_total,
+                home_win_prob_devig, away_win_prob_devig,
+                pace_factor, n_books, latest_observed_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """
+        payload = []
+        for r in records:
+            payload.append((
+                r.get("away_team"), r.get("home_team"),
+                r.get("computed_at_utc"),
+                _safe_float(r.get("consensus_total")),
+                _safe_float(r.get("home_spread")),
+                _safe_float(r.get("away_spread")),
+                _safe_float(r.get("home_team_total")),
+                _safe_float(r.get("away_team_total")),
+                _safe_float(r.get("home_win_prob_devig")),
+                _safe_float(r.get("away_win_prob_devig")),
+                _safe_float(r.get("pace_factor")),
+                _safe_int(r.get("n_books")),
+                r.get("latest_observed_at"),
+            ))
+        if not payload:
+            return {"upserted": 0, "attempted": 0}
+        before = self.conn.total_changes
+        self.conn.executemany(query, payload)
+        self.conn.commit()
+        upserted = self.conn.total_changes - before
+        return {"upserted": int(upserted), "attempted": int(len(payload))}
+
+    def get_team_prior(self, away_team: str, home_team: str):
+        """Look up the latest prior row for a matchup; returns None if absent."""
+        row = self.conn.execute(
+            """
+            SELECT away_team, home_team, computed_at_utc,
+                   consensus_total, home_spread, away_spread,
+                   home_team_total, away_team_total,
+                   home_win_prob_devig, away_win_prob_devig,
+                   pace_factor, n_books, latest_observed_at
+            FROM team_priors
+            WHERE lower(away_team) = lower(?)
+              AND lower(home_team) = lower(?)
+            """,
+            (away_team, home_team),
+        ).fetchone()
+        if row is None:
+            return None
+        keys = ["away_team", "home_team", "computed_at_utc",
+                "consensus_total", "home_spread", "away_spread",
+                "home_team_total", "away_team_total",
+                "home_win_prob_devig", "away_win_prob_devig",
+                "pace_factor", "n_books", "latest_observed_at"]
+        return dict(zip(keys, row))
+
+    def backfill_predictions_outcomes(self):
+        """Settle every pending ``predictions`` row whose game now has logs.
+
+        Looks up each pending prediction's ``(player_id, game_date)`` in
+        ``game_logs``, computes ``actual_result`` for the stat the
+        prediction was made on (points / rebounds / assists / pra / ra /
+        three_pointers_made / field_goals_made / minutes), then assigns
+        ``outcome`` ∈ {'over', 'under', 'push'} based on ``line_value``.
+
+        Returns counts of how many were settled and how many remain pending.
+        Idempotent — re-running just settles any new games that landed
+        since the last call.
+        """
+        # Map stat_type → SQL expression against game_logs columns. PRA / RA
+        # are computed from the raw columns, others are direct.
+        stat_expr = {
+            "points":              "g.points",
+            "assists":             "g.assists",
+            "rebounds":            "g.rebounds",
+            "three_pointers_made": "g.fg3m",
+            "field_goals_made":    "g.fgm",
+            "minutes":             "g.minutes",
+            "pra":                 ("COALESCE(g.points, 0) + "
+                                    "COALESCE(g.rebounds, 0) + "
+                                    "COALESCE(g.assists, 0)"),
+            "ra":                  ("COALESCE(g.rebounds, 0) + "
+                                    "COALESCE(g.assists, 0)"),
+            "steals":              "g.steals",
+            "blocks":              "g.blocks",
+            "turnovers":           "g.turnovers",
+        }
+
+        update_stmt = """
+            UPDATE predictions
+               SET actual_result = ?,
+                   outcome = ?
+             WHERE prediction_id = ?
+        """
+
+        settled = 0
+        scanned = 0
+        unsupported_stats: set[str] = set()
+
+        # Pull pending rows up front so the UPDATEs don't fight a live cursor.
+        pending = self.conn.execute(
+            """
+            SELECT prediction_id, player_id, game_date, stat_type, line_value
+            FROM predictions
+            WHERE actual_result IS NULL
+            """
+        ).fetchall()
+
+        for pred_id, player_id, game_date, stat_type, line_value in pending:
+            scanned += 1
+            stat = (stat_type or "").strip().lower()
+            expr = stat_expr.get(stat)
+            if expr is None:
+                unsupported_stats.add(stat or "<empty>")
+                continue
+            row = self.conn.execute(
+                f"""
+                SELECT {expr} AS actual
+                FROM game_logs g
+                WHERE g.player_id = ?
+                  AND DATE(g.game_date) = DATE(?)
+                LIMIT 1
+                """,
+                (int(player_id), str(game_date)),
+            ).fetchone()
+            if not row or row[0] is None:
+                continue
+            actual = float(row[0])
+            if line_value is None:
+                outcome = None
+            else:
+                lv = float(line_value)
+                if actual > lv:
+                    outcome = "over"
+                elif actual < lv:
+                    outcome = "under"
+                else:
+                    outcome = "push"
+            self.conn.execute(update_stmt, (actual, outcome, int(pred_id)))
+            settled += 1
+
+        self.conn.commit()
+        result = {
+            "scanned": int(scanned),
+            "settled": int(settled),
+            "remaining_pending": int(scanned - settled),
+        }
+        if unsupported_stats:
+            result["unsupported_stats"] = sorted(unsupported_stats)
+        logger.info(
+            "Backfilled predictions outcomes: %s settled, %s still pending "
+            "(scanned %s)",
+            settled, result["remaining_pending"], scanned,
+        )
+        return result
+
+    def sync_players_table(self):
+        """Backfill the ``players`` table from authoritative sources.
+
+        Why this exists: the snapshot DB had only ~94 rows in ``players``
+        with ``players.team`` set for just 1 row.  The chart layer and team
+        dropdowns used to read directly from there, which collapsed every
+        view to a single team.  The new bulk NBA-API ingest (8K+ team-games,
+        91K+ player game logs, 530 active-player reference rows) gives us a
+        much richer source — this method fills ``players`` from the union.
+
+        For each ``nba_active_players_ref`` entry we add a row with the
+        canonical name and a derived ``team`` (the first whitespace token
+        of the player's most-recent ``game_logs.matchup``, if any).
+        Existing rows are updated via ``ON CONFLICT(player_id)``.
+        """
+        # Each player's team derived from their most-recent game_logs row.
+        rows = self.conn.execute(
+            """
+            WITH ranked AS (
+                SELECT
+                    g.player_id,
+                    upper(trim(substr(g.matchup, 1, instr(g.matchup, ' ') - 1))) AS team,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY g.player_id
+                        ORDER BY g.game_date DESC, g.game_log_id DESC
+                    ) AS rn
+                FROM game_logs g
+                WHERE g.matchup IS NOT NULL AND instr(g.matchup, ' ') > 0
+            ),
+            player_team AS (
+                SELECT player_id, team FROM ranked WHERE rn = 1
+            )
+            SELECT
+                r.player_id,
+                r.player_name,
+                pt.team
+            FROM nba_active_players_ref r
+            LEFT JOIN player_team pt ON pt.player_id = r.player_id
+            """
+        ).fetchall()
+
+        if not rows:
+            return {"upserted": 0, "attempted": 0}
+
+        # Upsert: insert when new, overwrite name + team on conflict.  The
+        # existing ``insert_player`` runs one row at a time; for ~530 rows
+        # batching gives no perf win but the SQL is identical.
+        query = """
+            INSERT INTO players (player_id, name, team)
+            VALUES (?, ?, ?)
+            ON CONFLICT(player_id) DO UPDATE SET
+                name = excluded.name,
+                team = excluded.team,
+                last_updated = CURRENT_TIMESTAMP
+        """
+        before = self.conn.total_changes
+        self.conn.executemany(query, rows)
+        self.conn.commit()
+        upserted = self.conn.total_changes - before
+        logger.info(
+            "sync_players_table: upserted %s rows (%s with team derived)",
+            upserted, sum(1 for r in rows if r[2]),
+        )
+        return {"upserted": int(upserted), "attempted": int(len(rows))}
 
     def insert_player(self, player_id, name, team=None, position=None):
         """Insert or update player record."""
@@ -775,10 +1030,15 @@ class DatabaseManager:
                 params.append(f"-{hours} hours")
         where_sql = (" AND ".join(clauses)) if clauses else "1=1"
 
+        # Pull the latest line per (game, market, side, book) and aggregate
+        # in Python so we can convert odds → implied probability → mean →
+        # American.  Averaging raw American odds is mathematically wrong
+        # whenever the sample contains both + and - values (the signs flip
+        # the magnitude, distorting the mean).
         query = f"""
             WITH latest_per_book AS (
                 SELECT
-                    away_team, home_team, market_type, side, team,
+                    away_team, home_team, market_type, side,
                     book, line_value, odds_american, observed_at_utc,
                     ROW_NUMBER() OVER (
                         PARTITION BY lower(away_team), lower(home_team),
@@ -790,38 +1050,71 @@ class DatabaseManager:
             )
             SELECT
                 away_team, home_team, market_type, side,
-                AVG(line_value)              AS mean_line,
-                MIN(line_value)              AS min_line,
-                MAX(line_value)              AS max_line,
-                AVG(odds_american)           AS mean_odds,
-                COUNT(DISTINCT lower(book))  AS n_books,
-                GROUP_CONCAT(DISTINCT book)  AS books,
-                MAX(observed_at_utc)         AS latest_observed_at
+                book, line_value, odds_american, observed_at_utc
             FROM latest_per_book
             WHERE rn = 1
-            GROUP BY lower(away_team), lower(home_team),
-                     lower(market_type), lower(side)
-            HAVING n_books >= ?
-            ORDER BY home_team, away_team, market_type, side
+            ORDER BY away_team, home_team, market_type, side, book
         """
-        params.append(int(max(1, min_books)))
         rows = self.conn.execute(query, tuple(params)).fetchall()
-        return [
-            {
-                "away_team": row[0],
-                "home_team": row[1],
-                "market_type": row[2],
-                "side": row[3],
-                "mean_line": float(row[4]) if row[4] is not None else None,
-                "min_line": float(row[5]) if row[5] is not None else None,
-                "max_line": float(row[6]) if row[6] is not None else None,
-                "mean_odds": float(row[7]) if row[7] is not None else None,
-                "n_books": int(row[8] or 0),
-                "books": str(row[9] or ""),
-                "latest_observed_at": row[10],
-            }
-            for row in rows
-        ]
+
+        # Group rows by (away, home, market, side) and aggregate.
+        groups: dict[tuple, dict] = {}
+        for away, home, market, side, book, line, odds, obs_at in rows:
+            key = (away.lower(), home.lower(), market.lower(), side.lower())
+            slot = groups.setdefault(key, {
+                "away_team": away, "home_team": home,
+                "market_type": market, "side": side,
+                "line_values": [], "odds_probs": [], "raw_odds": [],
+                "books": set(), "latest_observed_at": obs_at,
+            })
+            if line is not None:
+                slot["line_values"].append(float(line))
+            prob = _american_to_implied_prob(odds)
+            if prob is not None:
+                slot["odds_probs"].append(prob)
+                slot["raw_odds"].append(int(odds))
+            if book:
+                slot["books"].add(book)
+            if obs_at and (slot["latest_observed_at"] is None
+                           or obs_at > slot["latest_observed_at"]):
+                slot["latest_observed_at"] = obs_at
+
+        min_books_int = int(max(1, min_books))
+        out: list[dict] = []
+        for slot in groups.values():
+            n_books = len(slot["books"])
+            if n_books < min_books_int:
+                continue
+            line_vals = slot["line_values"]
+            probs = slot["odds_probs"]
+            raw_odds = slot["raw_odds"]
+            mean_prob = sum(probs) / len(probs) if probs else None
+            out.append({
+                "away_team": slot["away_team"],
+                "home_team": slot["home_team"],
+                "market_type": slot["market_type"],
+                "side": slot["side"],
+                "mean_line": (sum(line_vals) / len(line_vals)
+                              if line_vals else None),
+                "min_line": min(line_vals) if line_vals else None,
+                "max_line": max(line_vals) if line_vals else None,
+                # mean_odds is now the American odds corresponding to the
+                # *mean implied probability* across books, which is what
+                # "average market odds" actually means.  Raw-american mean
+                # (e.g. -110, +120, -105 → 35/3) is retained as
+                # mean_odds_naive for callers that want to compare.
+                "mean_odds": _implied_prob_to_american(mean_prob),
+                "mean_implied_prob": mean_prob,
+                "mean_odds_naive": (sum(raw_odds) / len(raw_odds)
+                                    if raw_odds else None),
+                "n_books": n_books,
+                "books": ",".join(sorted(slot["books"])),
+                "latest_observed_at": slot["latest_observed_at"],
+            })
+        out.sort(key=lambda r: (
+            r["home_team"], r["away_team"], r["market_type"], r["side"],
+        ))
+        return out
 
     def insert_games(self, records):
         """Upsert team-game rows (one per team per game).

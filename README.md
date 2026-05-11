@@ -50,6 +50,62 @@ source .venv/bin/activate
 pip install -e .
 ```
 
+## Docker (web app)
+
+The fastest way to run the Streamlit web app on any machine with Docker:
+
+```bash
+# Build once.
+docker build -t nba-model .
+
+# Open-access mode (BILLING_ENABLED=0 by default - matches the launch
+# configuration; no Stripe / OIDC secrets required).
+docker run --rm -p 8501:8501 -v "$(pwd)/data:/app/data" nba-model
+```
+
+Or via docker-compose. The `tests` and `etl-bulk` services are gated
+behind the `tools` profile (one-shots, kept out of the default `up`).
+The `webhook` service is gated behind the `billing` profile (Stripe-only).
+
+```bash
+# Long-running services
+docker compose up streamlit                       # web UI on http://localhost:8501
+docker compose --profile billing up webhook        # FastAPI Stripe webhook on :8000
+
+# One-shot services
+docker compose --profile tools run --rm tests      # full pytest suite (194 cases)
+docker compose --profile tools run --rm etl-bulk   # bulk nba_api ingest
+docker compose --profile tools run --rm \
+  -e SEASONS="2025-26 2024-25" etl-bulk            # multi-season refresh
+
+docker compose down                                # tear everything down
+```
+
+The image is ~1.4 GB (matplotlib + pandas/numpy/scipy + streamlit + plotly),
+boots to healthy in ~2 s, and runs at ~70 MB resident memory. The container
+deliberately excludes Playwright / Chromium — scraping paths assume a real
+Chrome on `:9222` on the developer's host, which a container can't replicate
+without losing the auth session anyway.
+
+The `tests` service bind-mounts the whole repo (test files are excluded
+from the image at build time via `.dockerignore` to keep the prod image
+lean) and installs pytest at start time — the production lockfile has a
+pycookiecheat ↔ cryptography conflict that drops dev packages on partial
+install, so we add pytest only when actually running tests.
+
+All four services share the bind-mounted `./data` directory, so the
+SQLite DB written by `etl-bulk` is immediately visible to `streamlit`
+(and to your local Python) without rebuilding.
+
+To re-engage Stripe + OIDC billing in the container:
+
+```bash
+export BILLING_ENABLED=1
+# Edit .streamlit/secrets.toml first (see .streamlit/secrets.toml.example),
+# then uncomment the secrets bind-mount line in docker-compose.yml.
+docker compose up streamlit webhook
+```
+
 ## Run Commands
 
 ### 1) Single Prop or Parlay Demo

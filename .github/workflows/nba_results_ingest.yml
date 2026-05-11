@@ -1,0 +1,82 @@
+name: NBA Results Ingest
+
+# Bulk-refresh games + player game logs from nba_api into the SQLite DB.
+# Runs more aggressively than the full daily ETL because it's a single
+# league-wide endpoint per season — fast and idempotent.
+#
+# Scheduled separately from `daily_etl.yml` so we can keep games + logs
+# fresh even on days when the heavy ETL is skipped or fails (the daily
+# ETL workflow also now invokes this same module internally via the new
+# `--skip-bulk-results-ingest=false` default, so this cron is the
+# stand-alone fallback / catch-up path).
+
+on:
+  workflow_dispatch:
+    inputs:
+      seasons:
+        description: "Space-separated NBA seasons (e.g. '2025-26 2024-25')"
+        required: false
+        default: "2025-26"
+      skip_player_logs:
+        description: "Skip the per-player game-logs pass (games only)"
+        required: false
+        default: "false"
+  schedule:
+    # 08:30 UTC every day — 30 min after the daily ETL kicks off, so this
+    # functions as a follow-up refresh that catches games which finalised
+    # during the daily ETL's run window.
+    - cron: "30 8 * * *"
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # so the workflow can commit a refreshed DB if desired
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m venv .venv
+          source .venv/bin/activate
+          pip install --upgrade pip
+          pip install -e .
+
+      - name: Run bulk NBA results ingest
+        id: ingest
+        run: |
+          source .venv/bin/activate
+          SEASONS="${{ github.event.inputs.seasons || '2025-26' }}"
+          SKIP_PLAYER_LOGS="${{ github.event.inputs.skip_player_logs }}"
+          ARGS="--seasons $SEASONS"
+          if [ "$SKIP_PLAYER_LOGS" = "true" ]; then
+            ARGS="$ARGS --skip-player-logs"
+          fi
+          echo "Running: python -m nba_model.data.nba_results_ingestion $ARGS"
+          python -m nba_model.data.nba_results_ingestion $ARGS
+
+      - name: Show ingest failure summary
+        if: failure()
+        run: |
+          echo "=== nba_results_ingestion failed. Recent SQLite state: ==="
+          if [ -f data/database/nba_data.db ]; then
+            python -c "
+          import sqlite3
+          c = sqlite3.connect('data/database/nba_data.db')
+          for tbl in ('games', 'game_logs'):
+              cnt = c.execute(f'SELECT COUNT(*) FROM {tbl}').fetchone()[0]
+              latest = c.execute(
+                  f\"SELECT MAX({'game_date' if tbl=='games' else 'game_date'}) FROM {tbl}\"
+              ).fetchone()[0]
+              print(f'  {tbl}: {cnt} rows, most recent={latest}')
+          "
+          else
+            echo "  data/database/nba_data.db not present in workspace."
+          fi

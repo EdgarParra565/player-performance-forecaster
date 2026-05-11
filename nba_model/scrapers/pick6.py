@@ -14,10 +14,13 @@ record is dropped (we'd rather miss than misattribute).
 from __future__ import annotations
 
 import re
-import sqlite3
 from typing import Optional
 
 from nba_model.scrapers.base import BookScraper, SessionMarkers
+from nba_model.scrapers.player_names import (
+    load_active_player_names,
+    resolve_player_name,
+)
 
 
 # Position abbrevs Pick6 uses.
@@ -43,58 +46,22 @@ _ACTIVE_PLAYERS_CACHE: Optional[list[str]] = None
 
 
 def _load_active_players(db_path: str = "data/database/nba_data.db") -> list[str]:
-    """Read canonical active-player names from the reference table.
-
-    Cached at module level so repeated parser calls don't re-query.
-    """
+    """Cached wrapper around the shared loader."""
     global _ACTIVE_PLAYERS_CACHE
-    if _ACTIVE_PLAYERS_CACHE is not None:
-        return _ACTIVE_PLAYERS_CACHE
-    try:
-        conn = sqlite3.connect(db_path)
-        rows = conn.execute(
-            "SELECT player_name FROM nba_active_players_ref"
-        ).fetchall()
-        conn.close()
-        _ACTIVE_PLAYERS_CACHE = [r[0] for r in rows if r[0]]
-    except Exception:
-        _ACTIVE_PLAYERS_CACHE = []
+    if _ACTIVE_PLAYERS_CACHE is None:
+        _ACTIVE_PLAYERS_CACHE = load_active_player_names(db_path)
     return _ACTIVE_PLAYERS_CACHE
 
 
 def _expand_abbreviated_name(abbrev: str) -> Optional[str]:
-    """Map "J. Brunson" → "Jalen Brunson" via active-players reference.
+    """Map ``"J. Brunson"`` → ``"Jalen Brunson"`` via the shared resolver.
 
-    Returns None when 0 or >1 active players match (we don't guess).
+    Returns ``None`` when zero or multiple active players match.  The
+    resolution logic itself lives in ``scrapers/player_names.py`` so other
+    scrapers can reuse the same expansion without duplicating the matrix
+    of initial / surname / suffix rules.
     """
-    parts = abbrev.strip().split()
-    if len(parts) < 2:
-        return None
-    first = parts[0].rstrip(".")
-    last = " ".join(parts[1:])
-    if not first or not last:
-        return None
-    initial = first[0].upper()
-
-    matches = []
-    for full in _load_active_players():
-        full_parts = full.split()
-        if len(full_parts) < 2:
-            continue
-        # Match "Brunson" against last token, OR against everything after first word.
-        canon_first = full_parts[0]
-        canon_last = " ".join(full_parts[1:])
-        # Prefer exact first-name match (e.g. "Stephen" matches abbrev "Stephen Curry"
-        # written out unabbreviated by Pick6 in some places).
-        if first.lower() == canon_first.lower() and last.lower() == canon_last.lower():
-            return full
-        # Initial + last name match — most common case.
-        if (canon_first[0].upper() == initial
-                and canon_last.lower() == last.lower()):
-            matches.append(full)
-    if len(matches) == 1:
-        return matches[0]
-    return None
+    return resolve_player_name(abbrev, _load_active_players())
 
 
 def preprocess(text: str) -> str:

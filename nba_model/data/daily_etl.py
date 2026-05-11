@@ -754,6 +754,12 @@ def run_daily_etl(
     min_players: Optional[int] = None,
     skip_zero_game_players: bool = False,
     skip_game_logs: bool = False,
+    # When false, the bulk leaguegamefinder + playergamelogs pass runs first
+    # to populate the games + game_logs tables for the configured seasons.
+    # Subsequent per-player retries still run after it (covers any active
+    # player the bulk pass missed).
+    skip_bulk_results_ingest: bool = False,
+    bulk_results_seasons: Optional[list[str]] = None,
     skip_team_defense: bool = False,
     skip_odds: bool = False,
     skip_browser_parser: bool = False,
@@ -833,6 +839,30 @@ def run_daily_etl(
     started_at = _utc_now_iso()
     run_start = time.perf_counter()
     steps = {}
+
+    # ---- Bulk NBA-API results ingest (games + league-wide player logs) ----
+    # This runs BEFORE the per-player game-log refresh so the heavy bulk
+    # endpoint populates the table once; the per-player step then only has
+    # to backfill anything specific (active-roster gaps, recent games).
+    if skip_bulk_results_ingest:
+        steps["bulk_results_ingest"] = {
+            "status": "skipped", "reason": "Step disabled by flag.",
+        }
+    else:
+        from nba_model.data.nba_results_ingestion import ingest_all
+        seasons_to_pull = bulk_results_seasons or [season]
+
+        def _bulk_results_step():
+            return ingest_all(seasons=seasons_to_pull, db_path=db_path)
+
+        bulk_step = run_with_retry(
+            step_name="bulk_results_ingest",
+            func=_bulk_results_step,
+            retries=max(0, retries),
+            retry_delay_seconds=retry_delay_seconds,
+            retry_backoff=retry_backoff,
+        )
+        steps["bulk_results_ingest"] = bulk_step
 
     if skip_game_logs:
         steps["game_logs"] = {"status": "skipped",
@@ -1143,6 +1173,22 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--player-limit", type=int, default=None,
                         help="Optional cap on total players refreshed.")
     parser.add_argument("--skip-game-logs", action="store_true")
+    parser.add_argument(
+        "--skip-bulk-results-ingest", action="store_true",
+        help=(
+            "Skip the bulk leaguegamefinder + playergamelogs pass that "
+            "populates the games table + league-wide player game logs. "
+            "When this step runs, it covers ALL active players in one "
+            "request per season — much faster than the per-player step."
+        ),
+    )
+    parser.add_argument(
+        "--bulk-results-seasons", nargs="+", default=None,
+        help=(
+            "Seasons to ingest in the bulk pass (e.g. 2025-26 2024-25). "
+            "Defaults to the single season computed by `_default_nba_season`."
+        ),
+    )
     parser.add_argument("--skip-team-defense", action="store_true")
     parser.add_argument("--skip-odds", action="store_true")
     parser.add_argument("--skip-browser-parser", action="store_true")
@@ -1414,6 +1460,8 @@ def main() -> None:
         min_players=args.min_players,
         skip_zero_game_players=args.skip_zero_game_players,
         skip_game_logs=args.skip_game_logs,
+        skip_bulk_results_ingest=args.skip_bulk_results_ingest,
+        bulk_results_seasons=args.bulk_results_seasons,
         skip_team_defense=args.skip_team_defense,
         skip_odds=args.skip_odds,
         skip_browser_parser=args.skip_browser_parser,
