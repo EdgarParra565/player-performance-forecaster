@@ -28,6 +28,7 @@ from nba_model.web import etl_status
 from nba_model.web import input_validation as iv
 from nba_model.web import parlay_compare as parlay
 from nba_model.web import watchlist as wl
+from sports import SPORTS as _ALL_SPORTS, get_sport as _get_sport
 
 
 # ---------------------------------------------------------------------------
@@ -45,6 +46,7 @@ _QP_STAT   = "stat"
 _QP_NGAMES = "n_games"
 _QP_VIEW   = "view"
 _QP_ROLL   = "rolling"
+_QP_SPORT  = "sport"
 
 
 def _qp_get(key: str, default: str = "") -> str:
@@ -1057,6 +1059,62 @@ def _player_browse_view(db_path: str) -> None:
     st.caption(f"Showing {len(show)} game(s) across {show['player_name'].nunique()} player(s).")
 
 
+def _render_sport_selector():
+    """Sport picker at the top of the sidebar.
+
+    Only NBA is live today; NFL / MLB / NHL / Soccer render as "coming soon"
+    options that pin a sticky warning at the top of the main pane if picked.
+    Returns the selected `Sport` object.
+    """
+    from sports import live_sports as _live, stub_sports as _stubs
+    options = list(_ALL_SPORTS)
+    labels = {
+        s.key: (s.display_name if s.is_live
+                else f"{s.display_name} (coming soon)")
+        for s in options
+    }
+    default_key = _qp_get(_QP_SPORT, "nba")
+    chosen_key = st.sidebar.selectbox(
+        "Sport",
+        [s.key for s in options],
+        index=_index_or_zero([s.key for s in options], default_key),
+        format_func=lambda k: labels[k],
+        help="NBA is live. Other sports show what we plan to ship + their "
+             "open questions; pick one to see the roadmap.",
+    )
+    _qp_set(sport=chosen_key)
+    sport = _get_sport(chosen_key)
+    if not sport.is_live:
+        with st.container():
+            st.warning(
+                f":construction: **{sport.display_name}** isn't live yet. "
+                "The data pipeline + scrapers are planned but not built. "
+                "See `docs/MULTI_SPORT_PLAN.md` for the rollout order."
+            )
+            with st.expander(
+                f"What's planned for {sport.display_name}", expanded=False,
+            ):
+                st.markdown(
+                    f"**Status:** {sport.status}  \n"
+                    f"**Season format:** {sport.season_format or 'TBD'}  \n"
+                    f"**Stat types ({len(sport.stat_types)}):** "
+                    + ", ".join(sport.stat_types[:8])
+                    + (" ..." if len(sport.stat_types) > 8 else "")
+                )
+                if sport.sub_leagues:
+                    st.markdown("**Sub-leagues / competitions:**")
+                    for sub in sport.sub_leagues:
+                        st.markdown(
+                            f"- `{sub.key}` — {sub.display_name}"
+                            f" ({sub.season_format})"
+                        )
+                if sport.notes:
+                    st.markdown("**Open questions / decisions:**")
+                    for n in sport.notes:
+                        st.markdown(f"- {n}")
+    return sport
+
+
 def _render_watchlist_widget(available_players: list[str]) -> Optional[str]:
     """Sidebar watchlist. Returns a selected player name if the user clicked
     one of their watchlist entries, else None.
@@ -1251,6 +1309,17 @@ def main() -> None:
             "Sign in and upgrade for all stats, all players + teams, "
             "team distributions, parlay analysis, and unlimited history."
         )
+
+    # ---- Sport picker (sidebar dropdown + main-pane roadmap card) -------
+    # Rendered OUTSIDE `with st.sidebar:` so the roadmap card for a stub
+    # sport lands in the main pane while the selectbox still attaches to
+    # the sidebar (via the explicit `st.sidebar.selectbox` call inside the
+    # helper).
+    active_sport = _render_sport_selector()
+    if not active_sport.is_live:
+        # Don't render the rest of the sidebar / main view; the roadmap
+        # card already covered what the user can see for stub sports.
+        return
 
     # ---- Sidebar -------------------------------------------------------
     _render_etl_status_widget()

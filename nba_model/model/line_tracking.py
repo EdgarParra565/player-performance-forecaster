@@ -1,7 +1,7 @@
 """Helpers for logging model-vs-market line movement comparisons."""
 
 import csv
-from datetime import datetime
+from datetime import datetime, timezone
 
 
 def log_line_comparison(
@@ -19,7 +19,7 @@ def log_line_comparison(
         writer = csv.writer(f)
 
         writer.writerow([
-            datetime.utcnow().isoformat(),
+            datetime.now(timezone.utc).isoformat(),
             player,
             market,
             round(model_prob, 4),

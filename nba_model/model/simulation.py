@@ -1,5 +1,7 @@
 """Simulation utilities for NBA prop outcome distributions and calibration."""
 
+from typing import Optional
+
 import numpy as np
 
 # -----------------------------------------------------------------------------
@@ -138,6 +140,62 @@ def _draw_samples(
         f"Unsupported distribution '{distribution}'. "
         f"Supported: {SUPPORTED_DISTRIBUTIONS}"
     )
+
+
+def blend_team_prior(
+    mu: float,
+    sigma: float,
+    *,
+    pace_factor: Optional[float] = None,
+    implied_team_total: Optional[float] = None,
+    team_recent_avg_total: Optional[float] = None,
+    alpha: float = 0.3,
+) -> tuple[float, float]:
+    """Adjust a player's (``mu``, ``sigma``) using the team's cross-book prior.
+
+    Two complementary signals can shift the projection:
+
+    1. **Pace** (``pace_factor`` from ``team_priors``): how many more / fewer
+       possessions the game is priced for vs the league baseline. Counting
+       stats (points / rebounds / assists / etc.) scale roughly linearly
+       with possessions, so we scale ``mu`` by
+       ``1 + alpha * (pace_factor - 1)``.
+    2. **Team total** (``implied_team_total`` from ``team_priors``): how
+       many points the *team* is expected to score, relative to the
+       player's team's recent baseline. When ``team_recent_avg_total`` is
+       supplied we layer that scaling on top.
+
+    ``alpha`` ∈ [0, 1] controls how heavily the prior overrides the player's
+    own historical mean. ``alpha=0`` is "no blend" (status quo);
+    ``alpha=0.3`` is a sensible default (modest pull toward the market's
+    view). ``sigma`` is scaled by the same factor so the relative
+    coefficient of variation is preserved.
+
+    All inputs are optional — when none are supplied the returned mu/sigma
+    equal the inputs, which makes this safe to call unconditionally from
+    the player pipeline.
+    """
+    factor = 1.0
+    if pace_factor is not None:
+        try:
+            pf = float(pace_factor)
+            if pf > 0:
+                factor *= 1.0 + alpha * (pf - 1.0)
+        except (TypeError, ValueError):
+            pass
+    if implied_team_total is not None and team_recent_avg_total:
+        try:
+            tt = float(implied_team_total)
+            base = float(team_recent_avg_total)
+            if tt > 0 and base > 0:
+                ratio = tt / base
+                factor *= 1.0 + alpha * (ratio - 1.0)
+        except (TypeError, ValueError):
+            pass
+    # Clamp to a sane range — the prior should *nudge* projections, not
+    # produce ±50 % swings even if the inputs are extreme.
+    factor = max(0.5, min(factor, 1.5))
+    return float(mu) * factor, float(sigma) * factor
 
 
 def monte_carlo_over(

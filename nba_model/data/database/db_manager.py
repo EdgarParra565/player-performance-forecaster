@@ -1,7 +1,7 @@
 """SQLite database manager for NBA data, betting lines, and predictions."""
 import logging
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -83,6 +83,37 @@ class DatabaseManager:
             self.conn.executescript(f.read())
 
         logger.info("Database initialized at %s", self.db_path)
+
+    def get_team_recent_avg_total(
+        self,
+        team_abbrev: str,
+        n_games: int = 20,
+    ) -> Optional[float]:
+        """Average game total (the team's pts + opp_pts) over the last N games.
+
+        Used by ``simulation.blend_team_prior`` as the baseline against which
+        the cross-book ``implied_team_total`` is compared.  Returns ``None``
+        when the team has no recent games in ``games``.
+        """
+        if not team_abbrev:
+            return None
+        rows = self.conn.execute(
+            """
+            SELECT pts, opp_pts FROM games
+            WHERE upper(team_abbrev) = upper(?)
+              AND pts IS NOT NULL AND opp_pts IS NOT NULL
+            ORDER BY game_date DESC
+            LIMIT ?
+            """,
+            (team_abbrev, int(max(1, n_games))),
+        ).fetchall()
+        if not rows:
+            return None
+        totals = [float(p) + float(o) for p, o in rows
+                  if p is not None and o is not None]
+        if not totals:
+            return None
+        return sum(totals) / len(totals)
 
     def upsert_team_priors(self, records):
         """Upsert reverse-engineered priors (one row per matchup)."""
@@ -1137,7 +1168,7 @@ class DatabaseManager:
             )
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """
-        now = datetime.utcnow().isoformat()
+        now = datetime.now(timezone.utc).isoformat()
         payload = []
         for rec in records:
             try:

@@ -9,7 +9,7 @@ import subprocess
 import sys
 import threading
 import tkinter as tk
-from datetime import datetime
+from datetime import datetime, timezone
 from hashlib import sha1
 from pathlib import Path
 from queue import Empty, Queue
@@ -1024,8 +1024,8 @@ class SimpleModelUI:
         controls.pack(fill="x", padx=8, pady=8)
 
         self.manual_default_date = self._add_labeled_entry(
-            controls, 0, "Default Game Date (YYYY-MM-DD)", datetime.utcnow().strftime(
-                "%Y-%m-%d")
+            controls, 0, "Default Game Date (YYYY-MM-DD)",
+            datetime.now(timezone.utc).strftime("%Y-%m-%d")
         )
         ttk.Label(controls, text="Default Sportsbook").grid(
             row=1, column=0, sticky="w", padx=6, pady=6)
