@@ -1,6 +1,6 @@
 # NBA Player Performance Forecaster - Working Notes
 
-Last updated: 2026-05-11
+Last updated: 2026-06-01
 
 This file is the active project tracker. It keeps only:
 - current architecture
@@ -14,6 +14,308 @@ Near-term objective:
 - broaden cross-book consensus by activating more scrapers (currently 9 of 20)
 - wire team-line priors (implied totals / pace / devig win-prob) into the
   player-projection model so the consensus feeds back into the chart-driven EV
+- **prep for multi-sport expansion** (NFL → MLB → NHL → soccer); architecture
+  is in place, ingestion + scraping per sport is the next big workstream
+---
+
+## PLAN: Deploy push + UI/chart upgrade (added 2026-06-01)
+
+Full deployment plan with two paste-ready agent prompts lives in
+`plan_for_deploy.txt` at the repo root. Summary of the tracked workstreams:
+
+- Backend (Agent A): make all 8 distributions work end-to-end + reconcile the
+  `negative_binomial` overlay-vs-`SUPPORTED_DISTRIBUTIONS` mismatch; calibrate
+  `DEFAULT_DISTRIBUTION_BY_STAT`; hourly scraping automation on a real-Chrome
+  (:9222) host via launchd; ETL hardening; shared `manual_lines.py`; Postgres
+  migration for subscriptions.
+- Frontend/deploy (Agent B): port the remaining `simple_ui` features to the
+  Streamlit site (Single Prop full tuning, Manual Lines Import, admin-gated
+  Operations console, distribution-family selector); finalize Streamlit Cloud /
+  Docker / webhook / billing toggle.
+
+### Chart / line-display UI upgrade (NEW — must do, owned by Agent B)
+The graph that displays the book lines needs to be MUCH better. Current state:
+- Only the distribution histogram was migrated to Plotly
+  (`nba_model/visualization/plotly_charts.py::build_distribution_figure`); the
+  web app still renders recent-games / hit-rate / splits as static matplotlib
+  `st.pyplot` images.
+- The line chart (distribution + per-book dashed verticals + book-mean line +
+  ±1σ band) is cramped: overlapping verticals, 9px legend, annotations
+  colliding at the top, no best-line highlight, no line-movement view.
+
+Planned fix (detail in `plan_for_deploy.txt` Agent B Workstream 5):
+- [ ] Migrate recent-games / hit-rate / splits web charts off matplotlib to
+      interactive Plotly (keep matplotlib builders for the Tk desktop path).
+- [ ] Make the line board itself better — pick ONE:
+      (i) polish the Plotly figure: declutter per-book markers, bigger legend,
+          highlight best over/under EV side, add a compact horizontal "line
+          ladder" toggle (one row per book, sorted by line); OR
+      (ii) adopt a richer lib for the line board: `streamlit-echarts` (ECharts),
+           `streamlit-lightweight-charts` (TradingView), Altair/Vega-Lite, or a
+           custom React/D3 Streamlit component. Pin in requirements.txt (`~=`),
+           lazy import, must work inside the Docker image.
+- [ ] BONUS: line-MOVEMENT timeline from `betting_line_snapshots` (open→current
+      drift per book, optional sharp/public split) — maps onto the financial
+      chart libs above and is the most compelling "lines" upgrade.
+- [ ] Acceptance: no static matplotlib images left in NBA web views; the line
+      chart is readable with 6+ books and a non-technical user can see who has
+      the best number at a glance. Add a smoke test for the new figure builders.
+
+---
+
+## 0) End-of-Day Status (2026-06-01) — notes-driven cleanup batch
+
+Worked through the backlog called out in `notes.txt` known-limitations
+sections.  Focus: correctness, model-impactful follow-ups, and the
+Player Charts expansion items listed as "marquee feature" priorities.
+
+### Added/fixed today
+
+**Correctness / cosmetic:**
+- [x] Killed every `datetime.utcnow()` (DeprecationWarning eradicated):
+  `nba_model/data/database/db_manager.py`, `nba_model/model/line_tracking.py`,
+  `nba_model/simple_ui.py`.  All now use `datetime.now(timezone.utc)`.
+  Test suite is warning-free again.
+
+**Test coverage gaps:**
+- [x] Added `nba_model/tests/test_player_charts.py` — 27 cases covering
+  canonical stat resolution, ``_series_for_stat`` (incl. PRA / RA
+  composites), market-consensus mean, EV / break-even math,
+  ``evaluate_custom_line``, the full chart-data DB round-trip, every
+  figure builder (recent-games, distribution, hit-rate, rolling-CI,
+  trend-form, defense-scatter), and the line-staleness summary.
+
+**Model-impactful (the explicit "next step" from 2026-05-11):**
+- [x] **Team-prior blender** wired into ``nba_model/model/simulation.py``
+  via new ``blend_team_prior(mu, sigma, pace_factor=..., implied_team_total=...,
+  team_recent_avg_total=..., alpha=0.3)``.  Pure function: optionally scales
+  both ``mu`` and ``sigma`` by ``1 + alpha*(pace_factor - 1)`` (pace
+  channel) and ``1 + alpha*(implied/recent - 1)`` (team-total channel).
+  Output clamped to ``[0.5×, 1.5×]`` of inputs so extreme priors can't
+  blow projections up.  Adds DB helper
+  ``db.get_team_recent_avg_total(team_abbrev, n_games=20)`` for the
+  baseline.  10 unit tests in ``test_team_prior_blend.py`` pin the math.
+
+**Benchmark methodology fix:**
+- [x] New `nba_model/evaluation/run_per_stat_sweep.py` runs the existing
+  distribution sweep with a *realistic per-stat line* instead of the
+  fixed 25.5.  Module-level defaults: points=24.5, assists=6.5,
+  rebounds=7.5, pra=35.5, ra=11.5, 3pm=2.5, fgm=9.5, minutes=33.5.
+  Override via `--lines points=24.5 rebounds=7.5 ...`.  Live run
+  (5 players × 2 windows × 2 distributions × 4 stats) produced
+  meaningful ROI signal — **poisson best across all four stats** at
+  realistic lines (avg_roi: points 6.8, assists 29.5, rebounds 40.5,
+  pra 26.7).  Artifacts at
+  `nba_model/evaluation/artifacts/per_stat_sweep_2026-05-16_*`.
+
+**Player Charts expansion (3 new figure builders + staleness):**
+- [x] `build_rolling_ci_figure(data, rolling_window, n_bootstrap=200,
+  confidence=0.95)` — rolling-mean chart with bootstrap CI band
+  (deterministic seed) and the book-mean overlay.  Lets users see when
+  the rolling estimate is genuinely shifting vs. noise.
+- [x] `build_trend_form_figure(data, short_window=5)` — KPI strip:
+  last-N mean, season mean, delta (with ▲ / ▼ / • arrow + colour),
+  last-game value.  "Hot / cold" snapshot.
+- [x] `build_defense_scatter_figure(data, db_path)` — player stat vs.
+  opponent ``team_defense.def_rating``, with linear-fit slope label.
+  Surfaces "tough D → fewer points" intuition.  Parses opponent from
+  ``game_logs.matchup`` (the same field every other chart helper now
+  uses since ``players.team`` is sparse).
+- [x] `book_lines_staleness_summary(data)` + `_format_staleness(hours)`
+  helpers + integration into ``book_lines_summary_text`` —
+  "lines scraped 2.4 h ago (median across 3 books; newest 1 h ago,
+  oldest 5 h ago)".  Closes one of the data-quality items from 2026-05-03.
+
+### Items still open (carry forward)
+
+- 11 of 20 scrapers still parser-less (open authenticated-snapshot work).
+- Team-chart book reference is `points`-only (no team_total markets at lobby).
+- Postgres migration for `subscriptions.py` (production billing path).
+- Stripe Customer Portal link for self-managed subscriptions.
+- Promote recent-games / hit-rate / splits charts to Plotly (distribution
+  chart already migrated; CI / defense-scatter / trend-form still
+  matplotlib).
+- Multi-sport stubs (NFL / MLB / NHL / soccer) → real ingestion +
+  scraping pipelines.
+- Most-recent line per book per UPCOMING game (currently uses latest
+  observed_at_utc which is "yesterday's slate" once today's lines lock).
+
+### Test totals
+- Local: **231 passing** (was 194 at start of this session).  Added
+  10 (`test_team_prior_blend.py`) + 27 (`test_player_charts.py`).
+- No more DeprecationWarnings in the suite output.
+
+---
+
+## 0) End-of-Day Status (2026-05-26) — multi-sport scaffolding
+
+The user kicked off the next big architectural workstream: extend the project
+beyond NBA. Today is the planning / framework session (not the implementation
+of any non-NBA sport, which is weeks per sport).
+
+### Added today
+- [x] **`sports/` package at the project root** (sibling to `nba_model`, not
+  nested inside — the abstraction outgrew being NBA-namespaced).  Exports a
+  frozen `Sport` dataclass capturing everything sport-specific:
+  `stat_types`, `stat_line_ranges`, `team_codes`, `season_format`,
+  `primary_books`, `notes`, `sub_leagues`, plus a status flag
+  (`live` / `stub` / `planned`).
+- [x] **Five sport modules**:
+  - `sports/nba.py` — captures what's already implemented (single source of
+    truth so future refactors stop reading hardcoded NBA constants from
+    `input_validation.py` / `player_charts.py`).
+  - `sports/nfl.py` — stub. Stat-type list (passing/rushing/receiving +
+    anytime-TD + kicker) + per-stat plausible-line ranges + 32 team codes +
+    open-question notes (weekly cadence, position-dependent models, bye
+    weeks, Bernoulli markets, `nfl_data_py` for ingest).
+  - `sports/mlb.py` — stub. Hitter + pitcher stat-type lists + ranges + 30
+    team codes + open questions (pitcher/batter split, park factors,
+    handedness split, lineup uncertainty, `pybaseball` for ingest).
+  - `sports/nhl.py` — stub. Skater + goalie lists + ranges + 32 team codes
+    (incl. UTA) + open questions (shootouts, plus/minus noise,
+    `nhl-api-py`).
+  - `sports/soccer/__init__.py` — stub. Parent `Sport(key='soccer')` plus
+    six sub-leagues nested via `sub_leagues`: EPL, La Liga, Serie A,
+    Bundesliga, Ligue 1, UCL. Commented-out `Copa_Libertadores` +
+    `Copa_Sudamericana` entries with full planning notes (calendar-year
+    seasons, regional Brazilian books like bet365/Pinnacle/Betano,
+    two-legged knockouts).
+- [x] **Streamlit sport-selector**: dropdown at the very top of the sidebar
+  showing all five sports. NBA is the live option; the other four render a
+  "coming soon" roadmap card in the **main pane** with the sport's stat
+  types, sub-leagues, and open questions. URL state preserves it:
+  `?sport=nfl` etc. Renders OUTSIDE `with st.sidebar:` so the roadmap card
+  lands in the main view while the dropdown still attaches to the sidebar
+  via explicit `st.sidebar.selectbox`.
+- [x] **`docs/MULTI_SPORT_PLAN.md`**: architecture overview, rollout order
+  with rough timelines, and the **six cross-cutting decisions to make
+  before the first non-NBA sport ships** — schema (sport column vs
+  per-sport tables), stat-type namespacing, two-way vs three-way market
+  math, per-sport scraper resolution, player-name resolver scoping,
+  free-tier preview list per sport. Plus per-sport sections capturing
+  every open question raised during the planning pass.
+
+### Smoke-test
+- 233/233 tests still passing (no regressions; `sports/` is additive).
+- Streamlit boots clean; every `?sport={key}` URL returns 200.
+
+### What's NOT in this commit (deliberately deferred)
+- Schema migrations for the `sport` column (recommendation: `sport TEXT NOT
+  NULL DEFAULT 'nba'` on `game_logs`, `betting_lines`,
+  `betting_line_snapshots`, `players`, `web_prop_cards`, `predictions`).
+- Per-book scraper resolution by `(book, sport)` (currently `(book,)` only).
+- Three-way outcome math for soccer (`parlay_compare.py` + EV math assume
+  binary; need an `outcome_dim` field on `Sport`).
+- Per-sport `nba_api`-equivalent ingestion (`nfl_data_py`, `pybaseball`,
+  `nhl-api-py`, plus an as-yet-undecided soccer source — likely
+  `understat` for European leagues).
+- Free-tier preview dicts keyed by sport.
+
+### Recommended next-session order
+1. Pick which non-NBA sport to ship first. Recommended: **NFL** (largest
+   US market, single league, ingestion is well-tooled via `nfl_data_py`).
+2. Resolve the schema decision (sport column) — needs to land before any
+   non-NBA data flows.
+3. Write `data/nfl_results_ingestion.py` modeled on
+   `data/nba_results_ingestion.py`.
+4. Write NFL scrapers for the 4-5 books with deep NFL prop coverage
+   (FanDuel + DraftKings first).
+5. Wire NFL into `input_validation.py` via the registry instead of the
+   hardcoded NBA list.
+
+---
+
+## 0) End-of-Day Status (2026-05-25) — first live scrape attempt of the new cycle
+
+### What worked
+- [x] Launched real Chrome on `:9222` via
+  `open -na "Google Chrome" --args --remote-debugging-port=9222 --user-data-dir=/tmp/pp-chrome-profile`.
+  CDP bridge confirmed reachable.
+- [x] **Direct PrizePicks fetch via venv Python succeeded.**
+  `.venv/bin/python3 -m nba_model.model.web_text_ingestion --urls "https://app.prizepicks.com/board/nba" --browser-auth-state-file data/config/auth/prizepicks_state.json --chrome-debug-port 9222 --force-poll`
+  → `status: success`, 1 snapshot stored in `web_text_snapshots`.
+- [x] **CDP session extracted** to `data/config/auth/prizepicks_state.json`:
+  409 cookies + 50 localStorage keys.
+- [x] **Browser parser still produced data**: `step[browser_parser]: success`,
+  91 rows inserted into `web_prop_cards` (parsed from the earlier good snapshot,
+  not from the failed daily_etl fetches).
+- [x] **Bulk NBA results ingest worked**: 2,789 games upserted for season
+  2025-26, 213 new player game-logs (30,413 duplicates ignored as expected).
+
+### Issues found — fix on next session
+
+**Bug 1 — Daily ETL invoked with system `python3` instead of `.venv/bin/python3`.**
+Every URL in `data/config/web_text_urls.txt` failed with
+`Playwright is required for browser web ingestion. Install with:
+pip install playwright && playwright install chromium.` because the system
+interpreter doesn't have Playwright installed. End result: `step[web_text]: failed`,
+overall `status: failed`. The same command from `.venv/bin/python3` would have
+worked — the two preceding commands in the same terminal used the venv and
+succeeded. Fix: always use `.venv/bin/python3` (or activate the venv first).
+Consider adding a guard at the top of `daily_etl.py` that detects "system
+python without playwright" and aborts early with a clear message instead of
+retrying 6 URLs × 2 attempts each.
+
+**Bug 2 — `auth_keys_found: []` from `--connect-chrome`.**
+CDP grabbed 409 cookies and 50 localStorage keys but the extractor reported
+zero recognized JWT/auth keys. Two likely causes:
+- I wasn't fully logged into PrizePicks in the `:9222` Chrome window at the
+  time (Cloudflare / location check possibly still pending, or only on the
+  landing page rather than the actual board).
+- PrizePicks rotated the localStorage key name(s) the extractor watches for;
+  worth re-checking `_AUTH_KEY_PATTERNS` (or equivalent) in
+  `web_text_ingestion.py` against current localStorage on a known-good
+  logged-in session.
+- Verify next session by querying the snapshot:
+  `SELECT length(text_content), substr(text_content,1,400) FROM web_text_snapshots WHERE source_url LIKE '%prizepicks%' ORDER BY fetched_at_utc DESC LIMIT 1`
+  — if the prefix is "Sign in" / "Verify location" instead of player names,
+  the snapshot is logged-out and `web_prop_cards` rows from it will be junk.
+
+**Bug 3 — `data/config/web_text_urls.txt` is stale.**
+- All 5 UnderDog URLs use the old domain `app.underdogfantasy.com`.
+  The 2026 rebrand to `underdogsports.com` is already wired into the scraper
+  registry (`underdog.py` aliases) — see notes for 2026-05-08 — but the URL
+  list was never updated. Replace `app.underdogfantasy.com` →
+  `underdogsports.com` on lines 13-17.
+- Line 21 has a dead PrizePicks duplicate: `https://app.prizepicks.com/board?league=NBA`.
+  The working path is `/board/nba` (line 20). Drop line 21.
+
+**Bug 4 — URLs file only covers 2 of the 9 actively-parsing books.**
+File currently has only PrizePicks + Underdog. Cross-book consensus is much
+weaker than it could be until the other 7 are added:
+- Player props (DFS): `https://pick6.draftkings.com/?sport=NBA`,
+  `https://parlayplay.io/`
+- Team lines (sportsbooks): `https://sports.betmgm.com/en/sports/basketball-7`
+  (or your state subdomain), `https://sportsbook.caesars.com/us/<state>/bet/basketball`,
+  `https://sportsbook.draftkings.com/leagues/basketball/nba`,
+  `https://www.bovada.lv/sports/basketball/nba`,
+  `https://kalshi.com/markets/nba`
+Each tab needs to be opened + logged in (where required) in the same `:9222`
+Chrome window before the ETL runs.
+
+### Re-run checklist for next session
+1. Open `:9222` Chrome (`open -na "Google Chrome" --args --remote-debugging-port=9222 --user-data-dir=/tmp/pp-chrome-profile`).
+2. Open each of the 9 active book URLs as tabs; log in to PrizePicks +
+   Underdog + DK + BetMGM + Caesars (Bovada and Kalshi may not require
+   accounts; PrizePicks is the strict one).
+3. Confirm PrizePicks board is fully rendered (cards + lines visible).
+4. Re-run CDP capture: `.venv/bin/python3 -m nba_model.model.web_text_ingestion --connect-chrome https://app.prizepicks.com/board/nba --browser-auth-state-file data/config/auth/prizepicks_state.json --chrome-debug-port 9222`. **Verify `auth_keys_found` is non-empty this time.**
+5. Update `data/config/web_text_urls.txt` per Bugs 3 + 4.
+6. Re-run the ETL using **`.venv/bin/python3`** (Bug 1):
+   ```
+   .venv/bin/python3 -m nba_model.data.daily_etl \
+     --skip-game-logs --skip-team-defense --skip-odds --skip-reverse-engineering \
+     --web-text-urls-file data/config/web_text_urls.txt \
+     --browser-auth-state-file data/config/auth/prizepicks_state.json \
+     --chrome-debug-port 9222
+   ```
+7. Expect `step[web_text]: success` and `web_prop_cards` + `web_team_lines`
+   row counts to jump materially.
+
+### Run artifact
+- ETL report: `nba_model/data/artifacts/daily_etl_report_20260526_031510.json`
+  (status=failed, started 2026-05-26T03:15:02 UTC, elapsed 7,366 ms).
+
 ---
 
 ## 0) End-of-Day Status (2026-05-11)

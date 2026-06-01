@@ -291,6 +291,67 @@ class FigureBuilderTests(unittest.TestCase):
         fig = pc.build_hit_rate_figure(self._data())
         self.assertIsInstance(fig, Figure)
 
+    def test_rolling_ci_figure(self):
+        fig = pc.build_rolling_ci_figure(self._data(), rolling_window=3,
+                                         n_bootstrap=50)
+        self.assertIsInstance(fig, Figure)
+        # Legend should mention the CI band + rolling-mean line.
+        legend_labels = (
+            [t.get_text() for t in fig.axes[0].get_legend().get_texts()]
+            if fig.axes[0].get_legend() else []
+        )
+        self.assertTrue(any("CI" in lbl for lbl in legend_labels))
+        self.assertTrue(any("rolling" in lbl.lower() for lbl in legend_labels))
+
+    def test_trend_form_figure(self):
+        fig = pc.build_trend_form_figure(self._data())
+        self.assertIsInstance(fig, Figure)
+
+    def test_trend_form_figure_empty_data_is_safe(self):
+        empty = pc.PlayerChartData(
+            player_id=0, player_name="Nobody", stat_type="points",
+            games=pd.DataFrame(), values=np.array([], dtype=float),
+        )
+        fig = pc.build_trend_form_figure(empty)
+        self.assertIsInstance(fig, Figure)
+
+
+class StalenessSummaryTests(unittest.TestCase):
+    def test_none_when_no_book_lines(self):
+        data = pc.PlayerChartData(
+            player_id=1, player_name="P", stat_type="points",
+            games=pd.DataFrame(), values=np.array([], dtype=float),
+        )
+        self.assertIsNone(pc.book_lines_staleness_summary(data))
+
+    def test_computes_median_hours(self):
+        # Two books posted 1h ago and 5h ago → median 3h.
+        now = pd.Timestamp.now(tz="UTC")
+        data = pc.PlayerChartData(
+            player_id=1, player_name="P", stat_type="points",
+            games=pd.DataFrame(), values=np.array([], dtype=float),
+            book_lines=pd.DataFrame({
+                "book": ["a", "b"],
+                "line_value": [25.5, 26.0],
+                "game_date": [
+                    (now - pd.Timedelta(hours=1)).isoformat(),
+                    (now - pd.Timedelta(hours=5)).isoformat(),
+                ],
+            }),
+        )
+        out = pc.book_lines_staleness_summary(data)
+        self.assertIsNotNone(out)
+        self.assertEqual(out["n_books"], 2)
+        # Allow ±0.05h slack so the test isn't wall-clock-flaky.
+        self.assertAlmostEqual(out["hours_min"], 1.0, delta=0.05)
+        self.assertAlmostEqual(out["hours_max"], 5.0, delta=0.05)
+        self.assertAlmostEqual(out["hours_median"], 3.0, delta=0.05)
+
+    def test_format_staleness_human(self):
+        self.assertEqual(pc._format_staleness(0.5), "30 m ago")
+        self.assertEqual(pc._format_staleness(2.4), "2.4 h ago")
+        self.assertEqual(pc._format_staleness(72.0), "3.0 d ago")
+
 
 if __name__ == "__main__":
     unittest.main()

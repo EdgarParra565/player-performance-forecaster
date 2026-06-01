@@ -91,9 +91,13 @@ def main():
     )
     parser.add_argument("--start-date", default="2024-11-01")
     parser.add_argument("--end-date", default="2025-03-15")
-    # ``run_batch_backtest`` requires history >= 20 for the rolling-mean
-    # estimator to be stable.
-    parser.add_argument("--history-games", type=int, default=20)
+    # ``history_games`` is the size of the per-player cache the underlying
+    # ``_CachedLoader`` warms before running.  It MUST be at least ~120 so
+    # the backtest has enough rows to scan inside the configured date
+    # window (the cached loader doesn't re-fetch; whatever's loaded once
+    # is all the backtest will ever see).  ``run_batch_backtest`` also
+    # rejects values below 20 outright.
+    parser.add_argument("--history-games", type=int, default=120)
     parser.add_argument("--american-odds", type=int, default=-110)
     parser.add_argument(
         "--lines", nargs="+", default=None,

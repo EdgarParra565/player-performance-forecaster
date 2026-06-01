@@ -662,6 +662,230 @@ def build_hit_rate_figure(
     return fig
 
 
+def build_rolling_ci_figure(
+    data: PlayerChartData,
+    rolling_window: int = 5,
+    n_bootstrap: int = 200,
+    confidence: float = 0.95,
+    figsize: tuple[float, float] = (7.0, 3.6),
+) -> Figure:
+    """Recent-games chart with a bootstrap confidence band around the rolling mean.
+
+    For each game in the window, computes a centered rolling mean over the
+    last ``rolling_window`` games and a 95 % CI by bootstrapping ``n_bootstrap``
+    resamples of that window. The shaded band shows how much the rolling
+    estimate can swing under resampling — useful for spotting genuine
+    trend shifts vs. noise.
+    """
+    fig = Figure(figsize=figsize, dpi=100, layout="constrained")
+    ax = fig.add_subplot(111)
+    if data.values.size == 0 or data.games.empty:
+        ax.text(0.5, 0.5, "No game data", ha="center", va="center",
+                transform=ax.transAxes, fontsize=12, color="#666")
+        ax.set_axis_off()
+        return fig
+
+    values = data.values
+    n = len(values)
+    window = max(1, int(rolling_window))
+    xs = np.arange(n)
+
+    # Rolling mean (right-aligned to match the recent-games chart).
+    roll = pd.Series(values).rolling(window, min_periods=1).mean().to_numpy()
+
+    # Bootstrap CI per game-position.  At each position i we have the
+    # previous ``window`` values; resampling them with replacement and
+    # taking the mean ``n_bootstrap`` times gives the spread of plausible
+    # rolling means at that position.
+    lo_pct = (1.0 - confidence) / 2.0 * 100.0
+    hi_pct = (1.0 + confidence) / 2.0 * 100.0
+    rng = np.random.default_rng(seed=42)  # deterministic so chart re-renders match
+    lo_band = np.empty(n)
+    hi_band = np.empty(n)
+    for i in range(n):
+        sub = values[max(0, i - window + 1): i + 1]
+        if sub.size < 2:
+            lo_band[i] = hi_band[i] = sub.mean() if sub.size else 0.0
+            continue
+        boots = rng.choice(sub, size=(n_bootstrap, sub.size), replace=True)
+        means = boots.mean(axis=1)
+        lo_band[i] = float(np.percentile(means, lo_pct))
+        hi_band[i] = float(np.percentile(means, hi_pct))
+
+    ax.fill_between(xs, lo_band, hi_band, color="#cc4125", alpha=0.18,
+                    label=f"{int(confidence * 100)}% bootstrap CI")
+    ax.plot(xs, roll, color="#cc4125", linewidth=2,
+            label=f"rolling-{window} mean")
+    ax.scatter(xs, values, s=18, color="#4a86e8", alpha=0.7,
+               label=data.stat_type)
+    if data.market_consensus_line is not None:
+        ax.axhline(
+            data.market_consensus_line, color="#666", linestyle="--",
+            linewidth=1.0,
+            label=f"book mean {data.market_consensus_line:.1f}",
+        )
+
+    dates = pd.to_datetime(data.games["game_date"]).dt.strftime("%m/%d")
+    tick_step = max(1, n // 10)
+    ax.set_xticks(xs[::tick_step])
+    ax.set_xticklabels(dates.iloc[::tick_step], rotation=30, ha="right",
+                       fontsize=8)
+    ax.set_ylabel(data.stat_type)
+    ax.set_title(
+        f"{data.player_name} - rolling mean + {int(confidence * 100)}% CI"
+    )
+    ax.grid(axis="y", linestyle=":", alpha=0.4)
+    ax.legend(loc="upper left", fontsize=8, framealpha=0.85)
+    return fig
+
+
+def build_trend_form_figure(
+    data: PlayerChartData,
+    short_window: int = 5,
+    figsize: tuple[float, float] = (7.0, 2.4),
+) -> Figure:
+    """KPI panel: last-N vs season avg, with delta-arrows for "form" snapshot.
+
+    Renders four mini-cards: ``last-N mean``, ``season mean``, ``delta``,
+    ``last-game value``. Delta arrows (▲ / ▼) flag whether the player is
+    trending hot or cold relative to their season baseline.
+    """
+    fig = Figure(figsize=figsize, dpi=100, layout="constrained")
+    ax = fig.add_subplot(111)
+    ax.set_axis_off()
+    if data.values.size == 0:
+        ax.text(0.5, 0.5, "No game data", ha="center", va="center",
+                transform=ax.transAxes, fontsize=12, color="#666")
+        return fig
+
+    values = data.values
+    short_n = max(1, min(int(short_window), values.size))
+    last_n = values[-short_n:]
+    last_n_mean = float(np.mean(last_n))
+    season_mean = float(np.mean(values))
+    delta = last_n_mean - season_mean
+    last_game = float(values[-1])
+
+    # Direction arrow + colour-coded based on delta sign.
+    if delta > 0.5:
+        arrow, colour = "▲", "#0a8f0a"
+    elif delta < -0.5:
+        arrow, colour = "▼", "#c0392b"
+    else:
+        arrow, colour = "•", "#555"
+
+    cards = [
+        (f"last-{short_n} mean", f"{last_n_mean:.1f}",   "#1f3a93"),
+        ("season mean",          f"{season_mean:.1f}",   "#555"),
+        ("delta",                f"{arrow} {delta:+.1f}", colour),
+        ("last game",            f"{last_game:.1f}",     "#1f3a93"),
+    ]
+    for i, (label, value, value_colour) in enumerate(cards):
+        x_center = (i + 0.5) / len(cards)
+        ax.text(x_center, 0.7, value, transform=ax.transAxes,
+                ha="center", va="center", fontsize=22, fontweight="bold",
+                color=value_colour)
+        ax.text(x_center, 0.25, label, transform=ax.transAxes,
+                ha="center", va="center", fontsize=10, color="#666")
+    ax.set_title(
+        f"{data.player_name} - {data.stat_type} trend",
+        fontsize=11, loc="left",
+    )
+    return fig
+
+
+def build_defense_scatter_figure(
+    data: PlayerChartData,
+    db_path: str,
+    figsize: tuple[float, float] = (7.0, 3.6),
+) -> Figure:
+    """Player stat vs. opponent defensive rating scatter.
+
+    For each game in ``data.games`` we look up the opponent team from the
+    ``matchup`` field and join against ``team_defense.def_rating``. The
+    resulting scatter shows whether the player's stat correlates with
+    opponent strength — a downward slope on points-vs-def_rating is the
+    expected market intuition (tough defense → lower points).
+    """
+    fig = Figure(figsize=figsize, dpi=100, layout="constrained")
+    ax = fig.add_subplot(111)
+    if data.values.size == 0 or data.games.empty:
+        ax.text(0.5, 0.5, "No game data", ha="center", va="center",
+                transform=ax.transAxes, fontsize=12, color="#666")
+        ax.set_axis_off()
+        return fig
+
+    games = data.games.copy()
+    # Parse opponent abbreviation from matchup like "LAL vs. DEN" / "LAL @ DEN".
+    def _extract_opp(matchup):
+        if not isinstance(matchup, str):
+            return None
+        for sep in (" vs. ", " vs ", " @ "):
+            if sep in matchup:
+                return matchup.split(sep, 1)[1].strip().upper()
+        return None
+    games["opp_abbrev"] = games["matchup"].apply(_extract_opp) \
+        if "matchup" in games.columns else None
+
+    if games["opp_abbrev"].isna().all():
+        ax.text(0.5, 0.5, "No opponent info available",
+                ha="center", va="center", transform=ax.transAxes,
+                fontsize=12, color="#666")
+        ax.set_axis_off()
+        return fig
+
+    # Pull def_rating per opponent (latest season per team in team_defense).
+    with DatabaseManager(db_path=db_path) as db:
+        def_df = pd.read_sql_query(
+            """
+            SELECT team_abbrev, def_rating
+            FROM team_defense
+            WHERE def_rating IS NOT NULL
+            """,
+            db.conn,
+        )
+    if def_df.empty:
+        ax.text(0.5, 0.5,
+                "No team_defense rows. Run the daily ETL to populate.",
+                ha="center", va="center", transform=ax.transAxes,
+                fontsize=11, color="#666")
+        ax.set_axis_off()
+        return fig
+
+    games = games.merge(
+        def_df, left_on="opp_abbrev", right_on="team_abbrev", how="left",
+    )
+    games["stat_value"] = data.values
+    plot_df = games.dropna(subset=["def_rating", "stat_value"])
+    if plot_df.empty:
+        ax.text(0.5, 0.5, "Opponent defense not joinable for these games",
+                ha="center", va="center", transform=ax.transAxes,
+                fontsize=11, color="#666")
+        ax.set_axis_off()
+        return fig
+
+    ax.scatter(plot_df["def_rating"], plot_df["stat_value"],
+               s=36, alpha=0.7, color="#4a86e8", edgecolor="white")
+    # Light linear-fit overlay to surface the trend.
+    if len(plot_df) >= 3:
+        coeffs = np.polyfit(plot_df["def_rating"], plot_df["stat_value"], 1)
+        x_line = np.linspace(plot_df["def_rating"].min(),
+                             plot_df["def_rating"].max(), 50)
+        y_line = coeffs[0] * x_line + coeffs[1]
+        ax.plot(x_line, y_line, "--", color="#c0392b", alpha=0.6,
+                label=f"slope = {coeffs[0]:+.3f}")
+        ax.legend(loc="best", fontsize=9)
+
+    ax.set_xlabel("opponent defensive rating (lower = tougher)")
+    ax.set_ylabel(data.stat_type)
+    ax.set_title(
+        f"{data.player_name} - {data.stat_type} vs. opp def_rating "
+        f"({len(plot_df)} games)"
+    )
+    ax.grid(linestyle=":", alpha=0.4)
+    return fig
+
+
 def build_splits_figure(
     data: PlayerChartData,
     figsize: tuple[float, float] = (7.0, 3.6),
@@ -825,6 +1049,46 @@ def evaluate_custom_line(
     }
 
 
+def book_lines_staleness_summary(data: PlayerChartData) -> Optional[dict]:
+    """Return age-of-most-recent-line stats for ``data.book_lines``.
+
+    Used by both the chart-summary text and the Streamlit UI to surface
+    "lines scraped 2.4 h ago" so users know whether the consensus mean
+    they're looking at is fresh or pre-slate.
+
+    Returns ``None`` when there are no book lines or no parseable timestamps.
+    Otherwise returns ``{"hours_min", "hours_max", "hours_median",
+    "latest_iso", "n_books"}``.
+    """
+    if data.book_lines is None or data.book_lines.empty:
+        return None
+    if "game_date" not in data.book_lines.columns:
+        return None
+    ts = pd.to_datetime(
+        data.book_lines["game_date"], errors="coerce", utc=True,
+    ).dropna()
+    if ts.empty:
+        return None
+    now_utc = pd.Timestamp.now(tz="UTC")
+    hours = (now_utc - ts).dt.total_seconds() / 3600.0
+    return {
+        "hours_min": float(hours.min()),
+        "hours_max": float(hours.max()),
+        "hours_median": float(hours.median()),
+        "latest_iso": str(ts.max().isoformat()),
+        "n_books": int(len(ts)),
+    }
+
+
+def _format_staleness(hours: float) -> str:
+    """Human-friendly format for staleness: '2.4 h ago' / '12 m ago' / '3 d ago'."""
+    if hours < 1.0:
+        return f"{int(round(hours * 60))} m ago"
+    if hours < 48.0:
+        return f"{hours:.1f} h ago"
+    return f"{hours / 24.0:.1f} d ago"
+
+
 def book_lines_summary_text(data: PlayerChartData) -> str:
     """Render a small text table of per-book lines + over-prob under fitted normal."""
     lines: list[str] = []
@@ -848,6 +1112,17 @@ def book_lines_summary_text(data: PlayerChartData) -> str:
             f"mean={consensus['mean']:.3f}  "
             f"sigma={consensus['stdev']:.3f}  "
             f"spread={consensus['spread']:.3f}"
+        )
+    # Surface staleness — useful for spotting consensus computed from
+    # snapshots taken before today's slate moved.
+    staleness = book_lines_staleness_summary(data)
+    if staleness is not None:
+        lines.append(
+            f"lines scraped {_format_staleness(staleness['hours_median'])} "
+            f"(median across {staleness['n_books']} book"
+            f"{'s' if staleness['n_books'] != 1 else ''}; "
+            f"newest {_format_staleness(staleness['hours_min'])}, "
+            f"oldest {_format_staleness(staleness['hours_max'])})"
         )
     pct_lookup = {p["book"].lower(): p for p in consensus["per_book"]}
 

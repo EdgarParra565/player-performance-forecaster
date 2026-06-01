@@ -1,0 +1,483 @@
+================================================================================
+PLAN FOR DEPLOY — NBA Player Performance Forecaster
+Generated: 2026-06-01
+================================================================================
+
+PURPOSE OF THIS FILE
+--------------------
+This file lays out everything required to take the project from its current
+state to a deployable, self-updating NBA product, then splits the work into
+TWO self-contained prompts you can paste into two separate Claude agents that
+will work in parallel with minimal collision.
+
+  - PROMPT 1 (Agent A) = BACKEND: data, model, all-distribution support,
+    hourly scraping automation, ETL hardening, Postgres migration.
+  - PROMPT 2 (Agent B) = FRONTEND + DEPLOY: port every simple_ui feature into
+    the Streamlit site, finalize Streamlit Cloud / Docker / webhook deploy,
+    billing toggle, admin-gated operations.
+
+Scope decision (per your instruction): make EVERYTHING FOR NBA production-ready.
+Leave NFL / MLB / NHL / soccer as the existing "coming soon" stubs — do NOT
+delete the `sports/` scaffolding, just don't finish the non-NBA sports.
+
+--------------------------------------------------------------------------------
+CURRENT-STATE FINDINGS (the agents should trust this; it was audited 2026-06-01)
+--------------------------------------------------------------------------------
+
+A) DISTRIBUTIONS
+   - `nba_model/model/simulation.py` already implements 8 families in
+     `_draw_samples`: normal, student_t, binomial, poisson, exponential,
+     uniform, lognormal, power_law (plus `_DISTRIBUTION_ALIASES`).
+   - BUT `DEFAULT_DISTRIBUTION_BY_STAT` is hardcoded to "normal" for every
+     stat — never calibrated from the sweep. README "Production defaults"
+     section documents the intended calibration workflow but it was never run
+     to completion / committed.
+   - MISMATCH: the chart overlays in `player_charts.py` / `plotly_charts.py`
+     and both UIs offer "negative_binomial" as an overlay, but
+     `SUPPORTED_DISTRIBUTIONS` in simulation.py does NOT include
+     negative_binomial. The model path and the chart-overlay path use two
+     different distribution vocabularies. This must be reconciled so "all
+     distributions work" is actually true end-to-end.
+
+B) simple_ui.py FEATURES (desktop Tk) vs web app (Streamlit nba_model/web/app.py)
+   simple_ui tabs: Single Prop | Parlay | Manual Lines Import | Player Charts |
+   Game Results | Player Stats Browse | Operations.
+   Web app views: Player charts | Team charts | Compare players | All stats
+   (overview) | Parlay analysis | Game Results | Player Stats Browse.
+
+   PRESENT in web already: Player Charts, Team charts, Compare players,
+   Parlay analysis (single + multi), Game Results, Player Stats Browse,
+   custom-line probe, book-lines table, watchlist, ETL-status widget.
+
+   MISSING from web (must be ported to be "feature complete"):
+     1. SINGLE PROP view with the FULL model tuning surface that Tk exposes:
+        rolling window, opp def rating, vegas spread, league-avg def rating,
+        defense sensitivity, blowout threshold, blowout penalty, defense
+        severity, minutes-penalty severity, sigma severity, distribution
+        family (all 8), and the optional distribution plot. (Web's
+        "Parlay analysis > Single prop" is a thin subset — it does not expose
+        the tuning sliders.)
+     2. MANUAL LINES IMPORT view: paste pipe/csv/tab rows OR raw board text →
+        parse → preview table → save into `betting_lines`. Logic lives in
+        simple_ui `_parse_manual_lines_text`, `_parse_board_style_text`,
+        `_parse_manual_line_to_record` — refactor that parsing into a shared,
+        importable module so both Tk and Streamlit call the same code.
+     3. OPERATIONS / ADMIN panel: launch Daily ETL, Web-Text ingestion,
+        Browser Parser, Evaluation suite, Reverse-Engineering, DB Audit.
+        On a public site this MUST be admin-gated (web_auth.is_admin()) and
+        should stream subprocess output. Treat as an admin console, not a
+        public feature.
+     4. Full distribution-family selector on the player-charts view (web
+        currently only toggles normal / poisson / negative-binomial overlays).
+
+C) SCRAPING / AUTOMATION (the "run every hour" requirement)
+   - Today: `.github/workflows/daily_etl.yml` runs ONCE/DAY at 08:00 UTC and
+     SKIPS game_logs + team_defense in CI (stats.nba.com blocks GitHub IPs).
+     `nba_results_ingest.yml` runs once/day at 08:30 UTC.
+   - HARD CONSTRAINT: sportsbook scraping (PrizePicks/Underdog/etc.) requires a
+     REAL Chrome running locally with `--remote-debugging-port=9222` (CDP).
+     Cloudflare/PerimeterX/DataDome block Playwright's bundled Chromium at the
+     TLS layer. THIS CANNOT RUN ON GITHUB ACTIONS OR IN A CONTAINER. The hourly
+     scraper must run on a host with a persistent real Chrome (the dev Mac via
+     launchd, or a always-on VPS/mini-PC with a real Chrome session).
+   - The NBA-data refresh (games + player logs via nba_api) CAN run hourly from
+     a residential/host IP but NOT from GitHub. Keep these two cadences
+     separate: (a) hourly local scrape+recompute on the Chrome host;
+     (b) lightweight hourly nba_api refresh on the host or a residential box.
+   - `data/config/web_text_urls.txt` is STALE: UnderDog URLs still use the old
+     `app.underdogfantasy.com` domain (rebranded to `underdogsports.com`), and
+     there's a dead `app.prizepicks.com/board?league=NBA` duplicate. Only 2 of
+     the 9 working books are listed.
+   - Known footgun (seen in terminal logs): running the ETL with system
+     `python3` instead of `.venv/bin/python3` makes every browser fetch fail
+     with "Playwright is required". Add a guard.
+
+D) DEPLOYMENT
+   - Target: Streamlit Community Cloud (app) + FastAPI webhook on Render/Railway
+     (`nba_model/web/webhook_app.py`). Docker + docker-compose already exist.
+   - `BILLING_ENABLED` defaults to 0 (open-access). OIDC + Stripe code is all
+     present and dormant behind that env flag.
+   - REAL LAUNCH BLOCKERS already documented in notes.txt:
+       * `subscriptions.py` is SQLite; Streamlit Cloud has ephemeral disk, so
+         billing state won't survive restarts. Needs managed Postgres
+         (Neon/Supabase/Render PG) before billing is turned on.
+       * `data/database/nba_data.db` is read-only on Streamlit Cloud, so the
+         hourly ETL must run on the Chrome host and PUSH the refreshed DB up
+         (commit to repo, object storage, or a small sync). Decide + wire this.
+   - Tests: full suite is ~233 passing today. Neither agent may land work that
+     reduces the passing count; add tests for new behavior.
+
+E) CHARTING / LINE-DISPLAY UI (needs to be MUCH better)
+   - Current state: matplotlib builders in `nba_model/visualization/player_charts.py`
+     power the Tk desktop UI; only ONE chart (the distribution histogram +
+     fitted overlays + per-book vertical line markers) was migrated to Plotly
+     in `nba_model/visualization/plotly_charts.py`. The web app still renders
+     recent-games, hit-rate, and splits as static matplotlib `st.pyplot` images.
+   - The "chart displaying the lines" (the distribution figure with the dashed
+     per-book vertical markers + the book-mean line + the +/-1 sigma band) is
+     the marquee surface and currently looks cramped/cluttered: many overlapping
+     dashed verticals, tiny 9px legend, annotations colliding at the top edge,
+     and no clean way to compare books or see line movement over time.
+   - Goal (your words): make the line chart better — either build a custom
+     feature for it or adopt a library with a nicer UI. This is a frontend
+     (Agent B) workstream. Static matplotlib images in the web app are the
+     weakest part of the UX; everything user-facing should be interactive.
+
+================================================================================
+SHARED CONTRACT BETWEEN THE TWO AGENTS (read this before splitting)
+================================================================================
+To avoid merge conflicts, the file ownership is divided as follows.
+
+AGENT A OWNS (writes):
+  nba_model/model/simulation.py (DEFAULT_DISTRIBUTION_BY_STAT + dist reconcile)
+  nba_model/model/* (model/scraper plumbing), nba_model/scrapers/*
+  nba_model/data/* (daily_etl.py, nba_results_ingestion.py, db_manager.py,
+     schema.sql), nba_model/evaluation/*
+  .github/workflows/*, scripts/*, data/config/web_text_urls.txt
+  NEW: scripts/scheduler/ (launchd plist + hourly runner), nba_model/web/subscriptions.py
+       (Postgres driver)
+  NEW shared module: nba_model/model/manual_lines.py (extract the manual-line
+     parsing OUT of simple_ui so Agent B can import it — Agent A creates this
+     pure-logic module + tests; Agent B builds the Streamlit UI on top).
+
+AGENT B OWNS (writes):
+  nba_model/web/app.py and all new web views, nba_model/web/auth.py (only the
+     admin-ops gating), nba_model/web/operations_panel.py (NEW),
+     nba_model/web/single_prop_view.py (NEW), nba_model/web/manual_lines_view.py
+     (NEW, imports Agent A's nba_model/model/manual_lines.py)
+  Dockerfile, docker-compose.yml, .streamlit/secrets.toml.example,
+     docs/DEPLOYMENT.md, README deploy sections.
+
+SHARED / READ-MOSTLY (coordinate; Agent A is the writer of record):
+  nba_model/web/input_validation.py (Agent A may extend validators; Agent B
+     only reads). nba_model/model/simulation.py defaults (A writes, B reads).
+
+INTERFACE HANDSHAKE:
+  - Agent A must create `nba_model/model/manual_lines.py` EARLY (it's a pure
+    refactor of existing simple_ui parsing) and export:
+        parse_manual_lines_text(text, default_game_date, default_book) -> (records, errors)
+    so Agent B's manual-lines Streamlit view can import it without touching Tk.
+  - Agent A must finalize `SUPPORTED_DISTRIBUTIONS` (including or excluding
+    negative_binomial) so Agent B's distribution selectors list the exact same
+    set. Agent B reads `simulation.SUPPORTED_DISTRIBUTIONS` rather than
+    hardcoding.
+
+================================================================================
+================================================================================
+PROMPT 1  —  PASTE INTO CLAUDE AGENT A  (BACKEND / DATA / MODEL / SCRAPING)
+================================================================================
+================================================================================
+
+You are working in the repo /Users/edgarparra/nba-probability-model, a Python
+NBA player-props probability model (SQLite at data/database/nba_data.db,
+package `nba_model/`, multi-sport seam in `sports/`). The full pytest suite is
+~233 passing — do not reduce that number; add tests for everything you build.
+Use the project venv: ALWAYS run Python as `.venv/bin/python3`, never system
+`python3`. Keep all work NBA-only; do not finish NFL/MLB/NHL/soccer (leave the
+`sports/` stubs intact).
+
+Your mission has FIVE workstreams. Deliver them in order.
+
+WORKSTREAM 1 — MAKE THE MODEL WORK WITH ALL DISTRIBUTIONS (end-to-end)
+  Context: `nba_model/model/simulation.py` already draws from 8 families
+  (normal, student_t, binomial, poisson, exponential, uniform, lognormal,
+  power_law) but `DEFAULT_DISTRIBUTION_BY_STAT` is hardcoded "normal" for every
+  stat and was never calibrated. Separately, the chart overlays
+  (`player_charts.py`, `plotly_charts.py`, both UIs) offer "negative_binomial"
+  which is NOT in `SUPPORTED_DISTRIBUTIONS` — the model vocabulary and the
+  chart-overlay vocabulary disagree.
+  Tasks:
+   1. Reconcile the distribution vocabulary. Either add negative_binomial to
+      `_draw_samples` + `SUPPORTED_DISTRIBUTIONS` + aliases, OR cleanly separate
+      "model sampling families" from "chart overlay fits" and document both.
+      Recommended: add negative_binomial sampling (overdispersed counts) so the
+      single source of truth is `SUPPORTED_DISTRIBUTIONS`.
+   2. Verify every supported distribution flows end-to-end through
+      `run_single_prop` and `run_parlay_demo` (run_model.py) without error for
+      points/assists/rebounds/pra. Add a parametrized test that loops over
+      `SUPPORTED_DISTRIBUTIONS` and asserts a valid probability in [0,1].
+   3. Run the calibration the README prescribes and COMMIT the result:
+        .venv/bin/python3 -m nba_model.evaluation.run_distribution_sweep \
+          --windows 5 7 10 15 --stat-types points assists rebounds pra \
+          --start-date 2024-11-01 --end-date 2025-03-15
+      Review artifacts, then set a data-driven `DEFAULT_DISTRIBUTION_BY_STAT`
+      per stat (by avg_roi / significance), and update the README + inline
+      comment to record what you picked and why. If data is too sparse, say so
+      explicitly and keep "normal" but document the evidence.
+   4. Ensure `get_default_distribution` is actually used by the prop board /
+      simulation default paths (not bypassed).
+
+WORKSTREAM 2 — HOURLY SCRAPING AUTOMATION (the "update every hour" requirement)
+  HARD CONSTRAINT: sportsbook scraping needs a REAL Chrome on
+  `--remote-debugging-port=9222` (CDP) on the SAME host that runs the scrape —
+  Cloudflare/PerimeterX/DataDome block Playwright Chromium at the TLS layer.
+  This cannot run in GitHub Actions or a container. Design for a local always-on
+  host (the dev Mac via launchd, fallback cron).
+  Tasks:
+   1. Fix `data/config/web_text_urls.txt`: replace all `app.underdogfantasy.com`
+      with `underdogsports.com`; drop the dead `app.prizepicks.com/board?league=NBA`
+      duplicate; add the other working books so all 9 active scrapers are
+      covered (PrizePicks, Underdog, Pick6, ParlayPlay for props; BetMGM,
+      Caesars, DraftKings, Bovada, Kalshi for team lines). Use the documented
+      board URLs.
+   2. Build an hourly runner: `scripts/scheduler/hourly_update.sh` (or a Python
+      entry `nba_model/data/hourly_update.py`) that, in order:
+        (a) verifies Chrome is reachable on :9222 (curl localhost:9222/json/version);
+            if not, log a clear error and exit non-zero (do not silently fall back),
+        (b) runs web-text ingestion through CDP for the URL list,
+        (c) runs the browser prop parser + team-line parser,
+        (d) runs the lightweight nba_api refresh (games + recent player logs),
+        (e) re-derives team_priors / reverse-engineering single-pass,
+        (f) re-settles prediction outcomes / recomputes consensus so the model
+            reflects the new lines,
+        (g) writes a per-run JSON report (reuse the daily_etl report shape).
+   3. Provide a macOS launchd plist at `scripts/scheduler/com.nba.hourly.plist`
+      (StartInterval 3600) plus a README with load/unload instructions, and a
+      cron one-liner alternative. Make the runner idempotent and safe to overlap
+      (lockfile so two runs don't stomp each other).
+   4. Add a guard in `daily_etl.py` (and the hourly runner) that detects "running
+      under an interpreter without Playwright when a browser fetch is requested"
+      and aborts early with an actionable message instead of retrying every URL.
+   5. Add auto-reconnect/backoff if Chrome drops mid-run (notes.txt lists this as
+      an open item). At least: detect disconnect, retry once, then fail loudly.
+   6. OPTIONAL (only if time): activate 2-3 of the 11 stub scrapers
+      (fanduel/betrivers/espnbet etc.) following the betmgm.py / pick6.py
+      template, but only if you can capture an authenticated NBA-board snapshot.
+
+WORKSTREAM 3 — ETL HARDENING + DATA QUALITY FOR NBA
+   1. Confirm the NBA data path is whole: bulk results ingest, per-player logs,
+      team_defense, odds, web props, team lines, predictions backfill,
+      outcome settlement. Run a full local ETL and an audit
+      (`.venv/bin/python3 -m nba_model.data.audit_db --stdout`) and fix any
+      NBA-blocking gaps you find (e.g. players.team backfill, prediction stat
+      coverage beyond points if feasible).
+   2. Make the hourly run recompute predictions for all tracked
+      players/stats so the deployed model is genuinely "updated every hour."
+
+WORKSTREAM 4 — REFACTOR MANUAL-LINE PARSING INTO A SHARED MODULE (handshake for Agent B)
+   - Extract the manual-line parsing logic currently embedded in
+     `nba_model/simple_ui.py` (`_parse_manual_lines_text`,
+     `_parse_board_style_text`, `_parse_manual_line_to_record`,
+     `_tokenize_manual_line`, the noise/matchup heuristics, player resolution)
+     into a NEW pure-logic module `nba_model/model/manual_lines.py` with a clean
+     public function:
+        parse_manual_lines_text(text, default_game_date, default_book) -> (records, errors)
+     plus a helper to persist records into `betting_lines`. Keep simple_ui.py
+     working by importing from the new module (no behavior change for Tk).
+   - Add unit tests for the parser (pipe rows, csv rows, tab rows, raw board
+     dump, aliases, bad input). This module is the interface Agent B will build
+     the Streamlit "Manual Lines Import" view on, so land it EARLY and keep the
+     signature stable.
+
+WORKSTREAM 5 — POSTGRES MIGRATION FOR SUBSCRIPTIONS (launch blocker for billing)
+   - `nba_model/web/subscriptions.py` is SQLite-backed; Streamlit Cloud + Render
+     have ephemeral disks. Add a Postgres driver path (env-selected:
+     `SUBSCRIPTIONS_DB_URL` → Postgres, else fall back to SQLite for local dev),
+     preserving the existing idempotent upsert API + all security properties
+     (email validation, WAL/busy_timeout analog, no PII in logs). Keep the
+     webhook (`webhook_app.py`) and `auth.py` callers unchanged.
+   - Document the DB-delivery decision for `nba_data.db` on Streamlit Cloud
+     (read-only there): recommend + wire one of {commit refreshed DB from the
+     hourly host, push to object storage + pull on app start}. Implement the
+     simplest reliable option and document it in docs/DEPLOYMENT.md (coordinate
+     the doc edit location with Agent B — append a clearly-labeled "Data
+     delivery (hourly host → cloud)" subsection).
+
+CONSTRAINTS / DEFINITION OF DONE (Agent A):
+  - `.venv/bin/python3 -m pytest` count >= current (~233), with new tests added.
+  - All `SUPPORTED_DISTRIBUTIONS` produce valid probabilities via run_single_prop.
+  - Hourly runner works against a live Chrome :9222 and writes a JSON report;
+    fails loudly (non-zero) when Chrome/Playwright/venv is wrong.
+  - web_text_urls.txt is current and covers all 9 active books.
+  - `nba_model/model/manual_lines.py` exists with a stable public API + tests.
+  - Postgres subscription path is selectable by env and tested.
+  - Update notes.txt with an end-of-day entry describing what you changed.
+
+================================================================================
+================================================================================
+PROMPT 2  —  PASTE INTO CLAUDE AGENT B  (FRONTEND PARITY + DEPLOYMENT)
+================================================================================
+================================================================================
+
+You are working in the repo /Users/edgarparra/nba-probability-model, a Python
+NBA player-props probability model with a Streamlit web app at
+`nba_model/web/app.py` and a desktop Tk app at `nba_model/simple_ui.py`. The
+full pytest suite is ~233 passing — do not reduce that number; add tests where
+practical. Use `.venv/bin/python3` for everything. Keep all work NBA-only;
+leave the NFL/MLB/NHL/soccer "coming soon" stubs in `sports/` exactly as they
+are. Run the app with:
+    .venv/bin/python3 -m streamlit run nba_model/web/app.py
+
+GOAL: bring the Streamlit site to FULL feature parity with the desktop
+`simple_ui.py`, then make NBA fully deployable. The desktop app has these tabs:
+Single Prop | Parlay | Manual Lines Import | Player Charts | Game Results |
+Player Stats Browse | Operations. The site already has: Player charts, Team
+charts, Compare players, All stats (overview), Parlay analysis, Game Results,
+Player Stats Browse, custom-line probe, watchlist, ETL-status widget.
+
+WHAT'S MISSING FROM THE SITE (build these as new view modes in app.py):
+
+WORKSTREAM 1 — SINGLE PROP view (full model tuning surface)
+  Port the desktop "Single Prop" tab. Add a "Single prop (model)" view mode
+  that exposes the SAME tuning controls simple_ui has and calls
+  `nba_model.run_model.run_single_prop`:
+    player, stat type, line, American odds, rolling window, history games,
+    opp def rating, vegas spread, league-avg def rating, defense sensitivity,
+    blowout threshold, blowout penalty, defense severity, minutes-penalty
+    severity, sigma severity, and a distribution-family selector.
+  IMPORTANT: populate the distribution selector from
+  `nba_model.model.simulation.SUPPORTED_DISTRIBUTIONS` (do NOT hardcode the
+  list — Agent A is finalizing that set, possibly adding negative_binomial).
+  Render the result (mu, sigma_adjusted, prob_over, ev, distribution) and,
+  optionally, the distribution plot. Route every numeric input through
+  `nba_model/web/input_validation.py` validators (validate_line,
+  validate_american_odds, validate_n_games, etc.) so adversarial values are
+  rejected. Gate behind premium if billing is on (use web_auth), but it must be
+  fully usable in open-access mode (BILLING_ENABLED=0).
+
+WORKSTREAM 2 — MANUAL LINES IMPORT view
+  Port the desktop "Manual Lines Import" tab. Agent A is extracting the parsing
+  logic into `nba_model/model/manual_lines.py` exposing:
+     parse_manual_lines_text(text, default_game_date, default_book) -> (records, errors)
+  Build a new "Manual lines import" view that: a text area to paste rows/board
+  text, default game-date + default sportsbook inputs, a "Parse" button that
+  shows the parsed records in a table (with row-delete), and a "Save to DB"
+  button that writes into `betting_lines` via the shared module. If
+  `nba_model/model/manual_lines.py` does not exist yet when you start, import
+  the equivalent functions from `simple_ui` TEMPORARILY and leave a clearly
+  marked TODO to switch to the shared module (coordinate with Agent A).
+  ADMIN-GATE writes on the public site (only `web_auth.is_admin()` may save to
+  the DB) to prevent the public from poisoning betting_lines.
+
+WORKSTREAM 3 — OPERATIONS / ADMIN console (admin-gated)
+  Port the desktop "Operations" tab as an ADMIN-ONLY view (hard requirement:
+  wrap the entire view in `if not web_auth.is_admin(): web_auth.paywall(...)`/
+  return — this launches subprocesses and MUST NOT be exposed publicly).
+  Provide buttons that launch and stream output for: Daily ETL, Web-Text
+  (login / validate / fetch / connect-chrome / extract-cookies / sync players),
+  Browser Parser, Evaluation suite (real-data benchmark, distribution sweep,
+  line comparison, monthly diagnostics), Reverse-Engineering, and DB Audit —
+  mirroring the CLI argument-building in `simple_ui.py`'s `_ops_*` methods.
+  Implement subprocess streaming in a Streamlit-friendly way (e.g. run via
+  subprocess and stream stdout into a scrolling `st.code`/`st.empty` with a
+  Stop control). Put this logic in a new `nba_model/web/operations_panel.py`.
+  NOTE: the scraping operations only work where a real Chrome on :9222 exists
+  (local host), not on Streamlit Cloud — surface that caveat in the UI.
+
+WORKSTREAM 4 — DISTRIBUTION FAMILY SELECTOR on charts
+  The player-charts view currently only toggles normal/poisson/negative-binomial
+  overlays. Add a full distribution-family selector sourced from
+  `simulation.SUPPORTED_DISTRIBUTIONS` so the fitted overlay can use any
+  supported family, keeping the existing multi-overlay checkboxes working.
+
+WORKSTREAM 5 — UPGRADE THE LINE CHART / GRAPH UI (make it much better)
+  The chart that displays the book lines (the distribution figure with the
+  per-book vertical markers + book-mean line + sigma band, in
+  `nba_model/visualization/plotly_charts.py::build_distribution_figure`) plus
+  the still-matplotlib charts in the web app are the weakest part of the UX.
+  Make the line display genuinely good. Do BOTH of the following:
+
+  (5a) Migrate the remaining web charts off static matplotlib to interactive
+       Plotly so the whole web app is consistent and zoom/hover/legend-toggle
+       works everywhere: recent-games (bar + rolling mean + book-line),
+       hit-rate-vs-book-lines, and home/away + rest-day splits. Add the Plotly
+       equivalents in `plotly_charts.py` (keep the matplotlib builders for the
+       Tk desktop path — do not break Tk). The web app should call the Plotly
+       versions via `st.plotly_chart(..., use_container_width=True)`.
+
+  (5b) Make the LINE-DISPLAY chart itself clearly better. Pick ONE of these
+       two paths (your call; (i) is lower-risk, (ii) is higher-ceiling) and
+       implement it well rather than half-doing both:
+
+       (i) IMPROVE the existing Plotly distribution figure into a polished
+           "line board":
+             - declutter the per-book vertical markers (group/space the
+               labels, larger readable legend, avoid annotation collisions,
+               consider markers along a dedicated top rail instead of full-
+               height dashed lines),
+             - highlight the BEST line per side (best over / best under EV)
+               so line-shopping is obvious at a glance,
+             - color books consistently with `_BOOK_COLORS`, show each book's
+               delta vs consensus on hover,
+             - add an optional clean toggle between "distribution view" and a
+               compact horizontal "line ladder" (one row per book on a shared
+               x-axis, sorted by line value) which is far easier to read than
+               many overlapping verticals.
+
+       (ii) ADOPT a richer charting library / custom component for the line
+            board. Evaluate and choose one, then wire it for the line chart:
+              - `streamlit-echarts` (Apache ECharts) — excellent interactive
+                financial-style charts, candlesticks, markLine/markArea for
+                book lines; OR
+              - `streamlit-lightweight-charts` (TradingView) — purpose-built
+                for price/line displays, ideal for a line-movement timeline;
+                OR
+              - Altair/Vega-Lite (declarative, clean defaults); OR
+              - a custom React/D3 Streamlit component if you want full control.
+            Add the dependency to requirements.txt (pinned with `~=`), keep
+            the import lazy, and make sure it still works inside the Docker
+            image (Workstream 7) and degrades gracefully if the lib is missing.
+
+  (5c) BONUS line feature (do if time permits): a line-MOVEMENT timeline using
+       the `betting_line_snapshots` table — show how each book's line + odds
+       drifted over time (open → current), with a sharp/public split if the
+       data supports it. This is the single most compelling "lines" upgrade and
+       maps directly onto the financial-chart libraries above.
+
+  Acceptance for this workstream: no static matplotlib images remain in the
+  web app's NBA views; the line-display chart is readable with 6+ books on
+  screen, highlights the best EV side, and a non-technical user can tell at a
+  glance who's posting the best number. Add a smoke test that the new figure
+  builders return a non-empty figure object for a populated player.
+
+WORKSTREAM 6 — DEPLOYMENT (make NBA shippable)
+  1. Verify the app boots clean in open-access mode (BILLING_ENABLED unset/0)
+     with the bundled SQLite DB and that every NBA view renders.
+  2. Docker: confirm `docker build` + `docker compose up streamlit` serve the
+     full app on :8501 with all the new views; fix the image if the new views
+     pull in deps not installed. Keep the image lean.
+  3. Billing toggle: confirm `BILLING_ENABLED=1` cleanly re-enables OIDC +
+     Stripe paywalls and that admin-allowlist override works. Do NOT hardcode
+     secrets; use `.streamlit/secrets.toml.example` (update it if you add keys).
+  4. Webhook: confirm `nba_model/web/webhook_app.py` still imports/runs and the
+     documented Render/Railway start command is accurate.
+  5. Docs: update `docs/DEPLOYMENT.md` + the README deploy sections to reflect
+     the new views, the admin-ops console, and the open-access vs billing modes.
+     Agent A will append a "Data delivery (hourly host → cloud)" subsection to
+     DEPLOYMENT.md — leave room / don't clobber it.
+  6. Security review: because you're adding subprocess-launching and DB-writing
+     features, double-check they are admin-gated and that
+     `nba_model/web/input_validation.py` covers every new numeric input. Add
+     web tests where feasible (the project has nba_model/tests/test_security*.py
+     patterns to follow).
+
+CONSTRAINTS / DEFINITION OF DONE (Agent B):
+  - Every desktop simple_ui feature has a working web equivalent: Single Prop
+    (full tuning), Manual Lines Import, Operations/Admin console — plus the
+    chart distribution-family selector.
+  - Distribution selectors read `simulation.SUPPORTED_DISTRIBUTIONS` (no
+    hardcoded lists), so they automatically match Agent A's final vocabulary.
+  - The line-display chart is upgraded: no static matplotlib images remain in
+    the web app's NBA views, the chart is readable with 6+ books, highlights
+    the best EV side, and (chosen path) is either a polished Plotly line board
+    or a richer charting library wired in and Docker-compatible.
+  - Operations console and manual-lines DB writes are admin-gated.
+  - App boots in open-access mode AND with billing enabled; Docker serves it.
+  - `.venv/bin/python3 -m pytest` count >= current (~233).
+  - Update notes.txt with an end-of-day entry describing what you changed.
+
+================================================================================
+SEQUENCING NOTE FOR YOU (the human)
+================================================================================
+- Start BOTH agents together. The only ordering dependency is the manual-lines
+  module: Agent A creates `nba_model/model/manual_lines.py` early; Agent B has a
+  documented temporary fallback (import from simple_ui) so it is never blocked.
+- The "run every hour" capability lives on Agent A's local host with Chrome on
+  :9222. The deployed Streamlit Cloud app does NOT scrape — it reads the DB that
+  the hourly host refreshes and delivers (Agent A wires delivery, Agent B reads).
+- After both land, do one integration pass: full local ETL + hourly run on the
+  Chrome host, then redeploy the site and confirm all NBA views render with
+  fresh data.
+================================================================================
+END OF PLAN
+================================================================================

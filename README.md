@@ -16,6 +16,7 @@ The current baseline is designed to be reproducible offline (synthetic benchmark
 - Streamlit + Tk UIs both expose Player charts, Team charts, Game Results, and Player Stats Browse. All graphing inputs go through `nba_model/web/input_validation.py` (stat type / team code / season / rolling window).
 - Production-ready auth + billing scaffold: native Streamlit OIDC (Google + Microsoft) sign-in, Stripe-powered Free vs Premium tiers, FastAPI webhook handler with HMAC verification, replay tolerance, idempotency, body-size cap (256 KiB), per-IP rate limiting (120/60s), slowloris timeout, and the OWASP-recommended HTTP security headers. Full threat model + 4-layer hardening pass + adversarial / data-poisoning input validation in [docs/SECURITY.md](docs/SECURITY.md).
 - 182/182 tests passing (regression + stress + adversarial + scanners). `bandit` MEDIUM/HIGH baseline = 0; `pip-audit` clean; 30 consecutive stress runs flake-free.
+- **Multi-sport scaffolding** in place: `sports/` package at the project root with `Sport` config dataclass + modules for `nba` (live) and stubs for `nfl`, `mlb`, `nhl`, `soccer` (sub-leagues: EPL, La Liga, Serie A, Bundesliga, Ligue 1, UCL; future: Copa Libertadores + Copa Sudamericana). Streamlit sidebar has a sport-picker — selecting a non-live sport shows a roadmap card in the main pane with that sport's stat types, sub-leagues, and open questions. Full rollout plan in [docs/MULTI_SPORT_PLAN.md](docs/MULTI_SPORT_PLAN.md).
 
 ## Repository Layout
 
@@ -39,8 +40,14 @@ The current baseline is designed to be reproducible offline (synthetic benchmark
   - `stripe_helpers.py` - Checkout URL builder + signature helpers
   - `webhook_app.py` - FastAPI app that handles Stripe webhooks
   - `parlay_compare.py` - cross-comparison helpers for the Parlay analysis view
+- `sports/` - **multi-sport registry** (top-level, sibling to `nba_model`)
+  - `__init__.py` - `Sport` dataclass + `SPORTS` registry + `get_sport(key)` lookup
+  - `nba.py` - NBA config (live)
+  - `nfl.py`, `mlb.py`, `nhl.py` - per-sport stubs with stat types, ranges, team codes, open questions
+  - `soccer/__init__.py` - parent + 6 sub-league `Sport` configs (EPL, La Liga, Serie A, Bundesliga, Ligue 1, UCL); commented-out Copa Libertadores + Copa Sudamericana entries for the future South American phase
 - `data/DATABASE_INVENTORY.txt` - auto-generated snapshot of what's actually in the SQLite DB (refresh: `python3 -m nba_model.data.audit_db`)
 - `docs/API_TO_DATABASE.md` - how data flows from APIs to SQLite and how we clean it
+- `docs/MULTI_SPORT_PLAN.md` - architecture + rollout order + per-sport open questions for the NFL → MLB → NHL → soccer expansion
 
 ## Setup
 
