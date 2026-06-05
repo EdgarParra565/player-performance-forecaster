@@ -1,26 +1,41 @@
-"""SQLite-backed subscription store.
+"""Pluggable subscription store (SQLite or Postgres).
 
-Schema is intentionally minimal - one row per email - because every Stripe
+Schema is intentionally minimal — one row per email — because every Stripe
 event we care about (checkout completed / subscription updated / cancelled)
 maps to a single update on this table. The Stripe webhook handler writes;
 the Streamlit app reads.
 
-We use a separate file (`data/database/subscriptions.db`) from the main
-nba_data.db so the production deployment can mount the subscription DB as a
-persistent volume without giving the Streamlit container write access to the
-analytics DB.
+Backend selection:
+
+    SUBSCRIPTIONS_DB_URL = postgres://… or postgresql://…   -> Postgres
+    (anything else, or unset)                               -> SQLite
+
+The SQLite path is preserved for local dev (matches the previous default
+file ``data/database/subscriptions.db``). The Postgres path is for cloud
+deploys (Streamlit Cloud / Render) where the disk is ephemeral and the
+existing SQLite file would vanish on every redeploy.
+
+The public API — ``tier_for`` / ``upsert`` / ``record_stripe_event`` /
+``lookup`` — is unchanged so ``webhook_app.py`` and ``auth.py`` continue
+to work without edits. Security invariants (email validation, no PII in
+logs, busy_timeout / connect timeout, fail-closed on garbage) hold across
+both backends.
 """
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import sqlite3
-import stat
+import threading
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator, Optional
+from urllib.parse import urlparse
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_SUBSCRIPTIONS_DB = "data/database/subscriptions.db"
 
@@ -60,7 +75,42 @@ def _validate_email(email: str) -> str:
             raise ValueError("invalid email: punycode/IDN not allowed")
     return e
 
-_SCHEMA = """
+
+# ---------------------------------------------------------------------------
+# Backend dispatch
+# ---------------------------------------------------------------------------
+
+def _is_postgres_url(url: str) -> bool:
+    if not url:
+        return False
+    parsed = urlparse(url)
+    return parsed.scheme in {"postgres", "postgresql", "postgresql+psycopg"}
+
+
+def _selected_backend(db_path: Optional[str]) -> str:
+    """Return 'postgres' or 'sqlite' based on env + caller override."""
+    if db_path:
+        # Explicit caller override always wins (used by the test suite).
+        return "postgres" if _is_postgres_url(db_path) else "sqlite"
+    url = os.environ.get("SUBSCRIPTIONS_DB_URL", "")
+    return "postgres" if _is_postgres_url(url) else "sqlite"
+
+
+def _resolved_target(db_path: Optional[str]) -> str:
+    """Return the resolved DSN / file path for the active backend."""
+    if db_path:
+        return db_path
+    url = os.environ.get("SUBSCRIPTIONS_DB_URL", "")
+    if _is_postgres_url(url):
+        return url
+    return os.environ.get("SUBSCRIPTIONS_DB_PATH", DEFAULT_SUBSCRIPTIONS_DB)
+
+
+# ---------------------------------------------------------------------------
+# SQLite backend
+# ---------------------------------------------------------------------------
+
+_SQLITE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS user_subscriptions (
     email                  TEXT PRIMARY KEY,
     tier                   TEXT NOT NULL DEFAULT 'free',
@@ -78,10 +128,6 @@ CREATE TABLE IF NOT EXISTS stripe_events (
     payload      TEXT
 );
 """
-
-
-def _db_path() -> str:
-    return os.environ.get("SUBSCRIPTIONS_DB_PATH", DEFAULT_SUBSCRIPTIONS_DB)
 
 
 def _harden_db_file(path: str) -> None:
@@ -103,11 +149,11 @@ def _harden_db_file(path: str) -> None:
         pass
 
 
-_INIT_LOCK = __import__("threading").Lock()
+_INIT_LOCK = threading.Lock()
 _BOOTSTRAPPED_PATHS: set[str] = set()
 
 
-def _bootstrap_db(path: str) -> None:
+def _bootstrap_sqlite(path: str) -> None:
     """Run the one-time PRAGMA-mode setup serialized across threads.
 
     SECURITY / RELIABILITY: changing `journal_mode=WAL` requires an exclusive
@@ -135,9 +181,8 @@ def _bootstrap_db(path: str) -> None:
 
 
 @contextmanager
-def _connect(db_path: Optional[str] = None) -> Iterator[sqlite3.Connection]:
-    path = db_path or _db_path()
-    _bootstrap_db(path)
+def _connect_sqlite(path: str) -> Iterator[sqlite3.Connection]:
+    _bootstrap_sqlite(path)
     # SECURITY: 5-second busy_timeout. Without this, two concurrent webhook
     # events for the same email (or even the Streamlit reader contending
     # with the webhook writer) raise `database is locked` immediately. Real
@@ -146,19 +191,228 @@ def _connect(db_path: Optional[str] = None) -> Iterator[sqlite3.Connection]:
     conn = sqlite3.connect(path, isolation_level=None, timeout=5.0)
     try:
         conn.execute("PRAGMA busy_timeout = 5000")
-        # Block any external SQL extensions from being loaded over our handle.
         try:
             conn.enable_load_extension(False)  # type: ignore[attr-defined]
         except (AttributeError, sqlite3.NotSupportedError):
             pass
-        # `CREATE TABLE IF NOT EXISTS` is idempotent and cheap; running it on
-        # every connect lets operators drop a table for emergency reset and
-        # have it auto-recreated on the next read.
-        conn.executescript(_SCHEMA)
+        conn.executescript(_SQLITE_SCHEMA)
         yield conn
     finally:
         conn.close()
 
+
+def _sqlite_tier_for(path: str, normalized_email: str) -> Optional[tuple]:
+    with _connect_sqlite(path) as conn:
+        return conn.execute(
+            "SELECT tier, current_period_end FROM user_subscriptions "
+            "WHERE email = ?",
+            (normalized_email,),
+        ).fetchone()
+
+
+def _sqlite_upsert(
+    path: str,
+    *,
+    email: str, tier: str, stripe_customer_id, stripe_subscription_id,
+    current_period_end, last_event_type, now: str,
+) -> None:
+    with _connect_sqlite(path) as conn:
+        conn.execute(
+            """
+            INSERT INTO user_subscriptions (
+                email, tier, stripe_customer_id, stripe_subscription_id,
+                current_period_end, last_event_type, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(email) DO UPDATE SET
+                tier                   = excluded.tier,
+                stripe_customer_id     = COALESCE(excluded.stripe_customer_id,
+                                                  user_subscriptions.stripe_customer_id),
+                stripe_subscription_id = COALESCE(excluded.stripe_subscription_id,
+                                                  user_subscriptions.stripe_subscription_id),
+                current_period_end     = COALESCE(excluded.current_period_end,
+                                                  user_subscriptions.current_period_end),
+                last_event_type        = COALESCE(excluded.last_event_type,
+                                                  user_subscriptions.last_event_type),
+                updated_at             = excluded.updated_at
+            """,
+            (email, tier, stripe_customer_id, stripe_subscription_id,
+             current_period_end, last_event_type, now),
+        )
+
+
+def _sqlite_record_event(path: str, event_id: str, event_type: str, payload: str) -> bool:
+    with _connect_sqlite(path) as conn:
+        try:
+            conn.execute(
+                "INSERT INTO stripe_events (event_id, event_type, payload) "
+                "VALUES (?, ?, ?)",
+                (event_id, event_type, payload),
+            )
+            return True
+        except sqlite3.IntegrityError:
+            return False
+
+
+def _sqlite_lookup(path: str, normalized_email: str) -> Optional[dict]:
+    with _connect_sqlite(path) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT * FROM user_subscriptions WHERE email = ?",
+            (normalized_email,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+# ---------------------------------------------------------------------------
+# Postgres backend
+# ---------------------------------------------------------------------------
+
+_POSTGRES_SCHEMA = """
+CREATE TABLE IF NOT EXISTS user_subscriptions (
+    email                  TEXT PRIMARY KEY,
+    tier                   TEXT NOT NULL DEFAULT 'free',
+    stripe_customer_id     TEXT,
+    stripe_subscription_id TEXT,
+    current_period_end     TEXT,
+    last_event_type        TEXT,
+    updated_at             TEXT NOT NULL DEFAULT (now()::text)
+);
+
+CREATE TABLE IF NOT EXISTS stripe_events (
+    event_id     TEXT PRIMARY KEY,
+    event_type   TEXT NOT NULL,
+    received_at  TEXT NOT NULL DEFAULT (now()::text),
+    payload      TEXT
+);
+"""
+
+# Postgres analog to SQLite's busy_timeout/synchronous tuning:
+#   - statement_timeout    => abort runaway upserts after 5s (was busy_timeout)
+#   - lock_timeout         => fail fast instead of blocking on row locks
+#   - idle_in_transaction_session_timeout => abandon idle transactions
+# These run as session GUCs on each connect; safer than tampering with the
+# instance config in a hosted Postgres.
+_POSTGRES_SESSION_TUNING = (
+    "SET statement_timeout = '5s'",
+    "SET lock_timeout = '5s'",
+    "SET idle_in_transaction_session_timeout = '30s'",
+)
+
+_PG_BOOTSTRAPPED_DSNS: set[str] = set()
+
+
+def _import_psycopg():
+    """Return the ``psycopg`` (v3) module, raising a clear message if missing."""
+    try:
+        import psycopg  # type: ignore[import]
+        return psycopg
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "Postgres backend selected (SUBSCRIPTIONS_DB_URL points at "
+            "postgres://) but the `psycopg` driver is not installed. "
+            "Install it with: pip install 'psycopg[binary]>=3.1'"
+        ) from exc
+
+
+def _bootstrap_postgres(dsn: str) -> None:
+    if dsn in _PG_BOOTSTRAPPED_DSNS:
+        return
+    with _INIT_LOCK:
+        if dsn in _PG_BOOTSTRAPPED_DSNS:
+            return
+        psycopg = _import_psycopg()
+        with psycopg.connect(dsn, autocommit=True, connect_timeout=5) as conn:
+            with conn.cursor() as cur:
+                cur.execute(_POSTGRES_SCHEMA)
+        _PG_BOOTSTRAPPED_DSNS.add(dsn)
+
+
+@contextmanager
+def _connect_postgres(dsn: str):
+    _bootstrap_postgres(dsn)
+    psycopg = _import_psycopg()
+    conn = psycopg.connect(dsn, autocommit=True, connect_timeout=5)
+    try:
+        with conn.cursor() as cur:
+            for stmt in _POSTGRES_SESSION_TUNING:
+                cur.execute(stmt)
+        yield conn
+    finally:
+        conn.close()
+
+
+def _pg_tier_for(dsn: str, normalized_email: str):
+    with _connect_postgres(dsn) as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT tier, current_period_end FROM user_subscriptions "
+            "WHERE email = %s",
+            (normalized_email,),
+        )
+        return cur.fetchone()
+
+
+def _pg_upsert(
+    dsn: str,
+    *,
+    email: str, tier: str, stripe_customer_id, stripe_subscription_id,
+    current_period_end, last_event_type, now: str,
+) -> None:
+    with _connect_postgres(dsn) as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO user_subscriptions (
+                email, tier, stripe_customer_id, stripe_subscription_id,
+                current_period_end, last_event_type, updated_at
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (email) DO UPDATE SET
+                tier                   = EXCLUDED.tier,
+                stripe_customer_id     = COALESCE(EXCLUDED.stripe_customer_id,
+                                                  user_subscriptions.stripe_customer_id),
+                stripe_subscription_id = COALESCE(EXCLUDED.stripe_subscription_id,
+                                                  user_subscriptions.stripe_subscription_id),
+                current_period_end     = COALESCE(EXCLUDED.current_period_end,
+                                                  user_subscriptions.current_period_end),
+                last_event_type        = COALESCE(EXCLUDED.last_event_type,
+                                                  user_subscriptions.last_event_type),
+                updated_at             = EXCLUDED.updated_at
+            """,
+            (email, tier, stripe_customer_id, stripe_subscription_id,
+             current_period_end, last_event_type, now),
+        )
+
+
+def _pg_record_event(dsn: str, event_id: str, event_type: str, payload: str) -> bool:
+    psycopg = _import_psycopg()
+    with _connect_postgres(dsn) as conn, conn.cursor() as cur:
+        try:
+            cur.execute(
+                "INSERT INTO stripe_events (event_id, event_type, payload) "
+                "VALUES (%s, %s, %s)",
+                (event_id, event_type, payload),
+            )
+            return True
+        except psycopg.errors.UniqueViolation:
+            return False
+
+
+def _pg_lookup(dsn: str, normalized_email: str) -> Optional[dict]:
+    with _connect_postgres(dsn) as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT email, tier, stripe_customer_id, stripe_subscription_id, "
+            "current_period_end, last_event_type, updated_at "
+            "FROM user_subscriptions WHERE email = %s",
+            (normalized_email,),
+        )
+        row = cur.fetchone()
+        if not row:
+            return None
+        cols = [d.name for d in cur.description]
+    return dict(zip(cols, row))
+
+
+# ---------------------------------------------------------------------------
+# Public API (backend-agnostic)
+# ---------------------------------------------------------------------------
 
 def tier_for(email: str, db_path: Optional[str] = None) -> str:
     """Return 'free' or 'premium' for the given email.
@@ -173,12 +427,11 @@ def tier_for(email: str, db_path: Optional[str] = None) -> str:
         normalized = _validate_email(email)
     except ValueError:
         return "free"
-    with _connect(db_path) as conn:
-        row = conn.execute(
-            "SELECT tier, current_period_end FROM user_subscriptions "
-            "WHERE email = ?",
-            (normalized,),
-        ).fetchone()
+
+    backend = _selected_backend(db_path)
+    target = _resolved_target(db_path)
+    row = (_pg_tier_for(target, normalized) if backend == "postgres"
+           else _sqlite_tier_for(target, normalized))
     if not row:
         return "free"
     tier, period_end = row
@@ -187,7 +440,7 @@ def tier_for(email: str, db_path: Optional[str] = None) -> str:
     # Premium with an end date in the past is treated as expired.
     if period_end:
         try:
-            cutoff = datetime.fromisoformat(period_end.replace("Z", "+00:00"))
+            cutoff = datetime.fromisoformat(str(period_end).replace("Z", "+00:00"))
             if cutoff.tzinfo is None:
                 cutoff = cutoff.replace(tzinfo=timezone.utc)
             if cutoff < datetime.now(timezone.utc):
@@ -212,28 +465,20 @@ def upsert(
         raise ValueError(f"tier must be 'free' or 'premium', got {tier!r}")
     normalized_email = _validate_email(email)
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    with _connect(db_path) as conn:
-        conn.execute(
-            """
-            INSERT INTO user_subscriptions (
-                email, tier, stripe_customer_id, stripe_subscription_id,
-                current_period_end, last_event_type, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(email) DO UPDATE SET
-                tier                   = excluded.tier,
-                stripe_customer_id     = COALESCE(excluded.stripe_customer_id,
-                                                  user_subscriptions.stripe_customer_id),
-                stripe_subscription_id = COALESCE(excluded.stripe_subscription_id,
-                                                  user_subscriptions.stripe_subscription_id),
-                current_period_end     = COALESCE(excluded.current_period_end,
-                                                  user_subscriptions.current_period_end),
-                last_event_type        = COALESCE(excluded.last_event_type,
-                                                  user_subscriptions.last_event_type),
-                updated_at             = excluded.updated_at
-            """,
-            (normalized_email, tier, stripe_customer_id,
-             stripe_subscription_id, current_period_end, last_event_type, now),
-        )
+
+    backend = _selected_backend(db_path)
+    target = _resolved_target(db_path)
+    fn = _pg_upsert if backend == "postgres" else _sqlite_upsert
+    fn(
+        target,
+        email=normalized_email,
+        tier=tier,
+        stripe_customer_id=stripe_customer_id,
+        stripe_subscription_id=stripe_subscription_id,
+        current_period_end=current_period_end,
+        last_event_type=last_event_type,
+        now=now,
+    )
 
 
 def record_stripe_event(
@@ -243,16 +488,11 @@ def record_stripe_event(
     db_path: Optional[str] = None,
 ) -> bool:
     """Record a Stripe event id for idempotency. Returns False if already seen."""
-    with _connect(db_path) as conn:
-        try:
-            conn.execute(
-                "INSERT INTO stripe_events (event_id, event_type, payload) "
-                "VALUES (?, ?, ?)",
-                (event_id, event_type, payload),
-            )
-            return True
-        except sqlite3.IntegrityError:
-            return False
+    backend = _selected_backend(db_path)
+    target = _resolved_target(db_path)
+    if backend == "postgres":
+        return _pg_record_event(target, event_id, event_type, payload)
+    return _sqlite_record_event(target, event_id, event_type, payload)
 
 
 def lookup(email: str, db_path: Optional[str] = None) -> Optional[dict]:
@@ -260,10 +500,18 @@ def lookup(email: str, db_path: Optional[str] = None) -> Optional[dict]:
         normalized = _validate_email(email)
     except ValueError:
         return None
-    with _connect(db_path) as conn:
-        conn.row_factory = sqlite3.Row
-        row = conn.execute(
-            "SELECT * FROM user_subscriptions WHERE email = ?",
-            (normalized,),
-        ).fetchone()
-    return dict(row) if row else None
+    backend = _selected_backend(db_path)
+    target = _resolved_target(db_path)
+    if backend == "postgres":
+        return _pg_lookup(target, normalized)
+    return _sqlite_lookup(target, normalized)
+
+
+def selected_backend(db_path: Optional[str] = None) -> str:
+    """Inspect which backend would be used for the given override (or env).
+
+    Exposed for the deployment readiness check (`docs/DEPLOYMENT.md` shows
+    a one-liner that prints this) and for tests that need to assert the
+    URL-based dispatch lights up correctly without actually connecting.
+    """
+    return _selected_backend(db_path)

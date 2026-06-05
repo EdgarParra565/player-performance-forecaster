@@ -10,7 +10,12 @@ import pandas as pd
 from nba_model.evaluation.backtest import Backtester
 from nba_model.model.feature_engineering import add_rolling_stats
 from nba_model.model.probability import prob_over
-from nba_model.model.simulation import monte_carlo_over, normalize_distribution_name
+from nba_model.model.simulation import (
+    SUPPORTED_DISTRIBUTIONS,
+    get_default_distribution,
+    monte_carlo_over,
+    normalize_distribution_name,
+)
 
 
 class FeatureEngineeringSmokeTests(unittest.TestCase):
@@ -49,17 +54,10 @@ class ProbabilitySmokeTests(unittest.TestCase):
         self.assertLess(prob_over(20.0, 18.0, 5.0), 0.5)
 
     def test_monte_carlo_over_supports_distribution_families(self):
-        distributions = [
-            "normal",
-            "student_t",
-            "binomial",
-            "poisson",
-            "exponential",
-            "uniform",
-            "lognormal",
-            "power_law",
-        ]
-        for distribution in distributions:
+        # SUPPORTED_DISTRIBUTIONS is the canonical model vocabulary — every
+        # entry must produce a valid probability in [0, 1].
+        self.assertIn("negative_binomial", SUPPORTED_DISTRIBUTIONS)
+        for distribution in SUPPORTED_DISTRIBUTIONS:
             prob = monte_carlo_over(
                 mu=22.0,
                 sigma=6.0,
@@ -70,6 +68,24 @@ class ProbabilitySmokeTests(unittest.TestCase):
             )
             self.assertGreaterEqual(prob, 0.0)
             self.assertLessEqual(prob, 1.0)
+
+    def test_monte_carlo_over_negative_binomial_aliases(self):
+        for alias in ("negative_binomial", "nbinom", "negbin", "neg_binomial"):
+            self.assertEqual(normalize_distribution_name(alias), "negative_binomial")
+            prob = monte_carlo_over(
+                mu=10.0,
+                sigma=5.0,
+                line=8.5,
+                n=2000,
+                distribution=alias,
+            )
+            self.assertGreaterEqual(prob, 0.0)
+            self.assertLessEqual(prob, 1.0)
+
+    def test_get_default_distribution_returns_supported_value(self):
+        for stat in ("points", "assists", "rebounds", "pra", "unknown_stat"):
+            chosen = get_default_distribution(stat)
+            self.assertIn(chosen, SUPPORTED_DISTRIBUTIONS)
 
     def test_monte_carlo_over_rejects_invalid_distribution(self):
         with self.assertRaises(ValueError):

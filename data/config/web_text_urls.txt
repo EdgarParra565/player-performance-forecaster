@@ -5,17 +5,43 @@
 # Notes:
 # - Use full URLs with http:// or https://
 # - Duplicate URLs are auto-deduplicated
-# - ETL can poll these once per day with:
-#   --web-text-urls-file data/config/web_text_urls.txt
-#   --web-text-min-hours-between-polls 24
+# - Hourly ETL polls these via the CDP browser path:
+#     scripts/scheduler/hourly_update.sh
+#   which expects Chrome on --remote-debugging-port=9222.
+# - All 9 active books are covered: 4 DFS/pick'em boards for player props
+#   plus 5 sportsbooks/markets for team lines.
 
-# UnderDog NBA pick'em pages
-https://app.underdogfantasy.com/pick-em/higher-lower/all/NBA
-https://app.underdogfantasy.com/pick-em/higher-lower/all/NBA?filter_id=8d718cf2-1487-401e-88f7-f9f799e85871&filter_type=PickemStat
-https://app.underdogfantasy.com/pick-em/higher-lower/all/NBA?filter_id=590e7c83-99fc-419f-bdd8-78bb0a691f8b&filter_type=PickemStat
-https://app.underdogfantasy.com/pick-em/higher-lower/all/NBA?filter_id=0d33e7f2-6601-486b-9f9e-cbe268d8fc88&filter_type=PickemStat
-https://app.underdogfantasy.com/pick-em/higher-lower/all/NBA?filter_id=e3bc1aaa-7964-4a84-bcfa-2d92a4d477a2&filter_type=PickemStat
+# --- Player props (DFS / pick'em boards) ---
 
-# PrizePicks NBA projection board
+# PrizePicks NBA board (auth required)
 https://app.prizepicks.com/board/nba
-https://app.prizepicks.com/board?league=NBA
+
+# Underdog NBA pick'em (2026 rebrand: underdogsports.com)
+https://underdogsports.com/pick-em/higher-lower/all/NBA
+https://underdogsports.com/pick-em/higher-lower/all/NBA?filter_id=8d718cf2-1487-401e-88f7-f9f799e85871&filter_type=PickemStat
+https://underdogsports.com/pick-em/higher-lower/all/NBA?filter_id=590e7c83-99fc-419f-bdd8-78bb0a691f8b&filter_type=PickemStat
+https://underdogsports.com/pick-em/higher-lower/all/NBA?filter_id=0d33e7f2-6601-486b-9f9e-cbe268d8fc88&filter_type=PickemStat
+https://underdogsports.com/pick-em/higher-lower/all/NBA?filter_id=e3bc1aaa-7964-4a84-bcfa-2d92a4d477a2&filter_type=PickemStat
+
+# DraftKings Pick6 NBA props
+https://pick6.draftkings.com/?sport=NBA
+
+# ParlayPlay NBA player props
+https://parlayplay.io/
+
+# --- Team lines (sportsbooks / markets) ---
+
+# BetMGM NBA (state subdomain may vary; this is the canonical landing)
+https://sports.betmgm.com/en/sports/basketball-7
+
+# Caesars NBA (state subdomain may vary)
+https://sportsbook.caesars.com/us/ny/bet/basketball
+
+# DraftKings sportsbook NBA
+https://sportsbook.draftkings.com/leagues/basketball/nba
+
+# Bovada NBA
+https://www.bovada.lv/sports/basketball/nba
+
+# Kalshi NBA markets
+https://kalshi.com/markets/nba

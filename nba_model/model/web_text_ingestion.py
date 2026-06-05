@@ -716,6 +716,52 @@ def _import_playwright():
         ) from exc
 
 
+def playwright_is_available() -> bool:
+    """True iff the Playwright package can be imported in the current venv.
+
+    Used by hourly/daily ETL preflight to fail fast with an actionable message
+    instead of looping over every URL and retrying browser fetches that will
+    never succeed (e.g. when the user accidentally ran via system python3).
+    """
+    try:
+        _import_playwright()
+        return True
+    except RuntimeError:
+        return False
+
+
+def check_chrome_cdp_reachable(
+    chrome_debug_port: int,
+    host: str = "127.0.0.1",
+    timeout_seconds: float = 2.0,
+) -> dict:
+    """Verify a CDP-enabled Chrome is reachable on ``host:port``.
+
+    Hits ``/json/version`` (same endpoint the curl preflight uses) and returns
+    ``{"ok": bool, "version": str|None, "error": str|None}``. Callers should
+    short-circuit the ETL when ``ok`` is False — silently falling back to a
+    Playwright-managed Chromium loses the residential-Chrome TLS fingerprint
+    that Cloudflare / PerimeterX / DataDome rely on.
+    """
+    import json as _json
+    from urllib.error import URLError
+    from urllib.request import urlopen
+
+    url = f"http://{host}:{int(chrome_debug_port)}/json/version"
+    try:
+        with urlopen(url, timeout=timeout_seconds) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+        info = _json.loads(body) if body else {}
+        version = info.get("Browser") or info.get("browser") or ""
+        return {"ok": True, "version": str(version), "error": None}
+    except (URLError, OSError, _json.JSONDecodeError) as exc:
+        return {
+            "ok": False,
+            "version": None,
+            "error": f"Chrome CDP unreachable at {url}: {exc}",
+        }
+
+
 def _resolve_auth_state_path(
     browser_auth_state_file: Optional[str],
     browser_user_data_dir: Optional[str],
@@ -981,12 +1027,42 @@ def _fetch_url_text_with_browser(
 ) -> dict:
     """Fetch one URL in browser context, optionally with persisted session state."""
     if chrome_debug_port is not None:
-        return _fetch_url_text_via_cdp(
-            url=url,
-            chrome_debug_port=chrome_debug_port,
-            timeout=timeout,
-            max_chars=max_chars,
-        )
+        # CDP path: real Chrome may drop the websocket mid-run (user quit
+        # Chrome, OS sleep, port re-mapped). Retry once after a short backoff
+        # before bubbling the failure up — anything more would risk masking a
+        # genuine "Chrome is dead" condition that needs human attention.
+        try:
+            return _fetch_url_text_via_cdp(
+                url=url,
+                chrome_debug_port=chrome_debug_port,
+                timeout=timeout,
+                max_chars=max_chars,
+            )
+        except Exception as exc:  # noqa: BLE001 — surfaced via retry log below
+            disconnect_markers = (
+                "disconnect", "closed", "target closed", "connection refused",
+                "cannot connect", "websocket", "browser has been closed",
+            )
+            msg = str(exc).lower()
+            if any(marker in msg for marker in disconnect_markers):
+                import time as _time
+                _time.sleep(2.0)
+                preflight = check_chrome_cdp_reachable(chrome_debug_port)
+                if not preflight["ok"]:
+                    raise RuntimeError(
+                        "Chrome dropped mid-run and the CDP endpoint is "
+                        f"still unreachable on port {chrome_debug_port}: "
+                        f"{preflight['error']}. Restart Chrome with "
+                        f"--remote-debugging-port={chrome_debug_port} "
+                        "and re-run."
+                    ) from exc
+                return _fetch_url_text_via_cdp(
+                    url=url,
+                    chrome_debug_port=chrome_debug_port,
+                    timeout=timeout,
+                    max_chars=max_chars,
+                )
+            raise
 
     _ensure_local_playwright_browsers()
     sync_playwright = _import_playwright()

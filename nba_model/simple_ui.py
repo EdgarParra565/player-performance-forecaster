@@ -24,6 +24,9 @@ if __package__ in {None, ""}:
         sys.path.insert(0, str(project_root))
 
 from nba_model.data.database.db_manager import DatabaseManager  # noqa: E402
+from nba_model.model.manual_lines import (  # noqa: E402
+    parse_manual_lines_text as _shared_parse_manual_lines_text,
+)
 from nba_model.run_model import (  # noqa: E402
     DEFAULT_AMERICAN_ODDS,
     DEFAULT_BLOWOUT_PENALTY,
@@ -662,6 +665,17 @@ class SimpleModelUI:
         return records, errors
 
     def _parse_manual_lines_text(self, text: str, default_game_date: str, default_book: str):
+        # Delegate to the shared parser used by both the desktop and the
+        # Streamlit web app. Keeping the implementation in
+        # ``nba_model.model.manual_lines`` makes it independently testable
+        # and lets the web app reuse it without importing private Tk methods.
+        return _shared_parse_manual_lines_text(
+            text=text,
+            default_game_date=default_game_date,
+            default_book=default_book,
+        )
+
+    def _parse_manual_lines_text_legacy(self, text: str, default_game_date: str, default_book: str):
         records = []
         errors = []
         normalized_date = self._normalize_game_date(default_game_date)

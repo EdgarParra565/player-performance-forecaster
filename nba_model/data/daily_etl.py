@@ -985,6 +985,24 @@ def run_daily_etl(
             steps["odds"] = odds_step
 
     if web_text_urls:
+        # Guard: bail out early when the caller asked for a browser fetch but
+        # Playwright isn't importable in this interpreter (e.g. they ran the
+        # ETL with system python3 instead of `.venv/bin/python3`). Otherwise
+        # every URL would retry the same broken import once per
+        # request_retries — slow + confusing logs.
+        if (browser_auth_state_file or browser_user_data_dir or chrome_debug_port):
+            from nba_model.model.web_text_ingestion import playwright_is_available
+            if not playwright_is_available():
+                steps["web_text"] = {
+                    "status": "failed",
+                    "error": (
+                        "Playwright is not importable in this interpreter, but a "
+                        "browser fetch was requested (auth-state / user-data-dir / "
+                        "chrome-debug-port set). Re-run with .venv/bin/python3 -m "
+                        "nba_model.data.daily_etl ..."
+                    ),
+                }
+                raise RuntimeError(steps["web_text"]["error"])
         web_text_step = run_with_retry(
             step_name="web_text",
             func=lambda: _run_web_text_step(

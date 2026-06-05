@@ -258,13 +258,16 @@ Then open http://localhost:8501. Layout:
     unit for OVER and UNDER, plus a `+EV/-EV` verdict).
   - **Raw data** — the actual game-log rows used to build the charts.
 
-The Player charts view above is one of six top-level view modes. The others:
+The Player charts view above is one of a growing set of top-level view modes.
+The others:
 - **Team charts** (free + premium): per-game team aggregates with a
   `book mean` reference line derived from the cross-book consensus
   `(game_total - team_spread) / 2` per book (currently `points` only — the
   only stat books surface at the lobby level). Free tier sees preview
   stats; premium sees all of `points / assists / rebounds / pra / 3pm /
   fgm / minutes`.
+- **Compare players** (free + premium): overlay 2–3 players' distributions
+  for the same stat to find the strongest fit for a parlay leg.
 - **Game Results** (free): recent NBA matchups with final scores + winner.
   Filter by season / season type (Regular Season / Playoffs / Play-In /
   Pre Season) / team. Reads from `games` (populated by
@@ -276,8 +279,36 @@ The Player charts view above is one of six top-level view modes. The others:
   show canonical names.
 - **All stats (overview)** (premium): every stat for the selected player on
   one page.
+- **Single prop (model)** (premium): the desktop "Single Prop" tab ported
+  to the web — full tuning surface (rolling window, opp def, league avg
+  def, defense sensitivity, blowout threshold + penalty, defense /
+  minutes / sigma severity sliders) calling `run_single_prop`. The
+  distribution-family selector is sourced from
+  `simulation.SUPPORTED_DISTRIBUTIONS` so it tracks whatever the model
+  team ships.
 - **Parlay analysis** (premium): single-prop or multi-leg parlay with
   cross-comparison of model + chart-data + historical results.
+- **Manual lines import** (premium read; **admin-only save**): paste board /
+  CSV / pipe / tab rows, preview the parsed records (with input-validation
+  filtering for adversarial values), and — only as an admin —
+  write them into `betting_lines`. Parsing logic is shared with the desktop
+  UI via `nba_model.model.manual_lines.parse_manual_lines_text`.
+- **Operations (admin)** — **admin-only at all times, including in
+  open-access mode**: subprocess launcher for the same CLIs the desktop
+  "Operations" tab drives — Daily ETL, Web-Text (validate / fetch / sync
+  players), Browser Parser, Evaluation suite (real-data benchmark,
+  distribution sweep, line comparison, monthly diagnostics), market
+  Reverse-Engineering, and DB Audit. Output streams live into the page.
+  Scraping ops require a real Chrome on `:9222` on the same host running
+  Streamlit (Streamlit Cloud cannot satisfy this).
+
+All web charts now render via Plotly (no static matplotlib in the web
+views) so zoom / hover / legend-toggle work everywhere. The distribution
+figure can be toggled between two layouts from the sidebar: **Distribution
+view** (histogram + per-book vertical markers + a top-rail of triangles
+with the best-EV side highlighted with a gold-bordered star) and **Line
+ladder** (compact one-row-per-book layout sorted by line value, much
+easier to read when 6+ books are posting).
 
 The web app uses the same `nba_model/visualization/player_charts.py` module as
 the desktop UI, so any new figure builder added there automatically becomes
@@ -864,6 +895,32 @@ Default distribution per stat type is defined in `nba_model/model/simulation.py`
 
 3. Review artifacts in `nba_model/evaluation/artifacts/` (e.g. `distribution_sweep_distribution_summary_*.csv`, `distribution_sweep_summary_*.md`).
 4. Pick the best distribution per stat (e.g. by `avg_roi` or significance) and update `DEFAULT_DISTRIBUTION_BY_STAT` in `nba_model/model/simulation.py`. Use `get_default_distribution(stat_type)` in code when a single default is needed for a given stat.
+
+### Current defaults (2026-06-04 sweep)
+
+| Stat | Default | Why |
+|---|---|---|
+| points | `normal` | Sweep inconclusive — every distribution that placed bets posted a negative `avg_roi`. Keep baseline. |
+| assists | `normal` | Sweep inconclusive — same pattern. |
+| rebounds | `poisson` | Only family with a positive `avg_roi` (+8.78%, n=482 bets) in the 2026-06-04 sweep. |
+| pra | `normal` | Sweep inconclusive. |
+
+Methodology caveat: the sweep's default `line = expected_value` makes
+symmetric families (normal / student_t / uniform) degenerate — `prob_over`
+at the mean is ~0.5, the 0.55-edge filter rejects every wager, and these
+three return zero bets. Asymmetric families therefore dominate the
+`avg_roi` ranking by construction — that's a property of the backtest
+harness, not evidence that they fit player props better than normal in
+production. To re-rank under realistic conditions, the sweep must run
+with `--use-market-lines`, which currently requires backfilling
+`betting_lines` market coverage beyond the 2026-03-14..2026-03-15 window.
+
+Note: `SUPPORTED_DISTRIBUTIONS` now includes `negative_binomial`
+(overdispersed counts; method-of-moments parameterization with a
+Poisson fallback when variance ≤ mean). The chart-overlay vocabulary
+in `player_charts.py` / `plotly_charts.py` (normal / poisson /
+negative_binomial) is a visual subset of the model vocabulary — both
+share the same canonical names via `normalize_distribution_name`.
 
 ## Baseline Benchmark Results
 

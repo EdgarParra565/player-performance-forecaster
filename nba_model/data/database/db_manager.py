@@ -336,11 +336,54 @@ class DatabaseManager:
         self.conn.executemany(query, rows)
         self.conn.commit()
         upserted = self.conn.total_changes - before
+
+        # Second pass: any player_id that's in ``players`` but not in
+        # ``nba_active_players_ref`` (recently-traded veterans dropped from
+        # the active roster API, draft picks added before the next ref sync,
+        # etc.) still gets a team if we can derive one from game_logs. The
+        # audit_db data-quality flag tracks players with NULL team — closing
+        # this loop keeps that count at zero whenever there's a matchup to
+        # read from.
+        team_from_logs = self.conn.execute(
+            """
+            WITH ranked AS (
+                SELECT
+                    g.player_id,
+                    upper(trim(substr(g.matchup, 1, instr(g.matchup, ' ') - 1))) AS team,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY g.player_id
+                        ORDER BY g.game_date DESC, g.game_log_id DESC
+                    ) AS rn
+                FROM game_logs g
+                WHERE g.matchup IS NOT NULL AND instr(g.matchup, ' ') > 0
+            )
+            SELECT player_id, team
+            FROM ranked
+            WHERE rn = 1
+              AND player_id IN (
+                  SELECT player_id FROM players
+                  WHERE team IS NULL OR team = ''
+              )
+            """
+        ).fetchall()
+        if team_from_logs:
+            self.conn.executemany(
+                "UPDATE players SET team = ?, last_updated = CURRENT_TIMESTAMP "
+                "WHERE player_id = ? AND (team IS NULL OR team = '')",
+                [(team, pid) for pid, team in team_from_logs],
+            )
+            self.conn.commit()
+
         logger.info(
-            "sync_players_table: upserted %s rows (%s with team derived)",
-            upserted, sum(1 for r in rows if r[2]),
+            "sync_players_table: upserted %s rows (%s with team derived, "
+            "%s additionally patched from game_logs)",
+            upserted, sum(1 for r in rows if r[2]), len(team_from_logs),
         )
-        return {"upserted": int(upserted), "attempted": int(len(rows))}
+        return {
+            "upserted": int(upserted),
+            "attempted": int(len(rows)),
+            "patched_from_game_logs": int(len(team_from_logs)),
+        }
 
     def insert_player(self, player_id, name, team=None, position=None):
         """Insert or update player record."""

@@ -21,6 +21,7 @@ if str(_PROJECT_ROOT) not in sys.path:
 import pandas as pd
 import streamlit as st
 
+from nba_model.model.simulation import SUPPORTED_DISTRIBUTIONS
 from nba_model.visualization import player_charts as pc
 from nba_model.visualization import plotly_charts as plc
 from nba_model.web import auth as web_auth
@@ -29,6 +30,18 @@ from nba_model.web import input_validation as iv
 from nba_model.web import parlay_compare as parlay
 from nba_model.web import watchlist as wl
 from sports import SPORTS as _ALL_SPORTS, get_sport as _get_sport
+
+# Available distribution-family options. We source from
+# ``simulation.SUPPORTED_DISTRIBUTIONS`` so the selectors automatically match
+# whatever vocabulary the model team ships, plus ``negative_binomial`` which
+# the chart overlay supports directly even if the simulator hasn't added it yet.
+_OVERLAY_DISTRIBUTIONS: tuple[str, ...] = tuple(
+    list(SUPPORTED_DISTRIBUTIONS) + (
+        ["negative_binomial"]
+        if "negative_binomial" not in SUPPORTED_DISTRIBUTIONS
+        else []
+    )
+)
 
 
 # ---------------------------------------------------------------------------
@@ -449,17 +462,19 @@ def _all_stats_overview(
             )
         with c_right:
             st.caption("Hit-rate vs each book line")
-            st.pyplot(
-                pc.build_hit_rate_figure(data),
+            st.plotly_chart(
+                plc.build_hit_rate_figure(data),
                 use_container_width=True,
+                key=f"plotly_hitrate_overview_{data.player_id}_{data.stat_type}",
             )
 
         # Optional third row: recent-games trend (collapsed to save space)
         with st.expander(f"Recent games trend ({stat_type})"):
-            st.pyplot(
-                pc.build_recent_games_figure(
+            st.plotly_chart(
+                plc.build_recent_games_figure(
                     data, rolling_window=int(rolling)),
                 use_container_width=True,
+                key=f"plotly_recent_overview_{data.player_id}_{data.stat_type}",
             )
 
         st.divider()
@@ -527,10 +542,11 @@ def _team_overview(
         c_left, c_right = st.columns(2)
         with c_left:
             st.caption("Recent games + rolling mean")
-            st.pyplot(
-                pc.build_recent_games_figure(
+            st.plotly_chart(
+                plc.build_recent_games_figure(
                     data, rolling_window=int(rolling)),
                 use_container_width=True,
+                key=f"plotly_recent_team_{data.player_id}_{data.stat_type}",
             )
         with c_right:
             st.caption("Distribution + fitted overlays (hover / zoom enabled)")
@@ -541,9 +557,10 @@ def _team_overview(
             )
 
         with st.expander(f"Splits ({stat_type})"):
-            st.pyplot(
-                pc.build_splits_figure(data),
+            st.plotly_chart(
+                plc.build_splits_figure(data),
                 use_container_width=True,
+                key=f"plotly_splits_team_{data.player_id}_{data.stat_type}",
             )
 
         st.divider()
@@ -594,9 +611,9 @@ def _parlay_single(
         spread = c6.number_input("Vegas spread", value=0.0, step=0.5)
         distribution = c7.selectbox(
             "Model distribution",
-            ["normal", "student_t", "binomial", "poisson", "exponential",
-             "uniform", "lognormal", "power_law"],
+            list(SUPPORTED_DISTRIBUTIONS),
             index=0,
+            help="Sourced from `simulation.SUPPORTED_DISTRIBUTIONS`.",
         )
         run_model_too = c8.checkbox(
             "Run external model too",
@@ -1060,7 +1077,7 @@ def _player_browse_view(db_path: str) -> None:
 
 
 def _render_sport_selector():
-    """Sport picker at the top of the sidebar.
+    """Sport picker in the top control bar.
 
     Only NBA is live today; NFL / MLB / NHL / Soccer render as "coming soon"
     options that pin a sticky warning at the top of the main pane if picked.
@@ -1074,14 +1091,17 @@ def _render_sport_selector():
         for s in options
     }
     default_key = _qp_get(_QP_SPORT, "nba")
-    chosen_key = st.sidebar.selectbox(
-        "Sport",
-        [s.key for s in options],
-        index=_index_or_zero([s.key for s in options], default_key),
-        format_func=lambda k: labels[k],
-        help="NBA is live. Other sports show what we plan to ship + their "
-             "open questions; pick one to see the roadmap.",
-    )
+    with st.popover(":basketball: Sport", use_container_width=False):
+        chosen_key = st.selectbox(
+            "Sport",
+            [s.key for s in options],
+            index=_index_or_zero([s.key for s in options], default_key),
+            format_func=lambda k: labels[k],
+            help="NBA is live. Other sports show what we plan to ship + "
+                 "their open questions; pick one to see the roadmap.",
+            label_visibility="collapsed",
+            key="top_sport_picker",
+        )
     _qp_set(sport=chosen_key)
     sport = _get_sport(chosen_key)
     if not sport.is_live:
@@ -1115,26 +1135,22 @@ def _render_sport_selector():
     return sport
 
 
-def _render_watchlist_widget(available_players: list[str]) -> Optional[str]:
-    """Sidebar watchlist. Returns a selected player name if the user clicked
-    one of their watchlist entries, else None.
-
-    The caller passes the current player list so the widget can offer "Add
-    selected" without re-querying the DB. Picking an entry sets the URL
-    query-param so the right-side view re-renders with that player.
+def _render_watchlist_popover() -> None:
+    """Top-bar watchlist popover. Clicking an entry writes ``?player=`` to the
+    URL and reruns so the selection-row picks up the new player.
     """
     items = wl.get()
-    with st.sidebar.expander(
+    with st.popover(
         f":bookmark_tabs: Watchlist ({len(items)})",
-        expanded=bool(items),
+        use_container_width=False,
     ):
-        clicked: Optional[str] = None
         if items:
             for name in items:
                 col_pick, col_rm = st.columns([4, 1])
                 if col_pick.button(name, key=f"wl_pick_{name}",
                                    use_container_width=True):
-                    clicked = name
+                    _qp_set(player=name)
+                    st.rerun()
                 if col_rm.button(":x:", key=f"wl_rm_{name}",
                                  help=f"Remove {name}"):
                     wl.remove(name)
@@ -1145,22 +1161,21 @@ def _render_watchlist_widget(available_players: list[str]) -> Optional[str]:
                      use_container_width=True, disabled=not items):
             wl.clear()
             st.rerun()
-    return clicked
 
 
 def _render_etl_status_widget() -> None:
-    """Sidebar widget: data freshness signal from the latest ETL report.
+    """Top-bar popover: data freshness signal from the latest ETL report.
 
     Always renders, but degrades gracefully when no report exists (the
     Streamlit Cloud deploy might not have run the ETL yet). Trust signal:
     a user can see we're pushing data updates and that they're recent.
     """
     summary = etl_status.summarize_report(etl_status.load_latest_report())
-    with st.sidebar:
-        with st.expander(
-            f":satellite_antenna: Data freshness - {summary['age_text']}",
-            expanded=False,
-        ):
+    with st.popover(
+        f":satellite_antenna: Data {summary['age_text']}",
+        use_container_width=False,
+    ):
+        if True:
             if not summary["found"]:
                 st.caption(
                     "No ETL report found at `nba_model/data/artifacts/`. "
@@ -1266,9 +1281,10 @@ def _compare_players_view(
     if not datasets:
         return
 
-    st.pyplot(
-        pc.build_multi_player_distribution_figure(datasets),
+    st.plotly_chart(
+        plc.build_multi_player_distribution_figure(datasets),
         use_container_width=True,
+        key="plotly_multi_player_overlay",
     )
 
     st.markdown("**Player-by-player summary**")
@@ -1282,24 +1298,511 @@ def _compare_players_view(
     )
 
 
+# ---------------------------------------------------------------------------
+# Single Prop (model) view — full tuning surface, mirrors the desktop
+# `Single Prop` tab. Calls `nba_model.run_model.run_single_prop`.
+# ---------------------------------------------------------------------------
+def _single_prop_model_view(*, default_player: str, n_games_default: int) -> None:
+    st.subheader("Single prop (model)")
+    st.caption(
+        "Calls `nba_model.run_model.run_single_prop` — the same model the "
+        "desktop Single Prop tab uses. Hits the NBA API for game logs, "
+        "applies the minutes + defense + blowout adjustments, then returns "
+        "P(over)+EV under the chosen distribution family. "
+        "Note: the model currently uses **points** as the underlying stat; "
+        "the `Stat type` field only changes the default line value."
+    )
+
+    from nba_model.run_model import (
+        DEFAULT_AMERICAN_ODDS,
+        DEFAULT_BLOWOUT_PENALTY,
+        DEFAULT_BLOWOUT_THRESHOLD,
+        DEFAULT_DEFENSE_SENSITIVITY,
+        DEFAULT_LEAGUE_AVG_DEF_RATING,
+        DEFAULT_OPP_DEF_RATING,
+        DEFAULT_POINTS_LINE,
+        DEFAULT_ROLLING_WINDOW,
+        DEFAULT_SINGLE_PROP_DISTRIBUTION,
+        DEFAULT_VEGAS_SPREAD,
+        run_single_prop,
+    )
+
+    _single_default_lines = {
+        "points": 25.5, "assists": 5.5, "rebounds": 8.5, "pra": 35.5,
+    }
+
+    with st.form("single_prop_model_form", clear_on_submit=False):
+        c1, c2, c3, c4 = st.columns(4)
+        player = c1.text_input("Player", value=default_player or "LeBron James")
+        stat_type = c2.selectbox(
+            "Stat type", list(_single_default_lines.keys()), index=0,
+            help="Cosmetic: only changes the default line. The model itself is points-based.",
+        )
+        line = c3.number_input(
+            "Line", value=_single_default_lines.get(stat_type, DEFAULT_POINTS_LINE),
+            step=0.5, format="%.1f",
+        )
+        odds = c4.number_input("American odds", value=DEFAULT_AMERICAN_ODDS, step=5)
+
+        c5, c6, c7, c8 = st.columns(4)
+        rolling_window = c5.number_input(
+            "Rolling window", min_value=2, max_value=30,
+            value=DEFAULT_ROLLING_WINDOW, step=1,
+        )
+        history_games = c6.number_input(
+            "History games", min_value=10, max_value=200,
+            value=max(10, min(int(n_games_default), 200)), step=5,
+        )
+        opp_def = c7.number_input("Opp def rating",
+                                   value=DEFAULT_OPP_DEF_RATING, step=0.5)
+        spread = c8.number_input("Vegas spread",
+                                  value=DEFAULT_VEGAS_SPREAD, step=0.5)
+
+        st.markdown("**Distribution + tuning**")
+        c9, c10 = st.columns([1.2, 1.0])
+        # SECURITY/SAFETY: source dist list from SUPPORTED_DISTRIBUTIONS so
+        # the selector tracks whatever the model team ships.
+        dist_options = list(SUPPORTED_DISTRIBUTIONS)
+        default_idx = (
+            dist_options.index(DEFAULT_SINGLE_PROP_DISTRIBUTION)
+            if DEFAULT_SINGLE_PROP_DISTRIBUTION in dist_options else 0
+        )
+        distribution = c9.selectbox(
+            "Distribution family", dist_options, index=default_idx,
+        )
+        show_plot = c10.checkbox("Render distribution plot", value=True)
+
+        c11, c12 = st.columns(2)
+        league_avg_def = c11.slider(
+            "League avg def rating",
+            min_value=105.0, max_value=120.0,
+            value=float(DEFAULT_LEAGUE_AVG_DEF_RATING), step=0.1,
+        )
+        defense_sensitivity = c12.slider(
+            "Defense sensitivity",
+            min_value=0.0, max_value=1.5,
+            value=float(DEFAULT_DEFENSE_SENSITIVITY), step=0.01,
+        )
+        c13, c14 = st.columns(2)
+        blowout_threshold = c13.slider(
+            "Blowout threshold",
+            min_value=0.0, max_value=25.0,
+            value=float(DEFAULT_BLOWOUT_THRESHOLD), step=0.5,
+        )
+        blowout_penalty = c14.slider(
+            "Blowout penalty",
+            min_value=0.0, max_value=0.5,
+            value=float(DEFAULT_BLOWOUT_PENALTY), step=0.01,
+        )
+        c15, c16, c17 = st.columns(3)
+        defense_severity = c15.slider(
+            "Defense severity", min_value=0.0, max_value=3.0,
+            value=1.0, step=0.05,
+        )
+        minutes_severity = c16.slider(
+            "Minutes-penalty severity", min_value=0.0, max_value=3.0,
+            value=1.0, step=0.05,
+        )
+        sigma_severity = c17.slider(
+            "Sigma severity", min_value=0.0, max_value=3.0,
+            value=1.0, step=0.05,
+        )
+
+        submitted = st.form_submit_button("Run model")
+
+    if not submitted:
+        st.caption(
+            "Set parameters above and click **Run model**. The first run for a "
+            "new player triggers NBA-API calls and can take a few seconds."
+        )
+        return
+
+    # SECURITY: validate every numeric input before it reaches the model.
+    try:
+        v_line = iv.validate_line(stat_type, line)
+        v_odds = iv.validate_american_odds(odds)
+        v_n_games = iv.validate_n_games(history_games, min_value=10)
+        v_rolling = iv.validate_rolling_window(rolling_window, default=DEFAULT_ROLLING_WINDOW)
+        if not (-30.0 <= float(spread) <= 30.0):
+            raise iv.ValidationError(f"vegas_spread {spread} out of [-30, 30]")
+        if not (80.0 <= float(opp_def) <= 130.0):
+            raise iv.ValidationError(f"opp_def_rating {opp_def} out of [80, 130]")
+    except iv.ValidationError as exc:
+        st.error(f"Invalid input: {exc}")
+        return
+
+    with st.spinner(f"Running model for {player} (NBA API)…"):
+        try:
+            result = run_single_prop(
+                player_name=str(player).strip(),
+                line=float(v_line),
+                rolling_window=int(v_rolling),
+                american_odds=int(v_odds) if v_odds is not None else DEFAULT_AMERICAN_ODDS,
+                opp_def_rating=float(opp_def),
+                vegas_spread=float(spread),
+                league_avg_def_rating=float(league_avg_def),
+                defense_sensitivity=float(defense_sensitivity),
+                blowout_threshold=float(blowout_threshold),
+                blowout_penalty=float(blowout_penalty),
+                n_games=int(v_n_games),
+                show_plot=False,
+                distribution=str(distribution).strip().lower(),
+                defense_severity=float(defense_severity),
+                minutes_penalty_severity=float(minutes_severity),
+                sigma_severity=float(sigma_severity),
+            )
+        except Exception as exc:  # noqa: BLE001
+            st.error(f"Model failed: {exc}")
+            return
+
+    # KPI row
+    kpi = st.columns(5)
+    kpi[0].metric("mu (expected)", f"{result['mu']:.2f}")
+    kpi[1].metric("sigma (adjusted)", f"{result['sigma_adjusted']:.2f}")
+    kpi[2].metric("P(over)", f"{result['prob_over']:.1%}")
+    kpi[3].metric("Book implied", f"{result['implied_prob']:.1%}")
+    ev_delta = (
+        f"{(result['prob_over'] - result['implied_prob']) * 100:+.1f} pts"
+    )
+    kpi[4].metric("EV / unit", f"{result['ev']:+.3f}", delta=ev_delta)
+    st.caption(f"Distribution: **{result['distribution']}**")
+
+    if show_plot:
+        # Build a quick density figure using the model's mu + adjusted sigma.
+        import plotly.graph_objects as go
+        import numpy as np
+        from scipy.stats import norm
+        mu = float(result["mu"])
+        sigma = max(0.01, float(result["sigma_adjusted"]))
+        xs = np.linspace(mu - 4 * sigma, mu + 4 * sigma, 240)
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(
+            x=xs, y=norm.pdf(xs, mu, sigma), mode="lines",
+            name=f"{result['distribution']} fit",
+            line=dict(color="#222", width=2.5),
+        ))
+        fig.add_vline(
+            x=float(v_line), line=dict(color="#cc4125", width=2.4, dash="dash"),
+            annotation_text=f"line {v_line:.1f}", annotation_position="top right",
+        )
+        fig.add_vline(
+            x=mu, line=dict(color="#4a86e8", width=1.6, dash="dot"),
+            annotation_text=f"mu {mu:.2f}", annotation_position="top left",
+        )
+        fig.update_layout(
+            title=f"{player} — model density ({result['distribution']})",
+            xaxis_title="value", yaxis_title="density",
+            margin=dict(l=10, r=10, t=50, b=10),
+        )
+        st.plotly_chart(fig, use_container_width=True,
+                        key="plotly_single_model_density")
+
+    with st.expander("Full result JSON", expanded=False):
+        st.json(result)
+
+
+# ---------------------------------------------------------------------------
+# Manual lines import view — paste board / CSV / pipe rows, parse, save.
+# Saves are admin-gated to prevent random visitors from poisoning betting_lines.
+# ---------------------------------------------------------------------------
+def _manual_lines_import_view(*, db_path: str) -> None:
+    from datetime import datetime, timezone
+    from nba_model.model.manual_lines import parse_manual_lines_text
+
+    st.subheader("Manual lines import")
+    st.caption(
+        "Paste rows (pipe / CSV / tab delimited) or a noisy sportsbook board "
+        "dump. The parser extracts player / stat / line / odds and previews "
+        "the records before any database write."
+    )
+
+    is_admin = web_auth.is_admin()
+    if not is_admin and web_auth.BILLING_ENABLED:
+        st.warning(
+            ":lock: Saving to the database is **admin-only** to protect the "
+            "shared `betting_lines` table from poisoning. You can still paste "
+            "rows and preview the parser output."
+        )
+
+    with st.form("manual_lines_form", clear_on_submit=False):
+        c1, c2 = st.columns([1, 2])
+        default_date = c1.text_input(
+            "Default game date (YYYY-MM-DD)",
+            value=datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+        )
+        default_book = c2.text_input(
+            "Default sportsbook",
+            value="Manual import",
+        )
+        text = st.text_area(
+            "Lines / board text",
+            height=240,
+            value=(
+                "# Example rows\n"
+                "LeBron James | points | 27.5 | -115 | -105\n"
+                "Stephen Curry | 2025-03-07 | FanDuel | assists | 5.5 | -110 | -120\n"
+            ),
+            help=(
+                "Formats:\n"
+                "  1) player | stat | line | over_odds | under_odds\n"
+                "  2) player | game_date | book | stat | line | over_odds | under_odds\n"
+                "  3) Raw board dump (auto-extract from blocks: player + matchup + line + stat)\n"
+                "Stats accept aliases (pts/ast/reb/pra)."
+            ),
+        )
+        c_parse, c_save = st.columns(2)
+        parse_btn = c_parse.form_submit_button("Parse", use_container_width=True)
+        save_btn = c_save.form_submit_button(
+            "Save to DB",
+            disabled=(web_auth.BILLING_ENABLED and not is_admin),
+            use_container_width=True,
+        )
+
+    if not (parse_btn or save_btn):
+        return
+
+    try:
+        records, errors = parse_manual_lines_text(
+            text=text,
+            default_game_date=default_date,
+            default_book=default_book,
+        )
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"Parse failed: {exc}")
+        return
+
+    # SECURITY: reject any record that fails the betting-line plausibility
+    # check before showing the user a "ready to save" view.
+    plausible_records: list[dict] = []
+    dropped: list[str] = []
+    for rec in records:
+        if iv.is_plausible_betting_line(
+            rec.get("stat_type", ""),
+            rec.get("line_value"),
+            rec.get("over_odds"),
+            rec.get("under_odds"),
+        ):
+            plausible_records.append(rec)
+        else:
+            dropped.append(
+                f"{rec.get('player_name')} {rec.get('stat_type')} "
+                f"{rec.get('line_value')} (failed validation)"
+            )
+
+    cols = st.columns(3)
+    cols[0].metric("Parsed rows", len(records))
+    cols[1].metric("Plausible rows", len(plausible_records))
+    cols[2].metric("Errors / dropped", len(errors) + len(dropped))
+
+    if records:
+        st.markdown("**Parsed records (after validation)**")
+        st.dataframe(
+            pd.DataFrame(plausible_records),
+            hide_index=True,
+            use_container_width=True,
+        )
+
+    if errors:
+        with st.expander(f":warning: Parse errors ({len(errors)})", expanded=False):
+            for e in errors:
+                st.text(e)
+    if dropped:
+        with st.expander(
+            f":warning: Dropped by validator ({len(dropped)})", expanded=False
+        ):
+            for d in dropped:
+                st.text(d)
+
+    if save_btn:
+        if web_auth.BILLING_ENABLED and not is_admin:
+            st.error("Saving is admin-only.")
+            return
+        if not plausible_records:
+            st.warning("Nothing to save.")
+            return
+        try:
+            from nba_model.data.database.db_manager import DatabaseManager
+            with DatabaseManager(db_path=db_path) as db:
+                before = db.conn.execute(
+                    "SELECT COUNT(*) FROM betting_lines"
+                ).fetchone()[0]
+                seen: dict[int, str] = {}
+                for row in plausible_records:
+                    pid = row["player_id"]
+                    if pid not in seen:
+                        seen[pid] = row["player_name"]
+                        db.insert_player(pid, row["player_name"])
+                db.insert_betting_lines_records(plausible_records)
+                after = db.conn.execute(
+                    "SELECT COUNT(*) FROM betting_lines"
+                ).fetchone()[0]
+            inserted = after - before
+            st.success(
+                f"Inserted **{inserted}** new `betting_lines` row(s) "
+                f"(total rows now {after})."
+            )
+        except Exception as exc:  # noqa: BLE001
+            st.error(f"Save failed: {exc}")
+
+
+_GLOBAL_CSS = """
+<style>
+/* Hide the rarely-used sidebar entirely (collapsed by default; controls
+   live in the top bar). The sidebar handle still shows so power-users can
+   open it if a stray widget ever lands there. */
+section[data-testid="stSidebar"] > div { padding-top: 0.5rem; }
+
+/* Hero title */
+h1.hero-title {
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  font-size: 2.0rem;
+  margin: 0.2rem 0 0.6rem 0;
+  color: #0f172a;
+}
+h1.hero-title .hero-suffix {
+  font-weight: 500;
+  font-size: 1.1rem;
+  color: #64748b;
+  margin-left: 0.6rem;
+}
+
+/* Section divider — subtle, used between control bar and content. */
+hr.section-divider {
+  border: 0; border-top: 1px solid #e5e7eb;
+  margin: 0.75rem 0 1.0rem 0;
+}
+
+/* KPI cards: tighten Streamlit's default metric look. */
+div[data-testid="stMetric"] {
+  background: #ffffff;
+  border: 1px solid #e5e7eb;
+  border-radius: 10px;
+  padding: 10px 14px;
+  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
+}
+div[data-testid="stMetricLabel"] {
+  font-size: 0.78rem;
+  color: #64748b;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+div[data-testid="stMetricValue"] {
+  font-weight: 700;
+  font-size: 1.5rem;
+  color: #0f172a;
+}
+
+/* Primary nav (horizontal radio styled as pill segmented control). */
+div.primary-nav div[role="radiogroup"] {
+  gap: 6px;
+  flex-wrap: wrap;
+}
+div.primary-nav div[role="radiogroup"] > label {
+  background: #f1f4f9;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  padding: 6px 14px;
+  margin: 0 !important;
+  cursor: pointer;
+  font-size: 0.92rem;
+  color: #334155;
+  transition: background 0.12s ease, border-color 0.12s ease;
+}
+div.primary-nav div[role="radiogroup"] > label:hover {
+  background: #e2e8f0;
+}
+div.primary-nav div[role="radiogroup"] > label:has(input:checked) {
+  background: #5b8def;
+  color: #ffffff;
+  border-color: #4775d9;
+}
+div.primary-nav div[role="radiogroup"] > label > div:first-child {
+  display: none;  /* hide the native radio dot */
+}
+
+/* Top status row spacing */
+div.top-status { display: flex; gap: 6px; justify-content: flex-end; align-items: center; }
+
+/* Plotly chart cards */
+div[data-testid="stPlotlyChart"] {
+  background: #ffffff;
+  border: 1px solid #e5e7eb;
+  border-radius: 12px;
+  padding: 6px 8px;
+  box-shadow: 0 1px 3px rgba(15, 23, 42, 0.05);
+}
+
+/* Tab strip polish */
+button[data-testid="stTab"] {
+  font-weight: 500;
+}
+
+/* Captions */
+.stCaption, div[data-testid="stCaptionContainer"] { color: #64748b; }
+</style>
+"""
+
+
+def _inject_global_css() -> None:
+    st.markdown(_GLOBAL_CSS, unsafe_allow_html=True)
+
+
+def _render_top_status_row(user) -> None:
+    """Right-side top-bar cluster: ETL freshness + watchlist + account popovers."""
+    st.markdown("<div class='top-status'>", unsafe_allow_html=True)
+    cols = st.columns([1.4, 1.2, 1.2, 1.4])
+    with cols[0]:
+        _render_etl_status_widget()
+    with cols[1]:
+        _render_watchlist_popover()
+    with cols[2]:
+        with st.popover(":bookmark: Pin", use_container_width=False):
+            cur_player = _qp_get(_QP_PLAYER, "")
+            if cur_player:
+                if st.button(
+                    f"Pin {cur_player} to watchlist",
+                    key="wl_add_current_top",
+                    disabled=(cur_player in wl.get()),
+                    use_container_width=True,
+                ):
+                    wl.add(cur_player)
+                    st.rerun()
+            else:
+                st.caption("Select a player first.")
+    with cols[3]:
+        if web_auth.BILLING_ENABLED:
+            with st.popover(":bust_in_silhouette: Account",
+                            use_container_width=False):
+                web_auth.render_user_card(sidebar=False)
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
 def main() -> None:
     st.set_page_config(
         page_title="NBA Player Charts",
         page_icon="🏀",
         layout="wide",
+        initial_sidebar_state="collapsed",
     )
+    _inject_global_css()
 
-    # Auth state + tier; rendered as a sidebar card before any feature gates.
     user = web_auth.current_user()
-    web_auth.render_user_card(sidebar=True)
-
-    # Title suffix only when billing is on; otherwise the open site says
-    # nothing about Free/Premium.
+    title_suffix = ""
     if web_auth.BILLING_ENABLED:
-        title_suffix = " - Premium" if user.is_premium else " - Free preview"
-    else:
-        title_suffix = ""
-    st.title("NBA Player Charts" + title_suffix)
+        title_suffix = " — Premium" if user.is_premium else " — Free preview"
+
+    # ---- Top hero + status pills ----
+    hero_l, hero_r = st.columns([5, 4])
+    with hero_l:
+        st.markdown(
+            f"<h1 class='hero-title'>🏀 NBA Player Charts"
+            f"<span class='hero-suffix'>{title_suffix}</span></h1>",
+            unsafe_allow_html=True,
+        )
+    with hero_r:
+        _render_top_status_row(user)
+
     if web_auth.BILLING_ENABLED and not user.is_premium:
         st.info(
             ":lock: **Free preview mode.** You can view "
@@ -1310,146 +1813,230 @@ def main() -> None:
             "team distributions, parlay analysis, and unlimited history."
         )
 
-    # ---- Sport picker (sidebar dropdown + main-pane roadmap card) -------
-    # Rendered OUTSIDE `with st.sidebar:` so the roadmap card for a stub
-    # sport lands in the main pane while the selectbox still attaches to
-    # the sidebar (via the explicit `st.sidebar.selectbox` call inside the
-    # helper).
+    # ---- Sport picker (top popover; roadmap card lands in main pane) ----
     active_sport = _render_sport_selector()
     if not active_sport.is_live:
-        # Don't render the rest of the sidebar / main view; the roadmap
-        # card already covered what the user can see for stub sports.
         return
 
-    # ---- Sidebar -------------------------------------------------------
-    _render_etl_status_widget()
-    with st.sidebar:
-        st.divider()
-        st.header("Selection")
-        # SECURITY: db_path used to be a free-form text_input, which let any
-        # visitor change which sqlite file the app reads. We now hardcode the
-        # production path and only show a debug override to admin emails.
-        is_admin = web_auth.is_admin()
-        if is_admin:
+    # ---- DB path (hardcoded; admin gets an override popover) ----
+    is_admin = web_auth.is_admin()
+    db_path = DEFAULT_DB_PATH
+    if is_admin:
+        with st.popover(":gear: Admin", use_container_width=False):
             db_path = st.text_input(
                 "DB path (admin only)", value=DEFAULT_DB_PATH,
                 help="Visible because you are listed in [auth].admins.",
+                key="admin_db_path",
             )
-        else:
-            db_path = DEFAULT_DB_PATH
-        if st.button("Reload DB indexes"):
-            _cached_teams.clear()
-            _cached_players.clear()
+            if st.button("Reload DB indexes", key="admin_reload"):
+                _cached_teams.clear()
+                _cached_players.clear()
 
-        try:
-            teams = ["(any)"] + _cached_teams(db_path)
-        except Exception as exc:  # noqa: BLE001
-            st.error(f"Could not read teams from {db_path}: {exc}")
+    try:
+        teams = ["(any)"] + _cached_teams(db_path)
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"Could not read teams from {db_path}: {exc}")
+        return
+
+    # ---- Primary nav (View mode = top-level pills) ----
+    free_views = [
+        "Player charts", "Team charts", "Compare players",
+        "Game Results", "Player Stats Browse",
+    ]
+    premium_views = [
+        "Player charts", "Team charts", "Compare players",
+        "All stats (overview)", "Single prop (model)",
+        "Parlay analysis", "Manual lines import",
+        "Game Results", "Player Stats Browse",
+    ]
+    if web_auth.is_admin():
+        premium_views = premium_views + ["Operations (admin)"]
+    view_options = premium_views if user.is_premium else free_views
+    view_default = _qp_get(_QP_VIEW, view_options[0])
+
+    st.markdown("<div class='primary-nav'>", unsafe_allow_html=True)
+    view_mode = st.radio(
+        "View",
+        view_options,
+        index=_index_or_zero(view_options, view_default),
+        horizontal=True,
+        label_visibility="collapsed",
+        key="primary_nav_radio",
+    )
+    st.markdown("</div>", unsafe_allow_html=True)
+    _qp_set(view=view_mode)
+
+    is_overview      = view_mode.startswith("All stats")
+    is_team_view     = view_mode.startswith("Team charts")
+    is_player_view   = view_mode.startswith("Player charts")
+    is_parlay_view   = view_mode.startswith("Parlay")
+    is_compare_view  = view_mode.startswith("Compare")
+    is_game_results  = view_mode.startswith("Game Results")
+    is_player_browse = view_mode.startswith("Player Stats Browse")
+    is_single_model  = view_mode.startswith("Single prop")
+    is_manual_lines  = view_mode.startswith("Manual lines")
+    is_operations    = view_mode.startswith("Operations")
+
+    # ---- Views with their own controls (no shared selection row) ----
+    if is_game_results:
+        st.markdown("<hr class='section-divider'/>", unsafe_allow_html=True)
+        _game_results_view(db_path)
+        return
+    if is_player_browse:
+        st.markdown("<hr class='section-divider'/>", unsafe_allow_html=True)
+        _player_browse_view(db_path)
+        return
+    if is_single_model:
+        st.markdown("<hr class='section-divider'/>", unsafe_allow_html=True)
+        _single_prop_model_view(
+            default_player=_qp_get(_QP_PLAYER, "LeBron James"),
+            n_games_default=_qp_get_int(_QP_NGAMES, 25),
+        )
+        return
+    if is_manual_lines:
+        st.markdown("<hr class='section-divider'/>", unsafe_allow_html=True)
+        _manual_lines_import_view(db_path=db_path)
+        return
+    if is_operations:
+        # Hard gate: Operations launches subprocesses on the host. Admin is
+        # required REGARDLESS of BILLING_ENABLED — open-access mode must not
+        # leak this surface. The pill also only renders for admins, but this
+        # re-check defends against ``?view=Operations+(admin)`` deep-links.
+        if not web_auth.is_admin():
+            st.error(
+                ":lock: The Operations console is admin-only. "
+                "Sign in with an account listed in `[auth.admins]` of "
+                "`secrets.toml` to access it."
+            )
             return
-        team_default = _qp_get(_QP_TEAM, teams[0])
+        st.markdown("<hr class='section-divider'/>", unsafe_allow_html=True)
+        from nba_model.web import operations_panel as _ops
+        _ops.render_operations_panel(on_authorized=web_auth.is_admin)
+        return
+
+    # ---- Shared selection bar (Team / Player / Stat / N games + Filters) ----
+    team_default = _qp_get(_QP_TEAM, teams[0])
+    sel_cols = st.columns([1.3, 2.6, 1.4, 1.0, 1.0])
+
+    with sel_cols[0]:
         team_pick = st.selectbox(
             "Team", teams,
             index=_index_or_zero(teams, team_default),
+            key="top_team_select",
         )
-        team_val = "" if team_pick == "(any)" else team_pick
-        _qp_set(team=team_val or None)
+    team_val = "" if team_pick == "(any)" else team_pick
+    _qp_set(team=team_val or None)
 
-        try:
-            players_df = _cached_players(db_path, team_val)
-        except Exception as exc:  # noqa: BLE001
-            st.error(f"Could not list players: {exc}")
-            return
-        if players_df.empty:
-            st.warning("No players in DB for that filter.")
-            return
-        # Backstop: older cached frames may not carry n_books yet.
-        if "n_books" not in players_df.columns:
-            players_df = players_df.assign(n_books=0)
+    try:
+        players_df = _cached_players(db_path, team_val)
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"Could not list players: {exc}")
+        return
+    if players_df.empty:
+        st.warning("No players in DB for that filter.")
+        return
+    if "n_books" not in players_df.columns:
+        players_df = players_df.assign(n_books=0)
 
-        # Sidebar controls: filter to currently-scraped players + sort by book
-        # count. Defaults are tuned for the "test demand" open launch — we
-        # want first-time visitors to immediately land on a player who has
-        # real cross-book data (LeBron, Jokic, Wembanyama etc.) rather than
-        # the alphabetical first hit which is often a deep bench player with
-        # zero books.
-        only_scraped = st.checkbox(
-            "Only players with current book lines",
-            value=True,
-            help=(
-                "Hide players who aren't in any sportsbook's slate right now. "
-                "Uncheck to browse the full active roster (~530 players)."
-            ),
-        )
-        sort_mode = st.radio(
-            "Sort players by",
-            ["Book coverage (most books first)", "Alphabetical"],
-            index=0,
-            horizontal=False,
-            help="Book coverage = number of sportsbooks currently posting a "
-                 "line for the player.",
-        )
-
-        # Apply filter + sort BEFORE the free-tier allowlist trim, so the
-        # filter actually affects free-tier visitors (they only see Jokic /
-        # LeBron either way, but the default smart pick still works).
-        view_df = players_df
-        if only_scraped:
-            scraped = view_df[view_df["n_books"] > 0]
-            # Don't silently empty the list — if the filter would hide
-            # everything (some team filters + free tier), drop back to the
-            # unfiltered list so the dropdown is never empty.
-            if not scraped.empty:
-                view_df = scraped
-        if sort_mode.startswith("Book"):
-            view_df = view_df.sort_values(
-                ["n_books", "player_name"], ascending=[False, True]
+    # ---- Filters popover holds secondary controls so the top stays clean ----
+    with sel_cols[4]:
+        with st.popover(":control_knobs: Filters", use_container_width=True):
+            only_scraped = st.checkbox(
+                "Only players with current book lines",
+                value=True,
+                help="Hide players who aren't in any sportsbook's slate "
+                     "right now. Uncheck to browse the full active roster.",
+                key="filt_only_scraped",
             )
-        else:
-            view_df = view_df.sort_values("player_name", ascending=True)
+            sort_mode = st.radio(
+                "Sort players by",
+                ["Book coverage (most books first)", "Alphabetical"],
+                index=0,
+                key="filt_sort_mode",
+            )
+            rolling_raw = st.number_input(
+                "Rolling window", min_value=1, max_value=40, value=5, step=1,
+                key="filt_rolling",
+            )
+            overlay_default = [d for d in ("normal",) if d in _OVERLAY_DISTRIBUTIONS]
+            overlays = st.multiselect(
+                "Fitted distribution families",
+                list(_OVERLAY_DISTRIBUTIONS),
+                default=overlay_default,
+                help="Each picked family draws a fitted overlay on the "
+                     "distribution chart. Sourced from "
+                     "`simulation.SUPPORTED_DISTRIBUTIONS` plus "
+                     "`negative_binomial`.",
+                key="filt_overlays",
+            )
+            if not overlays:
+                overlays = ["normal"]
+            line_view_choice = st.radio(
+                "Line-board layout",
+                ["Distribution view", "Line ladder"],
+                index=0,
+                help="Distribution: histogram + fitted overlays + per-book "
+                     "vertical markers with best-EV highlight. "
+                     "Line ladder: compact one-row-per-book layout — easier "
+                     "with 6+ books, drops the histogram context.",
+                key="filt_line_view",
+            )
+            line_view_mode = (
+                "ladder" if line_view_choice.lower().startswith("line ladder")
+                else "distribution"
+            )
+    try:
+        rolling = iv.validate_rolling_window(rolling_raw, default=5)
+    except iv.ValidationError as exc:
+        st.error(f"Invalid rolling window: {exc}")
+        return
 
-        names = view_df["player_name"].dropna().astype(str).tolist()
+    # Filter / sort players for the dropdown.
+    view_df = players_df
+    if only_scraped:
+        scraped = view_df[view_df["n_books"] > 0]
+        if not scraped.empty:
+            view_df = scraped
+    if sort_mode.startswith("Book"):
+        view_df = view_df.sort_values(
+            ["n_books", "player_name"], ascending=[False, True],
+        )
+    else:
+        view_df = view_df.sort_values("player_name", ascending=True)
+
+    names = view_df["player_name"].dropna().astype(str).tolist()
+    if not names:
+        st.warning("No players match the current filter.")
+        return
+
+    if not user.is_premium:
+        preview_set = set(web_auth.PREVIEW_PLAYERS)
+        names = [n for n in names if n in preview_set]
         if not names:
-            st.warning("No players match the current filter.")
+            st.warning(
+                "Free preview is limited to: "
+                + ", ".join(web_auth.PREVIEW_PLAYERS)
+                + ". They may not appear in this team filter; "
+                "set Team to (any)."
+            )
             return
 
-        # Free tier sees only the preview allowlist; premium sees everything.
-        if not user.is_premium:
-            preview_set = set(web_auth.PREVIEW_PLAYERS)
-            names = [n for n in names if n in preview_set]
-            if not names:
-                st.warning(
-                    "Free preview is limited to: "
-                    + ", ".join(web_auth.PREVIEW_PLAYERS)
-                    + ". They may not appear in this team filter; "
-                    "set Team to (any)."
-                )
-                return
-        # Watchlist: click an entry to jump to that player (writes URL param).
-        watchlist_pick = _render_watchlist_widget(names)
-        if watchlist_pick and watchlist_pick in names:
-            _qp_set(player=watchlist_pick)
-            player_default = watchlist_pick
-        else:
-            # Smart default for first-time visitors with no URL state:
-            # pick the highest-coverage player currently in the dropdown.
-            smart_default = names[0]
-            url_player = _qp_get(_QP_PLAYER, "")
-            player_default = url_player if url_player in names else smart_default
+    smart_default = names[0]
+    url_player = _qp_get(_QP_PLAYER, "")
+    player_default = url_player if url_player in names else smart_default
 
-        # Pre-compute formatted labels showing the book count, so the
-        # dropdown itself tells the user which players are live in the
-        # market right now.
-        n_books_lookup = dict(
-            zip(
-                view_df["player_name"].astype(str),
-                view_df["n_books"].fillna(0).astype(int),
-            )
+    n_books_lookup = dict(
+        zip(
+            view_df["player_name"].astype(str),
+            view_df["n_books"].fillna(0).astype(int),
         )
+    )
 
-        def _label(n: str) -> str:
-            nb = n_books_lookup.get(n, 0)
-            return f"{n}  ({nb} books)" if nb else n
+    def _label(n: str) -> str:
+        nb = n_books_lookup.get(n, 0)
+        return f"{n}  ({nb} books)" if nb else n
 
+    with sel_cols[1]:
         player_name = st.selectbox(
             "Player", names,
             index=_index_or_zero(names, player_default),
@@ -1458,157 +2045,81 @@ def main() -> None:
                 "Switching player reloads every chart on the right. "
                 "Free tier: only "
                 + ", ".join(web_auth.PREVIEW_PLAYERS) + "."
-                if not user.is_premium else "Switching player reloads every chart."
+                if not user.is_premium
+                else "Switching player reloads every chart."
             ),
+            key="top_player_select",
         )
-        _qp_set(player=player_name)
-        if st.button(
-            f":bookmark: Pin {player_name} to watchlist",
-            use_container_width=True, key="wl_add_current",
-            disabled=(player_name in wl.get()),
-        ):
-            wl.add(player_name)
-            st.rerun()
+    _qp_set(player=player_name)
 
-        # Player + Team charts are top-level peers in the main page so users
-        # can pick either entry point immediately.  The two stats-browse
-        # views are free for everyone; the player/parlay overview views
-        # remain premium-gated for richer per-player analytics.
-        free_views = [
-            "Player charts",
-            "Team charts",
-            "Compare players",
-            "Game Results",
-            "Player Stats Browse",
-        ]
-        premium_views = [
-            "Player charts",
-            "Team charts",
-            "Compare players",
-            "All stats (overview)",
-            "Parlay analysis",
-            "Game Results",
-            "Player Stats Browse",
-        ]
-        view_options = premium_views if user.is_premium else free_views
-        view_default = _qp_get(_QP_VIEW, view_options[0])
-        view_mode = st.radio(
-            "View mode",
-            view_options,
-            index=_index_or_zero(view_options, view_default),
-            help=(
-                "Player charts: full chart suite for one player + stat. "
-                "Team charts: per-team aggregates with cross-book consensus line. "
-                "All stats: every stat for the selected player on one page. "
-                "Parlay analysis: cross-compare model + chart-data + historical. "
-                "Game Results: recent NBA games + scores. "
-                "Player Stats Browse: searchable league-wide player game logs."
-            ),
-        )
-        _qp_set(view=view_mode)
-        is_overview = view_mode.startswith("All stats")
-        is_team_view = view_mode.startswith("Team charts")
-        is_player_view = view_mode.startswith("Player charts")
-        is_parlay_view = view_mode.startswith("Parlay")
-        is_compare_view = view_mode.startswith("Compare")
-        is_game_results = view_mode.startswith("Game Results")
-        is_player_browse = view_mode.startswith("Player Stats Browse")
-
-        if is_team_view:
-            team_codes = _cached_team_codes(db_path)
-            if not team_codes:
-                st.warning(
-                    "No teams found in game_logs. Run the daily ETL first."
-                )
-                return
-            team_code_raw = st.selectbox(
-                "Team",
-                team_codes,
-                index=0,
-                help="Switching team reloads every team-level chart.",
-            )
-            try:
-                team_code = iv.validate_team_code(team_code_raw)
-            except iv.ValidationError as exc:
-                st.error(f"Invalid team code: {exc}")
-                return
-        else:
-            team_code = None
-
-        stat_choices_for_user = (
-            web_auth.PREVIEW_STATS if not user.is_premium else STAT_CHOICES
-        )
-        stat_default = _qp_get(_QP_STAT, stat_choices_for_user[0])
+    stat_choices_for_user = (
+        web_auth.PREVIEW_STATS if not user.is_premium else STAT_CHOICES
+    )
+    stat_default = _qp_get(_QP_STAT, stat_choices_for_user[0])
+    with sel_cols[2]:
         stat_type_raw = st.selectbox(
-            "Stat (single-stat mode)", stat_choices_for_user,
+            "Stat", stat_choices_for_user,
             index=_index_or_zero(stat_choices_for_user, stat_default),
-            disabled=(is_overview),
+            disabled=is_overview,
             help=(
                 "Free preview: points only. Premium unlocks all stats."
                 if not user.is_premium else None
             ),
+            key="top_stat_select",
         )
-        _qp_set(stat=stat_type_raw)
-        try:
-            stat_type = iv.validate_stat_type(
-                stat_type_raw, allowed=stat_choices_for_user,
-            )
-        except iv.ValidationError as exc:
-            st.error(f"Invalid stat: {exc}")
-            return
+    _qp_set(stat=stat_type_raw)
+    try:
+        stat_type = iv.validate_stat_type(
+            stat_type_raw, allowed=stat_choices_for_user,
+        )
+    except iv.ValidationError as exc:
+        st.error(f"Invalid stat: {exc}")
+        return
 
-        n_games_max = web_auth.PREVIEW_MAX_GAMES if not user.is_premium else 200
-        n_games_default = min(_qp_get_int(_QP_NGAMES, 25), n_games_max)
-        n_games_default = max(3, n_games_default)
+    n_games_max = web_auth.PREVIEW_MAX_GAMES if not user.is_premium else 200
+    n_games_default = min(_qp_get_int(_QP_NGAMES, 25), n_games_max)
+    n_games_default = max(3, n_games_default)
+    with sel_cols[3]:
         n_games_raw = st.number_input(
-            "Last N games", min_value=3, max_value=n_games_max,
+            "Last N", min_value=3, max_value=n_games_max,
             value=n_games_default, step=1,
             help=(
                 f"Free preview capped at {web_auth.PREVIEW_MAX_GAMES}. "
                 "Premium unlocks up to 200."
                 if not user.is_premium else None
             ),
+            key="top_n_games",
         )
-        _qp_set(n_games=int(n_games_raw))
-        try:
-            n_games = iv.validate_n_games(n_games_raw, min_value=3)
-        except iv.ValidationError as exc:
-            st.error(f"Invalid N games: {exc}")
-            return
-        # Tier-side cap: even after the validator's hard cap, free tier is
-        # capped tighter to enforce the preview limit.
-        n_games = min(n_games, n_games_max)
+    _qp_set(n_games=int(n_games_raw))
+    try:
+        n_games = iv.validate_n_games(n_games_raw, min_value=3)
+    except iv.ValidationError as exc:
+        st.error(f"Invalid N games: {exc}")
+        return
+    n_games = min(n_games, n_games_max)
 
-        rolling_raw = st.number_input(
-            "Rolling window", min_value=1, max_value=40, value=5, step=1,
+    # Team-aggregate code picker only shows for the Team-charts view.
+    if is_team_view:
+        team_codes = _cached_team_codes(db_path)
+        if not team_codes:
+            st.warning("No teams found in game_logs. Run the daily ETL first.")
+            return
+        team_code_raw = st.selectbox(
+            "Team aggregate (code)", team_codes, index=0,
+            help="Switching team reloads every team-level chart.",
+            key="top_team_code",
         )
         try:
-            rolling = iv.validate_rolling_window(rolling_raw, default=5)
+            team_code = iv.validate_team_code(team_code_raw)
         except iv.ValidationError as exc:
-            st.error(f"Invalid rolling window: {exc}")
+            st.error(f"Invalid team code: {exc}")
             return
+    else:
+        team_code = None
 
-        st.subheader("Distribution overlays")
-        show_normal = st.checkbox("normal", value=True)
-        show_poisson = st.checkbox("poisson", value=False)
-        show_negbin = st.checkbox("negative binomial", value=False)
-        overlays: list[str] = []
-        if show_normal:
-            overlays.append("normal")
-        if show_poisson:
-            overlays.append("poisson")
-        if show_negbin:
-            overlays.append("negative_binomial")
-        if not overlays:
-            overlays = ["normal"]
+    st.markdown("<hr class='section-divider'/>", unsafe_allow_html=True)
 
-    # ---- Stats-browse views (no player lookup needed) -----------------
-    if is_game_results:
-        _game_results_view(db_path)
-        return
-    if is_player_browse:
-        _player_browse_view(db_path)
-        return
+    # ---- Compare-players (uses shared selection row) ----
     if is_compare_view:
         _compare_players_view(
             db_path=db_path,
@@ -1703,22 +2214,30 @@ def main() -> None:
         c1, c2 = st.columns(2)
         with c1:
             st.caption("Recent games + rolling mean + median book line")
-            st.pyplot(
-                pc.build_recent_games_figure(data, rolling_window=int(rolling)),
+            st.plotly_chart(
+                plc.build_recent_games_figure(data, rolling_window=int(rolling)),
                 use_container_width=True,
+                key=f"plotly_recent_single_{data.player_id}_{data.stat_type}",
             )
         with c2:
             st.caption("Distribution + book-line markers (hover / zoom enabled)")
             st.plotly_chart(
                 plc.build_distribution_figure(
-                    data, distributions=tuple(overlays)),
+                    data,
+                    distributions=tuple(overlays),
+                    view_mode=line_view_mode,
+                ),
                 use_container_width=True,
-                key=f"plotly_dist_single_{data.player_id}_{data.stat_type}",
+                key=f"plotly_dist_single_{data.player_id}_{data.stat_type}_{line_view_mode}",
             )
 
     with tab_splits:
         st.caption("home/away mean and rest-day buckets")
-        st.pyplot(pc.build_splits_figure(data), use_container_width=True)
+        st.plotly_chart(
+            plc.build_splits_figure(data),
+            use_container_width=True,
+            key=f"plotly_splits_single_{data.player_id}_{data.stat_type}",
+        )
         splits = pc.compute_home_away_split(data)
         rest = pc.compute_rest_days_split(data)
         cols = st.columns(2)
@@ -1740,8 +2259,12 @@ def main() -> None:
         )
 
     with tab_hitrate:
-        st.caption("Historical over-rate per book line; tick = book break-even")
-        st.pyplot(pc.build_hit_rate_figure(data), use_container_width=True)
+        st.caption("Historical over-rate per book line; 50% reference shown")
+        st.plotly_chart(
+            plc.build_hit_rate_figure(data),
+            use_container_width=True,
+            key=f"plotly_hitrate_single_{data.player_id}_{data.stat_type}",
+        )
         st.markdown("---")
         st.markdown("### Book lines + EV")
         _render_book_lines_table(data)

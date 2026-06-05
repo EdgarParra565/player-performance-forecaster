@@ -1,0 +1,202 @@
+"""Tests for the hourly ETL runner.
+
+Coverage:
+- Preflight guard fires when Chrome :9222 is unreachable or Playwright is
+  missing (the hourly job MUST fail loudly in those cases, not silently
+  retry every URL).
+- The lockfile blocks overlapping runs so a stuck hourly job doesn't get
+  trampled by the next tick.
+- Successful + partial-failure runs both emit a JSON report with the
+  per-step shape callers can grep for.
+"""
+
+import json
+import os
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+from nba_model.data import hourly_update
+
+
+class CheckChromeCdpReachableTests(unittest.TestCase):
+    def test_unreachable_port_returns_ok_false_with_actionable_error(self):
+        from nba_model.model.web_text_ingestion import check_chrome_cdp_reachable
+
+        # Port 1 is universally unbound on a normal user account, so this
+        # check is platform-stable.
+        result = check_chrome_cdp_reachable(1, host="127.0.0.1", timeout_seconds=0.5)
+        self.assertFalse(result["ok"])
+        self.assertIn("Chrome CDP unreachable", result["error"])
+        self.assertIsNone(result["version"])
+
+
+class PreflightTests(unittest.TestCase):
+    def test_preflight_raises_when_chrome_unreachable(self):
+        with patch(
+            "nba_model.model.web_text_ingestion.playwright_is_available",
+            return_value=True,
+        ), patch(
+            "nba_model.model.web_text_ingestion.check_chrome_cdp_reachable",
+            return_value={"ok": False, "version": None, "error": "boom"},
+        ):
+            with self.assertRaises(RuntimeError) as ctx:
+                hourly_update._run_preflight(
+                    chrome_port=9222, chrome_host="127.0.0.1",
+                    require_playwright=False,
+                )
+            self.assertIn("boom", str(ctx.exception))
+            self.assertIn("--remote-debugging-port", str(ctx.exception))
+
+    def test_preflight_raises_when_playwright_missing_and_required(self):
+        with patch(
+            "nba_model.model.web_text_ingestion.playwright_is_available",
+            return_value=False,
+        ):
+            with self.assertRaises(RuntimeError) as ctx:
+                hourly_update._run_preflight(
+                    chrome_port=9222, chrome_host="127.0.0.1",
+                    require_playwright=True,
+                )
+            self.assertIn("Playwright", str(ctx.exception))
+            self.assertIn(".venv/bin/python3", str(ctx.exception))
+
+    def test_preflight_succeeds_when_both_ok(self):
+        with patch(
+            "nba_model.model.web_text_ingestion.playwright_is_available",
+            return_value=True,
+        ), patch(
+            "nba_model.model.web_text_ingestion.check_chrome_cdp_reachable",
+            return_value={"ok": True, "version": "Chrome/120", "error": None},
+        ):
+            result = hourly_update._run_preflight(
+                chrome_port=9222, chrome_host="127.0.0.1",
+                require_playwright=True,
+            )
+        self.assertTrue(result["chrome"]["ok"])
+        self.assertEqual(result["chrome"]["version"], "Chrome/120")
+
+
+class LockfileTests(unittest.TestCase):
+    def test_second_acquire_returns_false_when_already_held(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            lockfile = os.path.join(tmp, "test.lock")
+            with hourly_update._acquire_lock(lockfile) as acquired_first:
+                self.assertTrue(acquired_first)
+                with hourly_update._acquire_lock(lockfile) as acquired_second:
+                    self.assertFalse(acquired_second)
+
+
+class RunHourlyUpdateReportTests(unittest.TestCase):
+    def _patched_run(self, tmpdir: str) -> dict:
+        """Run with every step shimmed to a fast return so we exercise the
+        report-writer + exit-code branches without touching the network."""
+        patches = [
+            patch.object(hourly_update, "_run_preflight",
+                         return_value={"playwright_available": True,
+                                       "chrome": {"ok": True}}),
+            patch.object(hourly_update, "_run_web_text",
+                         return_value={"urls": 3, "fetched": 3}),
+            patch.object(hourly_update, "_run_browser_prop_parser",
+                         return_value={"snapshots_parsed": 2}),
+            patch.object(hourly_update, "_run_team_line_parser",
+                         return_value={"snapshots_parsed": 1}),
+            patch.object(hourly_update, "_run_game_log_refresh",
+                         return_value={"players_refreshed": 5, "failures": []}),
+            patch.object(hourly_update, "_run_players_table_sync",
+                         return_value={"upserted": 530, "attempted": 530,
+                                       "patched_from_game_logs": 1}),
+            patch.object(hourly_update, "_run_reverse_engineering",
+                         return_value={"updated": 12}),
+            patch.object(hourly_update, "_run_outcome_settlement",
+                         return_value={"settled": 0, "pending": 4}),
+            patch.object(hourly_update, "_run_prediction_recompute",
+                         return_value={"scored": 7}),
+        ]
+        for p in patches:
+            p.start()
+        try:
+            return hourly_update.run_hourly_update(
+                report_dir=tmpdir,
+                require_playwright=False,
+            )
+        finally:
+            for p in patches:
+                p.stop()
+
+    def test_full_run_writes_report_with_all_steps(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report = self._patched_run(tmp)
+            self.assertTrue(report["ok"])
+            self.assertEqual(report["exit_code"], hourly_update.EXIT_OK)
+            self.assertEqual(report["failed_steps"], [])
+            for step in (
+                "preflight", "web_text", "browser_prop_parser",
+                "team_line_parser", "game_log_refresh",
+                "players_table_sync",
+                "reverse_engineering", "outcome_settlement",
+                "prediction_recompute",
+            ):
+                self.assertIn(step, report["steps"])
+                self.assertTrue(report["steps"][step]["ok"], f"step {step}")
+            self.assertTrue(report["report_path"].endswith(".json"))
+            saved = json.loads(Path(report["report_path"]).read_text())
+            self.assertTrue(saved["ok"])
+
+    def test_preflight_failure_short_circuits_with_exit_78(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            hourly_update, "_run_preflight",
+            side_effect=RuntimeError("chrome down"),
+        ):
+            report = hourly_update.run_hourly_update(
+                report_dir=tmp, require_playwright=False,
+            )
+        self.assertFalse(report["ok"])
+        self.assertEqual(report["exit_code"], hourly_update.EXIT_PREFLIGHT_FAILED)
+        self.assertIn("preflight", report["failed_steps"])
+        # No downstream step should have been recorded — preflight blocks the rest.
+        for step in ("web_text", "browser_prop_parser", "team_line_parser"):
+            self.assertNotIn(step, report["steps"])
+
+    def test_step_failure_records_traceback_and_exits_1(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            patches = [
+                patch.object(hourly_update, "_run_preflight",
+                             return_value={"playwright_available": True,
+                                           "chrome": {"ok": True}}),
+                patch.object(hourly_update, "_run_web_text",
+                             side_effect=RuntimeError("network blew up")),
+                patch.object(hourly_update, "_run_browser_prop_parser",
+                             return_value={"snapshots_parsed": 0}),
+                patch.object(hourly_update, "_run_team_line_parser",
+                             return_value={"snapshots_parsed": 0}),
+                patch.object(hourly_update, "_run_game_log_refresh",
+                             return_value={"players_refreshed": 0, "failures": []}),
+                patch.object(hourly_update, "_run_players_table_sync",
+                             return_value={"upserted": 0, "attempted": 0,
+                                           "patched_from_game_logs": 0}),
+                patch.object(hourly_update, "_run_reverse_engineering",
+                             return_value={"updated": 0}),
+                patch.object(hourly_update, "_run_outcome_settlement",
+                             return_value={"settled": 0}),
+                patch.object(hourly_update, "_run_prediction_recompute",
+                             return_value={"scored": 0}),
+            ]
+            for p in patches:
+                p.start()
+            try:
+                report = hourly_update.run_hourly_update(
+                    report_dir=tmp, require_playwright=False,
+                )
+            finally:
+                for p in patches:
+                    p.stop()
+        self.assertFalse(report["ok"])
+        self.assertEqual(report["exit_code"], hourly_update.EXIT_STEP_FAILED)
+        self.assertEqual(report["failed_steps"], ["web_text"])
+        self.assertIn("traceback", report["steps"]["web_text"])
+
+
+if __name__ == "__main__":
+    unittest.main()

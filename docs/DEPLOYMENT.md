@@ -254,3 +254,216 @@ and `~50 MB` for the webhook. Volume mounts:
 The matrix is enforced in `nba_model/web/auth.py` (`PREVIEW_PLAYERS`,
 `PREVIEW_TEAMS`, `PREVIEW_STATS`, `PREVIEW_MAX_GAMES`). Adjust there if you
 change the policy.
+
+## 9. Web app views (parity with the desktop UI)
+
+The Streamlit app at `nba_model/web/app.py` exposes the following view modes,
+selectable from the sidebar `View mode` radio:
+
+| View mode               | What it does                                       | Gating |
+|-------------------------|----------------------------------------------------|--------|
+| Player charts           | Per-player distribution + recent games + splits + hit-rate + custom-line probe | Free preview (Jokic/LeBron + points) / Premium full |
+| Team charts             | Per-team aggregate distributions, per-stat overview | Free preview (LAL/DEN) / Premium full |
+| Compare players         | Overlay 2–3 players' distributions for one stat   | Free / Premium |
+| All stats (overview)    | One page, every stat for a selected player        | Premium |
+| Single prop (model)     | Calls `run_single_prop` — same model the desktop "Single Prop" tab uses | Premium |
+| Parlay analysis         | Cross-compare model + chart-data + historical for single + multi-leg | Premium |
+| Manual lines import     | Paste board / CSV / pipe rows, parse, optionally save to DB | Read free; **DB save = admin** |
+| Game Results            | Recent NBA games + scores                          | Free / Premium |
+| Player Stats Browse     | Searchable league-wide player game logs           | Free / Premium |
+| Operations (admin)      | Subprocess launcher for ETL / scrapers / evaluation / DB audit | **Admin-only** |
+
+The fitted-distribution selector reads `simulation.SUPPORTED_DISTRIBUTIONS`
+plus `negative_binomial`, so when the model team adds a family there it
+appears in the UI automatically without a code change in `app.py`.
+
+### Line-display chart upgrades
+
+All web charts now render via Plotly (no `st.pyplot(...)` calls remain in
+the NBA views), so zoom / hover / legend-toggle work everywhere. The
+distribution figure has two layouts selectable from the sidebar:
+
+- **Distribution view** (default) — histogram + per-stat fitted overlays +
+  per-book vertical markers with a top-rail of triangles labeled with each
+  book's three-letter tag. The best-EV-over and best-EV-under markers get
+  a thick gold-bordered star so line-shopping is obvious at a glance.
+- **Line ladder** — compact one-row-per-book layout sorted by line value,
+  with delta-vs-consensus shown on hover. Recommended whenever 6+ books are
+  posting a line; verticals start to overlap in the distribution view.
+
+A bonus `plotly_charts.build_line_movement_figure(snapshots_df, stat_type)`
+draws a line-movement timeline from `betting_line_snapshots` rows — wire it
+into a custom view if your deploy is populating that table.
+
+## 10. Admin Operations console
+
+The desktop "Operations" tab is mirrored as a Streamlit view at
+`Operations (admin)`. It lives in `nba_model/web/operations_panel.py` and
+provides forms + Run buttons for:
+
+- **Daily ETL** (`nba_model.data.daily_etl`)
+- **Web-text session validate / fetch / sync active players**
+- **Browser prop parser**
+- **Evaluation:** real-data benchmark, distribution sweep, line comparison,
+  monthly diagnostics
+- **Market reverse-engineering**
+- **DB audit**
+
+Each form translates field values into argv (no shell expansion ever, by
+design — see `test_operations_panel.py::test_shell_metacharacters_pass_through_as_literal_arg`)
+and streams stdout/stderr into a live transcript box.
+
+### Hard gating
+
+`Operations (admin)` is **admin-only at all times**, including in
+open-access mode (`BILLING_ENABLED=0`). The gate at the top of `is_operations`
+in `app.py` returns immediately unless `web_auth.is_admin()` is true, which
+requires:
+
+1. A logged-in OIDC session (so `BILLING_ENABLED=1` *plus* a Google /
+   Microsoft sign-in), AND
+2. The signed-in email listed in `[auth.admins]` of `.streamlit/secrets.toml`.
+
+If no admins are configured, the view simply doesn't appear and the
+deep-link `?view=Operations+(admin)` is blocked at the gate.
+
+### Caveats
+
+- Scraping operations (Validate Web Session, Fetch URL, Browser Parser)
+  require a real Chrome on `:9222` on the **same host running Streamlit**.
+  Streamlit Community Cloud cannot satisfy this — run from a self-host
+  / docker-compose deploy.
+- The Docker image runs as a non-root user (`app`) with no Chrome installed;
+  Operations that need Chromium will fail with a clear error in the
+  transcript box rather than corrupting the DB.
+
+## 11. Open-access vs billing modes
+
+The launch default is **open-access**: `BILLING_ENABLED` unset (or `0`).
+Every visitor is treated as Premium, no OIDC sign-in is required, the
+sidebar user-card stays hidden, and the Free/Premium gating helpers in
+`auth.py` short-circuit to "premium".
+
+To flip back to billing mode:
+
+```bash
+BILLING_ENABLED=1 docker compose --profile billing up streamlit webhook
+```
+
+When `BILLING_ENABLED=1`:
+
+- OIDC sign-in is required for all premium features.
+- Stripe Checkout / webhook flow drives `subscriptions.db`.
+- Admin overrides from `[auth.admins]` continue to work (this is how
+  developers get full access without paying themselves).
+
+### Important: what changes vs what doesn't
+
+The `Operations (admin)` and Manual-Lines DB-save surfaces are admin-gated
+**regardless of mode**. Open-access does NOT relax these — the worst-case
+trust model for an open URL is "anonymous internet visitor," and the
+Operations console launches arbitrary subprocesses (and Manual Lines
+writes into the shared `betting_lines` table) which is never something we
+want anonymous visitors doing.
+
+## 12. Manual lines import (DB writes)
+
+The web "Manual lines import" view lets anyone preview the parser output
+without authentication (good for sanity-checking a scraped board), but the
+**Save to DB** button is admin-only — the public must not be able to
+poison the shared `betting_lines` table.
+
+Records also pass through `nba_model.web.input_validation.is_plausible_betting_line`
+before being accepted; rows that fail the per-stat range check are dropped
+with a visible "dropped by validator" expander and never written.
+
+Parsing logic lives in `nba_model.model.manual_lines` and is reused by both
+the desktop Tk UI and the Streamlit view, so the two paths can't drift.
+
+## 13. Subscription store backend (SQLite vs Postgres)
+
+`nba_model/web/subscriptions.py` now picks its backend from the environment:
+
+| `SUBSCRIPTIONS_DB_URL`             | Backend  | When to use                    |
+|------------------------------------|----------|--------------------------------|
+| _unset_ or non-URL path            | SQLite   | local dev, self-host with disk |
+| `postgres://…` / `postgresql://…`  | Postgres | Streamlit Cloud / Render       |
+
+The public API (`tier_for` / `upsert` / `record_stripe_event` / `lookup`)
+is identical across both backends, so `webhook_app.py` and `auth.py` don't
+need to change.
+
+**Hosted Postgres setup (Render / Neon / Supabase / RDS):**
+
+```bash
+# 1. Install the driver in the deploy image:
+pip install 'psycopg[binary]>=3.1'
+
+# 2. Set the DSN on the deployed service (Streamlit Cloud → Secrets,
+#    Render → Environment, etc.). Example DSNs:
+SUBSCRIPTIONS_DB_URL=postgresql://user:pw@db.example.com:5432/subs?sslmode=require
+
+# 3. First deploy auto-creates the user_subscriptions / stripe_events
+#    tables (same idempotent CREATE-IF-NOT-EXISTS path the SQLite backend
+#    uses on every connect).
+
+# 4. Sanity-check from the deploy shell:
+python3 -c "from nba_model.web import subscriptions; print(subscriptions.selected_backend())"
+# expected: postgres
+```
+
+Postgres session GUCs mirror the SQLite WAL/busy_timeout tuning:
+`statement_timeout=5s`, `lock_timeout=5s`,
+`idle_in_transaction_session_timeout=30s`. These keep a runaway webhook
+from holding row locks long enough to wedge concurrent reads from
+Streamlit.
+
+## 14. Data delivery (hourly host → cloud)
+
+This subsection coordinates the `nba_data.db` delivery between the
+always-on hourly ETL host (the dev Mac running
+`scripts/scheduler/hourly_update.sh`) and any read-only cloud deploy.
+
+**Constraint:** Streamlit Community Cloud and Render's free tiers both have
+ephemeral disks. Any file the app writes is wiped at the next redeploy —
+which is unacceptable for the analytics DB the scraping host populates
+hour by hour. So the hourly host has to own writes; the cloud surface
+needs to receive a fresh read-only snapshot.
+
+**Implemented option (simplest reliable):** git-commit refreshed DB on
+every successful hourly run.
+
+Why this option:
+
+- Same trust boundary as the rest of the repo — no extra S3 credentials,
+  no extra IAM, no extra cost.
+- Streamlit Cloud already redeploys on push to `main`, so the cloud app
+  picks up the new DB on the same heartbeat as code.
+- The DB is currently ~60 MB; well inside Git LFS limits (or even raw
+  git, with a periodic `git gc`).
+- If we outgrow git, the next-simplest swap is object storage (S3 / R2)
+  with a startup hook that pulls the latest blob — the
+  `subscriptions.selected_backend()` pattern (env-selected DSN, lazy
+  driver import) is the model.
+
+Pieces:
+
+1. `scripts/scheduler/hourly_update.sh` does the work hour-by-hour;
+   the JSON report under `nba_model/data/artifacts/hourly/` flags whether
+   the run was clean enough to publish.
+2. Add a downstream "publish" hook (left as a follow-up; not on the
+   critical path for billing launch) that, on a clean run, does:
+   `git add data/database/nba_data.db && git commit -m "etl: hourly snapshot $(date -u +%FT%TZ)" && git push origin main`.
+3. Streamlit Cloud auto-redeploys on push; the app reads
+   `data/database/nba_data.db` at startup as today.
+
+**Alternative (object storage):** if commit churn becomes a problem,
+swap step 2 for `aws s3 cp data/database/nba_data.db s3://…/latest.db`
+and add a `STARTUP_HOOK` that pulls the latest object before the
+Streamlit app boots. Same env-selection pattern as `SUBSCRIPTIONS_DB_URL`
+will keep the code paths clean.
+
+> Coordination note for Agent B: this `## 14. Data delivery` subsection
+> is owned by Agent A. The Streamlit "Manual Lines Import" view and any
+> billing-flow docs you add should go under their own headings (e.g.
+> `## 15. Manual lines view (web)`) to avoid edit collisions.

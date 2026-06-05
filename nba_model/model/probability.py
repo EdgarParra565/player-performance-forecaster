@@ -1,7 +1,17 @@
 """Distribution-based over-probability calculations for NBA prop modeling."""
 
 import numpy as np
-from scipy.stats import binom, expon, lognorm, norm, pareto, poisson, t, uniform
+from scipy.stats import (
+    binom,
+    expon,
+    lognorm,
+    nbinom,
+    norm,
+    pareto,
+    poisson,
+    t,
+    uniform,
+)
 
 
 def prob_over(line: float, mu: float, sigma: float) -> float:
@@ -28,6 +38,7 @@ def prob_over_distribution(
       - normal
       - student_t
       - binomial
+      - negative_binomial (overdispersed counts; var > mean)
       - poisson
       - exponential
       - uniform
@@ -63,6 +74,19 @@ def prob_over_distribution(
         n_trials = int(np.clip(np.ceil(mean / p), 1, 5000))
         k = int(np.floor(x))
         return float(1.0 - binom.cdf(k, n=n_trials, p=p))
+
+    if dist in {"negative_binomial", "negativebinomial", "neg_binomial", "nbinom", "negbin"}:
+        if mean <= 1e-9:
+            return float(1.0 if x < 0 else 0.0)
+        variance = max(std * std, 1e-6)
+        if variance <= mean * 1.0001:
+            # No overdispersion — fall back to Poisson for stability.
+            k = int(np.floor(x))
+            return float(1.0 - poisson.cdf(k, mu=mean))
+        p = float(np.clip(mean / variance, 1e-4, 0.999))
+        r = float(np.clip(mean * p / max(1.0 - p, 1e-6), 1e-3, 1e6))
+        k = int(np.floor(x))
+        return float(1.0 - nbinom.cdf(k, n=r, p=p))
 
     if dist == "exponential":
         scale = std
@@ -102,5 +126,6 @@ def prob_over_distribution(
 
     raise ValueError(
         f"Unsupported distribution '{distribution}'. "
-        "Supported: normal, student_t, binomial, poisson, exponential, uniform, lognormal, power_law."
+        "Supported: normal, student_t, binomial, negative_binomial, poisson, "
+        "exponential, uniform, lognormal, power_law."
     )

@@ -1,0 +1,69 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+    launchd plist for the hourly NBA ETL runner.
+
+    Install (per-user, no sudo needed):
+
+        cp scripts/scheduler/com.nba.hourly.plist ~/Library/LaunchAgents/
+        # Edit ~/Library/LaunchAgents/com.nba.hourly.plist and replace the
+        # ABSOLUTE_PATH_TO_REPO placeholders below with `pwd` of this checkout.
+        launchctl unload -w ~/Library/LaunchAgents/com.nba.hourly.plist 2>/dev/null
+        launchctl load   -w ~/Library/LaunchAgents/com.nba.hourly.plist
+
+    Inspect:
+
+        launchctl list | grep com.nba.hourly
+        tail -f nba_model/data/logs/hourly_update_*.log
+
+    Stop:
+
+        launchctl unload -w ~/Library/LaunchAgents/com.nba.hourly.plist
+
+    Cron equivalent (if you prefer crontab over launchd):
+
+        0 * * * * /ABSOLUTE_PATH_TO_REPO/scripts/scheduler/hourly_update.sh \
+            >> /ABSOLUTE_PATH_TO_REPO/nba_model/data/logs/cron.log 2>&1
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.nba.hourly</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/ABSOLUTE_PATH_TO_REPO/scripts/scheduler/hourly_update.sh</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/ABSOLUTE_PATH_TO_REPO</string>
+
+    <!-- Fire every 3600s. Idempotent — the runner takes an fcntl lock and
+         the second invocation exits 75 (EX_TEMPFAIL) if a previous run is
+         still in flight. -->
+    <key>StartInterval</key>
+    <integer>3600</integer>
+
+    <!-- Fire once at load so we don't wait an hour for the first tick. -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Don't auto-restart on non-zero exit. The runner already retries
+         transient failures internally; restart loops just spam Chrome. -->
+    <key>KeepAlive</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>/ABSOLUTE_PATH_TO_REPO/nba_model/data/logs/launchd_stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/ABSOLUTE_PATH_TO_REPO/nba_model/data/logs/launchd_stderr.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>CHROME_PORT</key>
+        <string>9222</string>
+    </dict>
+</dict>
+</plist>

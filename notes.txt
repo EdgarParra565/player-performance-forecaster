@@ -1,6 +1,6 @@
 # NBA Player Performance Forecaster - Working Notes
 
-Last updated: 2026-06-01
+Last updated: 2026-06-04
 
 This file is the active project tracker. It keeps only:
 - current architecture
@@ -1147,5 +1147,231 @@ RESOURCES & REFERENCES
 - Sharpe ratio for risk-adjusted returns
 
 ================================================================================
+2026-06-04 - WEB APP FEATURE PARITY + LINE-DISPLAY UPGRADE (Agent B)
+================================================================================
+
+Brought the Streamlit web app to full feature parity with the desktop
+simple_ui, then polished the line-display surface. Net: 289 passing tests
+(was 239), no static matplotlib remaining in the NBA web views, and the
+distribution chart now highlights the best-EV side at a glance.
+
+What's new in the web app (`nba_model/web/app.py`):
+
+  - **Single prop (model)** view — full tuning surface mirroring the desktop
+    Single Prop tab. All numeric inputs validated through
+    `input_validation.py`. Distribution selector reads
+    `simulation.SUPPORTED_DISTRIBUTIONS` dynamically.
+
+  - **Manual lines import** view — paste board / CSV / pipe / tab text,
+    preview parsed records with adversarial-line filtering, and (admin
+    only) save into `betting_lines`. The Save button is hard-gated to
+    `web_auth.is_admin()` so the public can't poison the shared table.
+    Parsing logic now lives in `nba_model/model/manual_lines.py` (shared
+    with the desktop UI; simple_ui delegates to the new module).
+
+  - **Operations (admin)** view — subprocess launcher for all CLI pipelines
+    (Daily ETL, Web-Text, Browser Parser, Evaluation suite, Reverse-
+    Engineering, DB Audit). Output streams live. Implementation lives in
+    `nba_model/web/operations_panel.py`. Admin-only **regardless of
+    BILLING_ENABLED** — open-access mode does NOT relax this gate, since
+    Operations launches subprocesses on the host.
+
+  - **Distribution selector** in the sidebar is now a multiselect sourced
+    from `simulation.SUPPORTED_DISTRIBUTIONS` plus `negative_binomial`, so
+    it tracks the model team's vocabulary without code changes.
+
+Line-display chart upgrade (`nba_model/visualization/plotly_charts.py`):
+
+  - Polished the distribution figure: best-EV-over and best-EV-under book
+    markers get a thick gold-bordered star, a top-rail of triangles with
+    each book's 3-letter tag declutters the labels, and hover shows
+    delta-vs-consensus + P(over) + EV-over + EV-under per book.
+
+  - Added a "Line ladder" toggle in the sidebar — compact one-row-per-book
+    layout sorted by line value, with the consensus line drawn as a
+    vertical reference and per-book deltas as colored connectors. Much
+    easier to read than 6+ overlapping verticals.
+
+  - Migrated the remaining matplotlib chart calls in the web app to
+    Plotly: `build_recent_games_figure`, `build_hit_rate_figure`,
+    `build_splits_figure`, and `build_multi_player_distribution_figure`.
+    Desktop Tk path still uses the matplotlib builders in
+    `player_charts.py` (unchanged — the Tk canvas needs Figure objects).
+
+  - Bonus: `build_line_movement_figure(snapshots_df, stat_type)` draws a
+    line-movement timeline from `betting_line_snapshots` rows. Not wired
+    into a UI surface yet but ready to drop into a custom view.
+
+Security:
+
+  - Operations view gate is `if not web_auth.is_admin(): return` regardless
+    of BILLING_ENABLED. The sidebar option also only renders for admins.
+  - Manual-lines DB save is admin-gated AND every record passes through
+    `iv.is_plausible_betting_line` before insertion; failed records are
+    dropped with a visible expander and never written.
+  - Single Prop view validates every numeric input (line, odds, n_games,
+    rolling, spread, def-rating bounds) before calling `run_single_prop`.
+  - Operations panel builds argv as a list (no shell), and a test verifies
+    shell metacharacters in field values pass through as literal args.
+
+Tests:
+
+  - `nba_model/tests/test_manual_lines.py` (Agent A) — 38 tests on the
+    shared parser + the new `persist_manual_lines_records` writer.
+  - `nba_model/tests/test_operations_panel.py` (new) — argv construction,
+    spaced/positional/bare-flag handling, shell-metachar safety, registry
+    shape sanity.
+  - `nba_model/tests/test_plotly_charts.py` (new) — smoke + behavior
+    tests for every new Plotly builder (distribution / ladder / recent /
+    hit-rate / splits / multi-player / line-movement), with the line
+    ladder covering the 6+-book readability requirement.
+
+Deployment:
+
+  - Docker image: no new dependencies; `plotly` was already in
+    `requirements.txt`. `docker compose up streamlit` boots the app
+    cleanly on :8501 with all new views, open-access mode (BILLING_ENABLED
+    unset). `BILLING_ENABLED=1` re-engages OIDC + Stripe paywalls
+    unchanged.
+  - `docs/DEPLOYMENT.md` got a new section (#9-12) documenting the view
+    matrix, line-display layouts, admin Operations console, open-access
+    vs billing modes, and the Manual Lines admin gate. Left intentional
+    room after section 12 for Agent A's "Data delivery (hourly host →
+    cloud)" follow-up — do not clobber.
+  - README updated to document the new view modes and the "no static
+    matplotlib in web views" / best-EV-highlight / line-ladder upgrades.
+
+Files added:
+
+  - nba_model/model/manual_lines.py             (shared parser)
+  - nba_model/web/operations_panel.py            (admin subprocess UI)
+  - nba_model/tests/test_operations_panel.py
+  - nba_model/tests/test_plotly_charts.py
+
+Files modified:
+
+  - nba_model/web/app.py                         (3 new views, plotly migration, dist selector)
+  - nba_model/visualization/plotly_charts.py     (best-EV, ladder, all new builders)
+  - nba_model/simple_ui.py                       (delegates parser to shared module)
+  - docs/DEPLOYMENT.md                            (sections 9-12)
+  - README.md                                     (web view matrix)
+
+Test count: 239 → 289 passing.
+
+================================================================================
 END OF NOTES
 ================================================================================
+
+---
+
+## 2026-06-04 — Agent A end-of-day (5 workstreams)
+
+Test count: 239 -> 312 (+73 new tests). Full suite passing.
+
+### WS1: distributions end-to-end
+- `negative_binomial` added to `SUPPORTED_DISTRIBUTIONS` (method-of-moments,
+  Poisson fallback when var <= mean). Same family added to `prob_over_distribution`
+  + aliases (`nbinom`, `negbin`). Chart-overlay vocabulary now matches the model
+  vocabulary (both reconcile via `normalize_distribution_name`).
+- Ran the full sweep: `python3 -m nba_model.evaluation.run_distribution_sweep
+  --windows 5 7 10 15 --stat-types points assists rebounds pra
+  --start-date 2024-11-01 --end-date 2025-03-15` →
+  `nba_model/evaluation/artifacts/distribution_sweep_2026-06-04_*`.
+- New defaults in `DEFAULT_DISTRIBUTION_BY_STAT`:
+  - `points: normal` — sweep inconclusive (every distribution that placed bets
+    posted negative ROI; normal/student_t/uniform produced 0 bets because the
+    sweep's `line = mean` default makes symmetric families degenerate at the
+    0.55-edge filter)
+  - `assists: normal` — sweep inconclusive
+  - `rebounds: poisson` — only family with positive avg_roi (+8.78%, n=482 bets)
+  - `pra: normal` — sweep inconclusive
+  - README "Production defaults" section + inline `simulation.py` comment both
+    document the methodology caveat: market-line coverage in `betting_lines`
+    only spans 2026-03-14..2026-03-15, so `--use-market-lines` can't run over
+    the full sweep window yet. Re-run when market backfill lands.
+- `get_default_distribution` is already wired through `prop_board.py`; new
+  parametrized test in `test_distribution_end_to_end.py` proves every supported
+  family round-trips through `run_single_prop`.
+
+### WS2: hourly scraping
+- `data/config/web_text_urls.txt` rewritten: dropped dead PrizePicks duplicate,
+  swapped `app.underdogfantasy.com` -> `underdogsports.com` (2026 rebrand),
+  added the other 7 active books — PrizePicks / Underdog / Pick6 / ParlayPlay
+  for props, BetMGM / Caesars / DraftKings / Bovada / Kalshi for team lines.
+- `nba_model/data/hourly_update.py` — Python pipeline runner. Preflight on
+  Chrome :9222 + Playwright import; on failure, exit 78 (EX_CONFIG) so launchd
+  surfaces it instead of looping. Lockfile via fcntl: overlapping runs exit 75
+  (EX_TEMPFAIL), launchd just retries next hour. Steps: web_text -> browser
+  prop parser -> team-line parser -> game-log refresh -> players_table_sync
+  -> reverse_engineering -> outcome_settlement -> prediction_recompute (today's
+  betting_lines re-scored against the live model). Per-run JSON report under
+  `nba_model/data/artifacts/hourly/`.
+- `scripts/scheduler/hourly_update.sh` — shell wrapper that re-execs
+  `.venv/bin/python3 -m nba_model.data.hourly_update` after curl-pinging
+  Chrome on :9222.
+- `scripts/scheduler/com.nba.hourly.plist` — launchd plist (StartInterval=3600,
+  RunAtLoad=true, KeepAlive=false). README has copy-paste install + cron
+  fallback.
+- Playwright guard added to `daily_etl.py`: when a browser fetch is requested
+  but Playwright isn't importable, abort with an actionable message instead of
+  retrying every URL.
+- CDP auto-reconnect: `_fetch_url_text_with_browser` now retries once with a
+  Chrome-CDP preflight after a disconnect-style error, then fails loud.
+- Public helper `playwright_is_available()` + `check_chrome_cdp_reachable()`
+  exposed from `web_text_ingestion.py`.
+
+### WS3: ETL hardening
+- `audit_db --stdout` flagged 3 NULL `players.team` rows + missing prediction
+  coverage for fg/3pm. Extended `DatabaseManager.sync_players_table` with a
+  second pass that derives team from the most-recent `game_logs.matchup` for
+  any player still missing it after the active-ref upsert. Down from 3 NULL
+  to 2 — remaining two (Thomas Sorber, Alex Toohey) are draftees with zero
+  game logs yet, nothing to derive from.
+- `players_table_sync` step added to the hourly runner so the gap stays closed.
+- The hourly `prediction_recompute` step re-scores every `betting_lines` row
+  dated today against the latest model — model is genuinely "updated every
+  hour."
+
+### WS4: shared manual_lines module (handshake for Agent B)
+- `nba_model/model/manual_lines.py` already existed and is already imported by
+  `simple_ui.py`. Added a public `persist_manual_lines_records(records, db=None)`
+  helper that wraps `DatabaseManager.insert_betting_lines_records` so the
+  Streamlit view can persist with one call.
+- 24 new unit tests covering pipe / csv / tab rows, explicit-date rows, board
+  dumps (with goblin/demon stripping + noise filtering + dedupe), mixed input,
+  bad input, and the persist wrapper.
+- Public API is stable: `parse_manual_lines_text(text, default_game_date,
+  default_book) -> (records, errors)`. Safe for Agent B to depend on.
+
+### WS5: Postgres subscriptions + DB delivery
+- `nba_model/web/subscriptions.py` refactored into a backend dispatcher.
+  Env-selected: `SUBSCRIPTIONS_DB_URL=postgres://...` -> Postgres (lazy
+  `psycopg` import + clear RuntimeError if missing); anything else falls
+  through to the existing SQLite path. Public API (`tier_for`/`upsert`/
+  `record_stripe_event`/`lookup`) is unchanged so `webhook_app.py` and
+  `auth.py` don't need edits. Postgres session GUCs mirror the SQLite
+  WAL/busy_timeout tuning: `statement_timeout=5s`, `lock_timeout=5s`,
+  `idle_in_transaction_session_timeout=30s`. Email validation runs before
+  backend dispatch so garbage never hits the network.
+- 14 new tests covering env dispatch, override dispatch, the missing-driver
+  error, the Postgres CRUD shape (with `psycopg` stubbed), and the
+  email-validation pre-gate.
+- `docs/DEPLOYMENT.md` extended with `## 13. Subscription store backend
+  (SQLite vs Postgres)` (env-driven setup, hosted-Postgres DSN, sanity-check
+  one-liner) and `## 14. Data delivery (hourly host -> cloud)` documenting
+  the git-commit refreshed-DB approach (simplest reliable; object-storage
+  alternative noted). Section 14 has an Agent B coordination note so the
+  Streamlit manual-lines view lands under a new `## 15` heading without
+  collision.
+
+### Open items (not on Agent A critical path)
+- Activate 2-3 stub scrapers (fanduel / betrivers / espnbet) following
+  `betmgm.py` / `pick6.py` template. Not done — gated on capturing
+  authenticated NBA-board snapshots first.
+- Implement the actual `git add / commit / push` post-hook for nightly DB
+  publish. Documented in `docs/DEPLOYMENT.md §14` as a follow-up; not
+  blocking billing launch.
+- Backtest harness bug: with `line = mean` default, symmetric distributions
+  produce zero bets. The proper fix is to require `--use-market-lines` or
+  set a fixed `--line`; that's a sweep-methodology cleanup once market-line
+  coverage is backfilled.

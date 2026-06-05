@@ -643,11 +643,22 @@ class DailyETLTests(unittest.TestCase):
         self.assertEqual(report["steps"]["browser_parser"]["status"], "partial_success")
         self.assertEqual(report["status"], "partial_success")
 
+    @patch("nba_model.model.web_text_ingestion.playwright_is_available",
+           return_value=True)
     @patch("nba_model.data.daily_etl.fetch_and_store_web_text")
     def test_run_daily_etl_passes_browser_session_flags_to_web_text_step(
         self,
         mock_fetch_web_text,
+        _mock_pw_available,
     ):
+        # The Playwright preflight guard in daily_etl trips whenever a
+        # browser fetch is requested (auth-state / user-data-dir / CDP port)
+        # and the interpreter lacks the `playwright` package. That's correct
+        # production behavior but it makes this test environment-dependent
+        # (passes in venv, fails in Docker which intentionally skips
+        # Playwright). Mock the preflight as available so we exercise the
+        # kwarg-forwarding contract regardless of the host's Playwright
+        # state. The negative branch is covered by PlaywrightGuardTests.
         mock_fetch_web_text.return_value = {
             "status": "success",
             "fetched_count": 1,
@@ -678,6 +689,36 @@ class DailyETLTests(unittest.TestCase):
             kwargs.get("browser_user_data_dir"),
             "data/config/auth/underdog_profile",
         )
+
+
+class PlaywrightGuardTests(unittest.TestCase):
+    """The daily ETL must abort with an actionable error when the caller
+    requested a browser fetch (auth-state / user-data-dir / CDP port) but
+    Playwright isn't importable in the interpreter — otherwise every URL
+    re-runs the same broken import on each retry."""
+
+    @patch("nba_model.data.daily_etl.fetch_and_store_betting_lines")
+    @patch("nba_model.model.web_text_ingestion.playwright_is_available",
+           return_value=False)
+    def test_chrome_debug_port_without_playwright_aborts(
+        self, _mock_pw_available, _mock_odds,
+    ):
+        with self.assertRaises(RuntimeError) as ctx:
+            run_daily_etl(
+                players=["LeBron James"],
+                include_db_players=False,
+                skip_game_logs=True,
+                skip_team_defense=True,
+                skip_odds=True,
+                skip_browser_parser=True,
+                skip_reverse_engineering=True,
+                web_text_urls=["https://example.com/props"],
+                chrome_debug_port=9222,
+                retries=0,
+                write_report=False,
+            )
+        self.assertIn("Playwright", str(ctx.exception))
+        self.assertIn(".venv/bin/python3", str(ctx.exception))
 
 
 if __name__ == "__main__":

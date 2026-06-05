@@ -6,24 +6,50 @@ import numpy as np
 
 # -----------------------------------------------------------------------------
 # Production defaults by stat type (from distribution_sweep review).
-# Update after running:
-#   python3 -m nba_model.evaluation.run_distribution_sweep \
-#     --windows 5 7 10 15 --stat-types points assists rebounds pra \
-#     --start-date 2024-11-01 --end-date 2025-03-15
-# and choosing best distribution per stat (e.g. by avg_roi or significance).
-# See README "Production defaults (from benchmarks)".
+#
+# 2026-06-04 sweep summary
+#   command: python3 -m nba_model.evaluation.run_distribution_sweep \
+#              --windows 5 7 10 15 --stat-types points assists rebounds pra \
+#              --start-date 2024-11-01 --end-date 2025-03-15
+#   artifacts: nba_model/evaluation/artifacts/distribution_sweep_2026-06-04_*
+#
+#   Methodology caveat: the sweep's default "line = expected_value" makes
+#   symmetric distributions (normal / student_t / uniform) degenerate —
+#   prob_over evaluates to ~0.5 at the mean and the 0.55-edge bet filter
+#   rejects every wager, producing 0 bets for those families. Asymmetric
+#   distributions (poisson, NB, exponential, lognormal, power_law) do produce
+#   bets and so dominate the avg_roi ranking by default; this is a property
+#   of the backtest harness, not a claim that they fit player props better
+#   than normal in production. Market-line coverage in the DB
+#   (`betting_lines`) only spans 2026-03-14..2026-03-15, so --use-market-lines
+#   over the full sweep window is not yet possible.
+#
+#   What the data *does* support:
+#     - rebounds: poisson gave the only positive avg_roi (+8.78%, n=482
+#       bets, p=0.96 vs breakeven — directionally positive, not significant).
+#       Picking poisson here also aligns with the chart-overlay vocabulary
+#       (poisson is one of the three families surfaced for counts).
+#     - assists / points / pra: every distribution that placed bets posted
+#       a negative avg_roi. Evidence is too noisy to switch from normal.
+#       Keep "normal" for these three stats and revisit once full-season
+#       market-line coverage is backfilled.
+#
+# Update procedure: re-run the sweep, then update this dict + the README
+# "Production defaults" section together. See README §"Production defaults
+# (from benchmarks)".
 # -----------------------------------------------------------------------------
 DEFAULT_DISTRIBUTION_BY_STAT = {
-    "points": "normal",
-    "assists": "normal",
-    "rebounds": "normal",
-    "pra": "normal",
+    "points": "normal",      # sweep inconclusive (all negative ROI); keep baseline
+    "assists": "normal",     # sweep inconclusive; keep baseline
+    "rebounds": "poisson",   # only family with positive avg_roi in 2026-06-04 sweep
+    "pra": "normal",         # sweep inconclusive; keep baseline
 }
 
 SUPPORTED_DISTRIBUTIONS = [
     "normal",
     "student_t",
     "binomial",
+    "negative_binomial",
     "poisson",
     "exponential",
     "uniform",
@@ -40,6 +66,11 @@ _DISTRIBUTION_ALIASES = {
     "t_distribution": "student_t",
     "binomial": "binomial",
     "bernoulli_trials": "binomial",
+    "negative_binomial": "negative_binomial",
+    "negativebinomial": "negative_binomial",
+    "neg_binomial": "negative_binomial",
+    "nbinom": "negative_binomial",
+    "negbin": "negative_binomial",
     "poisson": "poisson",
     "exponential": "exponential",
     "uniform": "uniform",
@@ -106,6 +137,21 @@ def _draw_samples(
         p = float(np.clip(1.0 - (variance / mean), 1e-4, 0.999))
         n_trials = int(np.clip(np.ceil(mean / p), 1, 5000))
         return rng.binomial(n=n_trials, p=p, size=n).astype(float)
+
+    if dist == "negative_binomial":
+        # Overdispersed count model: variance > mean.
+        # Method-of-moments: with mean mu, variance v, set p = mu / v
+        # and r = mu * p / (1 - p). If v <= mu (no overdispersion), fall
+        # back to Poisson so the sampler still produces sensible counts.
+        if mean <= 1e-9:
+            return np.zeros(n, dtype=float)
+        variance = max(std * std, 1e-6)
+        if variance <= mean * 1.0001:
+            return rng.poisson(lam=mean, size=n).astype(float)
+        p = float(np.clip(mean / variance, 1e-4, 0.999))
+        r = float(mean * p / max(1.0 - p, 1e-6))
+        r = float(np.clip(r, 1e-3, 1e6))
+        return rng.negative_binomial(n=r, p=p, size=n).astype(float)
 
     if dist == "exponential":
         scale = std
