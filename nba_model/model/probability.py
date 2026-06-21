@@ -19,7 +19,9 @@ def prob_over(line: float, mu: float, sigma: float) -> float:
     Closed-form probability of going over the line
     """
     if sigma <= 0:
-        return 0.0
+        # Degenerate distribution at mu: P(over) is 1 if mu>line, 0.5 at the
+        # line, else 0 — NOT a flat 0.0 (which would flip a sure over to 0%).
+        return 1.0 if mu > line else (0.5 if mu == line else 0.0)
 
     return 1 - norm.cdf(line, mu, sigma)
 

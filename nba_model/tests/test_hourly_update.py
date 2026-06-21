@@ -198,5 +198,55 @@ class RunHourlyUpdateReportTests(unittest.TestCase):
         self.assertIn("traceback", report["steps"]["web_text"])
 
 
+class PersistPredictionsTests(unittest.TestCase):
+    """_persist_predictions widens the predictions table and is idempotent."""
+
+    def _board_line(self, stat, line, mu):
+        from nba_model.model.prop_board import BoardLine
+        return BoardLine(
+            game_date="2025-04-01", team="LAL", player_name="LeBron James",
+            stat_type=stat, line_value=line, over_odds=-110, under_odds=-110,
+            mu=mu, sigma=5.0, distribution="normal", prob_over=0.55,
+            implied_over_prob=0.52, implied_under_prob=0.52,
+            ev_over=0.06, ev_under=-0.04,
+        )
+
+    def test_persists_multiple_stats_idempotently(self):
+        from nba_model.data.database.db_manager import DatabaseManager
+        from nba_model.data.hourly_update import _persist_predictions
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = os.path.join(tmp, "nba.db")
+            with DatabaseManager(db_path=db_path):
+                pass
+            lines = [
+                self._board_line("points", 25.5, 26.0),
+                self._board_line("assists", 7.5, 8.0),
+                self._board_line("rebounds", 7.5, 8.0),
+            ]
+            name_to_id = {"LeBron James": 2544}
+            n1 = _persist_predictions(db_path, lines, name_to_id, "2025-04-01")
+            self.assertEqual(n1, 3)
+            # Re-run (next hourly tick): still 3 rows total, not 6.
+            _persist_predictions(db_path, lines, name_to_id, "2025-04-01")
+            with DatabaseManager(db_path=db_path) as db:
+                total = db.conn.execute(
+                    "SELECT COUNT(*) FROM predictions").fetchone()[0]
+                stats = {r[0] for r in db.conn.execute(
+                    "SELECT DISTINCT stat_type FROM predictions").fetchall()}
+            self.assertEqual(total, 3)
+            self.assertEqual(stats, {"points", "assists", "rebounds"})
+
+    def test_skips_unknown_player(self):
+        from nba_model.data.database.db_manager import DatabaseManager
+        from nba_model.data.hourly_update import _persist_predictions
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = os.path.join(tmp, "nba.db")
+            with DatabaseManager(db_path=db_path):
+                pass
+            lines = [self._board_line("points", 25.5, 26.0)]
+            n = _persist_predictions(db_path, lines, {}, "2025-04-01")
+        self.assertEqual(n, 0)
+
+
 if __name__ == "__main__":
     unittest.main()

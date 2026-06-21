@@ -37,6 +37,35 @@ TIER_PREMIUM = "premium"
 _FLAG = os.environ.get("BILLING_ENABLED", "").strip().lower()
 BILLING_ENABLED: bool = _FLAG in {"1", "true", "yes", "on"}
 
+# Optional first-sign-in free trial. Off by default; flip with ENABLE_TRIAL=1.
+_TRIAL_FLAG = os.environ.get("ENABLE_TRIAL", "").strip().lower()
+TRIAL_ENABLED: bool = _TRIAL_FLAG in {"1", "true", "yes", "on"}
+TRIAL_DAYS: int = int(os.environ.get("TRIAL_DAYS", "7") or "7")
+
+
+def trial_active(created_at, now=None, trial_days: int = TRIAL_DAYS) -> bool:
+    """True if ``created_at`` (ISO ts of first sign-in) is within the trial.
+
+    Pure + testable. Wiring this into live tier resolution requires a
+    ``created_at`` (or ``trial_start``) timestamp on the subscription record —
+    the current ``user_subscriptions`` schema only has ``updated_at``, so add
+    that column (DEFAULT datetime('now')) before relying on this in production.
+    Returns False on missing / unparseable input so it always fails closed.
+    """
+    if not created_at:
+        return False
+    from datetime import datetime, timedelta, timezone
+    try:
+        start = datetime.fromisoformat(str(created_at).replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if start.tzinfo is None:
+        start = start.replace(tzinfo=timezone.utc)
+    now = now or datetime.now(timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    return now < start + timedelta(days=int(trial_days))
+
 # Players + teams a NOT-logged-in or free-tier user is allowed to view in
 # preview mode. Keep this short and high-profile so the app is still useful
 # as a teaser without giving away the marquee. Only used when BILLING_ENABLED.
@@ -184,6 +213,14 @@ def render_user_card(sidebar=True) -> None:
                     _checkout_url_for(user.email or ""),
                     use_container_width=True,
                 )
+            else:
+                portal_url = _portal_url_for(user.email or "")
+                if portal_url:
+                    container.link_button(
+                        "Manage subscription",
+                        portal_url,
+                        use_container_width=True,
+                    )
             if hasattr(st, "logout"):
                 container.button(
                     "Sign out", on_click=st.logout, key="logout_btn",
@@ -199,6 +236,12 @@ def _checkout_url_for(email: str) -> str:
     """Return the Stripe Checkout URL configured in secrets, with email pre-fill."""
     from nba_model.web import stripe_helpers
     return stripe_helpers.checkout_url(prefill_email=email)
+
+
+def _portal_url_for(email: str):
+    """Return a Stripe Customer Portal URL for a premium user, or None."""
+    from nba_model.web import stripe_helpers
+    return stripe_helpers.customer_portal_url(email=email)
 
 
 def paywall(feature: str, allow_preview: bool = True) -> None:

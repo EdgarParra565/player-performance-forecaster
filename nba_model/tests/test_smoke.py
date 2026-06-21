@@ -53,6 +53,12 @@ class ProbabilitySmokeTests(unittest.TestCase):
         self.assertGreater(prob_over(20.0, 22.0, 5.0), 0.5)
         self.assertLess(prob_over(20.0, 18.0, 5.0), 0.5)
 
+    def test_prob_over_degenerate_sigma(self):
+        # sigma <= 0 must NOT flatten a sure over to 0.0.
+        self.assertEqual(prob_over(20.0, 22.0, 0.0), 1.0)   # mu > line → over
+        self.assertEqual(prob_over(20.0, 18.0, 0.0), 0.0)   # mu < line → under
+        self.assertEqual(prob_over(20.0, 20.0, 0.0), 0.5)   # at the line
+
     def test_monte_carlo_over_supports_distribution_families(self):
         # SUPPORTED_DISTRIBUTIONS is the canonical model vocabulary — every
         # entry must produce a valid probability in [0, 1].

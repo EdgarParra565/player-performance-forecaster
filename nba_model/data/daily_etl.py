@@ -1153,6 +1153,11 @@ def run_daily_etl(
         "steps": steps,
     }
 
+    # Embed an alert marker so a notifier (or the webhook below) can act on a
+    # failed / partial run without re-deriving status from the step map.
+    from nba_model.data.etl_alerts import build_alert
+    report["alert"] = build_alert(report)
+
     if write_report:
         report["report_path"] = _write_report(report, report_dir=report_dir)
 
@@ -1398,6 +1403,10 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--no-write-report", action="store_true")
     parser.add_argument(
+        "--alert-webhook-url", default=None,
+        help="POST a JSON alert here when the run fails or partially succeeds.",
+    )
+    parser.add_argument(
         "--login",
         default=None,
         metavar="URL",
@@ -1604,6 +1613,13 @@ def main() -> None:
         print(f"- report_path: {report['report_path']}")
     if log_path:
         print(f"- log_path: {log_path}")
+
+    # Fire an alert webhook on a failed / partial run (best-effort, never raises).
+    if getattr(args, "alert_webhook_url", None):
+        from nba_model.data.etl_alerts import maybe_send_alert
+        sent = maybe_send_alert(report, args.alert_webhook_url)
+        if sent.get("sent"):
+            print(f"- alert_sent: {report['alert']['severity']}")
 
     for step_name, payload in report["steps"].items():
         print(f"- step[{step_name}]: {payload.get('status')}")

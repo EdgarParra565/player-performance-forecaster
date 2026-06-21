@@ -52,6 +52,11 @@ def _decimal_to_american(decimal_odds: float) -> int:
     """
     if decimal_odds >= 2.0:
         return int(round((decimal_odds - 1.0) * 100))
+    if decimal_odds <= 1.0:
+        # Degenerate / malformed decimal (≤ 1.0 implies ≥100% or free money):
+        # not a real price. Return 0 so the caller can skip it rather than
+        # dividing by zero and dropping the whole snapshot.
+        return 0
     return int(round(-100.0 / (decimal_odds - 1.0)))
 
 

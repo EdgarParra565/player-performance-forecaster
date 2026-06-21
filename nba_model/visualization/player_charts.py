@@ -5,6 +5,7 @@ The UI layer is responsible for embedding the figures into a Tk canvas.
 """
 from __future__ import annotations
 
+import calendar
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -151,6 +152,138 @@ def fetch_player_chart_data(
     )
 
 
+def fetch_line_movement_snapshots(
+    db_path: str,
+    player_id: int,
+    stat_type: str,
+    lookback_hours: float = 168.0,
+) -> pd.DataFrame:
+    """Return the open->current line drift per book from ``betting_line_snapshots``.
+
+    One row per snapshot (not deduped per book) so the timeline can render the
+    full drift. Columns match what ``plotly_charts.build_line_movement_figure``
+    expects: ``snapshot_ts_utc``, ``book``, ``stat_type``, ``line_value``,
+    ``over_odds``, ``under_odds``. Restricted to the lookback window so a player
+    page doesn't pull months of stale history. Returns an empty (but correctly
+    shaped) frame when there are no snapshots.
+    """
+    canonical = _canonical_stat_type(stat_type)
+    columns = [
+        "snapshot_ts_utc", "book", "stat_type",
+        "line_value", "over_odds", "under_odds",
+    ]
+    query = """
+        SELECT snapshot_ts_utc, book, stat_type, line_value, over_odds, under_odds
+        FROM betting_line_snapshots
+        WHERE player_id = ?
+          AND lower(stat_type) = lower(?)
+          AND snapshot_ts_utc >= datetime('now', ?)
+        ORDER BY book ASC, snapshot_ts_utc ASC
+    """
+    with DatabaseManager(db_path=db_path) as db:
+        df = pd.read_sql_query(
+            query,
+            db.conn,
+            params=(int(player_id), str(canonical),
+                    f"-{float(lookback_hours)} hours"),
+        )
+    if df.empty:
+        return pd.DataFrame(columns=columns)
+    return df
+
+
+def fetch_cumulative_line_vs_actual(
+    db_path: str,
+    player_id: int,
+    stat_type: str,
+    n_games: int = 40,
+) -> pd.DataFrame:
+    """Game-by-game book line vs actual outcome (over/under streak view).
+
+    Joins per-game consensus lines from ``betting_line_snapshots`` to the
+    player's actual results from ``game_logs``. Columns:
+    ``game_date``, ``actual``, ``line``, ``delta`` (actual-line), ``result``
+    ('over'/'under'/'push'). Returns an empty (shaped) frame when there's no
+    overlap of lines and logs.
+    """
+    canonical = _canonical_stat_type(stat_type)
+    columns = ["game_date", "actual", "line", "delta", "result"]
+    with DatabaseManager(db_path=db_path) as db:
+        games = db.get_player_games(player_id, n_games=max(1, int(n_games)))
+        if games is None or games.empty or "game_date" not in games.columns:
+            return pd.DataFrame(columns=columns)
+        actual = _series_for_stat(games, canonical)
+        if actual.size != len(games):
+            return pd.DataFrame(columns=columns)
+        actual_df = pd.DataFrame({
+            "game_date": pd.to_datetime(games["game_date"], errors="coerce")
+            .dt.strftime("%Y-%m-%d").to_numpy(),
+            "actual": actual,
+        }).dropna(subset=["game_date"])
+        lines = pd.read_sql_query(
+            """
+            SELECT date(game_date) AS game_date, AVG(line_value) AS line
+            FROM betting_line_snapshots
+            WHERE player_id = ? AND lower(stat_type) = lower(?)
+            GROUP BY date(game_date)
+            """,
+            db.conn, params=(int(player_id), str(canonical)),
+        )
+    if lines.empty or actual_df.empty:
+        return pd.DataFrame(columns=columns)
+    merged = actual_df.merge(lines, on="game_date", how="inner")
+    if merged.empty:
+        return pd.DataFrame(columns=columns)
+    merged["delta"] = merged["actual"] - merged["line"]
+    merged["result"] = np.where(
+        merged["actual"] > merged["line"], "over",
+        np.where(merged["actual"] < merged["line"], "under", "push"),
+    )
+    return merged.sort_values("game_date").reset_index(drop=True)[columns]
+
+
+def fetch_clv_proxy_by_book(
+    db_path: str,
+    player_id: int,
+    stat_type: str,
+) -> pd.DataFrame:
+    """Open vs current (close) line per book from ``betting_line_snapshots``.
+
+    A CLV (closing-line-value) proxy: for each book, the earliest and latest
+    snapshot line for this player+stat, plus the drift. Columns: ``book``,
+    ``open_line``, ``close_line``, ``line_delta``, ``n_snapshots``.
+    """
+    canonical = _canonical_stat_type(stat_type)
+    columns = ["book", "open_line", "close_line", "line_delta", "n_snapshots"]
+    with DatabaseManager(db_path=db_path) as db:
+        df = pd.read_sql_query(
+            """
+            SELECT book, line_value, snapshot_ts_utc
+            FROM betting_line_snapshots
+            WHERE player_id = ? AND lower(stat_type) = lower(?)
+            ORDER BY book ASC, snapshot_ts_utc ASC
+            """,
+            db.conn, params=(int(player_id), str(canonical)),
+        )
+    if df.empty:
+        return pd.DataFrame(columns=columns)
+    rows = []
+    for book, grp in df.groupby("book", sort=True):
+        grp = grp.dropna(subset=["line_value"])
+        if grp.empty:
+            continue
+        open_line = float(grp.iloc[0]["line_value"])
+        close_line = float(grp.iloc[-1]["line_value"])
+        rows.append({
+            "book": str(book),
+            "open_line": open_line,
+            "close_line": close_line,
+            "line_delta": close_line - open_line,
+            "n_snapshots": int(len(grp)),
+        })
+    return pd.DataFrame(rows, columns=columns)
+
+
 def _fetch_latest_book_lines(
     db: DatabaseManager,
     player_id: int,
@@ -166,17 +299,28 @@ def _fetch_latest_book_lines(
     `nba_active_players_ref` (530+ rows, kept in sync by the scraper) and
     finally `players` (94 rows, mostly stale).
     """
+    # Prefer the line tied to the player's NEXT game (today or the soonest
+    # upcoming date), not simply max(game_date). Plain ``game_date DESC`` picks
+    # the furthest-future slate and, once today's game locks, can surface
+    # yesterday's line. Ranking: upcoming/today before past; among upcoming the
+    # nearest date wins; among past the most recent; newest scrape breaks ties.
     query = """
         WITH ranked AS (
-            SELECT book, line_value, over_odds, under_odds, game_date,
+            SELECT book, line_value, over_odds, under_odds, game_date, scraped_at,
                    ROW_NUMBER() OVER (
                        PARTITION BY book
-                       ORDER BY game_date DESC, scraped_at DESC
+                       ORDER BY
+                           (game_date < date('now')) ASC,
+                           CASE WHEN game_date >= date('now')
+                                THEN julianday(game_date) END ASC,
+                           game_date DESC,
+                           scraped_at DESC
                    ) AS rn
             FROM betting_lines
             WHERE player_id = ? AND lower(stat_type) = lower(?)
         )
-        SELECT book, line_value, over_odds, under_odds, game_date
+        SELECT book, line_value, over_odds, under_odds, game_date,
+               scraped_at AS scraped_at_utc
         FROM ranked WHERE rn = 1
         ORDER BY book ASC
     """
@@ -230,7 +374,11 @@ def _fetch_latest_book_lines(
             )
             agg["over_odds"] = None
             agg["under_odds"] = None
-            agg = agg[["book", "line_value", "over_odds", "under_odds", "game_date"]]
+            # For web cards observed_at_utc IS the scrape time, so it's the
+            # correct freshness timestamp.
+            agg["scraped_at_utc"] = agg["game_date"]
+            agg = agg[["book", "line_value", "over_odds", "under_odds",
+                       "game_date", "scraped_at_utc"]]
             existing_books = set(df["book"].str.lower()) if not df.empty else set()
             agg = agg[~agg["book"].str.lower().isin(existing_books)]
             df = pd.concat([df, agg], ignore_index=True) if not agg.empty else df
@@ -940,6 +1088,77 @@ def build_splits_figure(
     return fig
 
 
+def build_box_quantile_figure(
+    data: PlayerChartData,
+    figsize: tuple[float, float] = (6.0, 4.0),
+) -> Figure:
+    """Box-and-whisker of the stat with the book-consensus line overlaid."""
+    fig = Figure(figsize=figsize, dpi=100, layout="constrained")
+    ax = fig.add_subplot(111)
+    if data.values.size == 0:
+        ax.text(0.5, 0.5, "No game data.", ha="center", va="center",
+                transform=ax.transAxes, fontsize=12, color="#666")
+        ax.set_axis_off()
+        return fig
+
+    ax.boxplot(
+        data.values, showmeans=True, widths=0.5,
+        patch_artist=True,
+        boxprops=dict(facecolor="#cfe2ff", edgecolor="#4a86e8"),
+        medianprops=dict(color="#c0392b"),
+        meanprops=dict(marker="D", markerfacecolor="#2ca02c",
+                       markeredgecolor="#2ca02c"),
+    )
+    if data.market_consensus_line is not None:
+        ax.axhline(float(data.market_consensus_line), color="#8e44ad",
+                   linestyle="--", alpha=0.8,
+                   label=f"book line {float(data.market_consensus_line):.1f}")
+        ax.legend(loc="best", fontsize=9)
+
+    q1, med, q3 = np.percentile(data.values, [25, 50, 75])
+    ax.set_xticks([1])
+    ax.set_xticklabels([data.stat_type])
+    ax.set_ylabel(data.stat_type)
+    ax.set_title(
+        f"{data.player_name} - {data.stat_type} spread "
+        f"(median {med:.1f}, IQR {q1:.1f}-{q3:.1f}, n={data.values.size})"
+    )
+    ax.grid(axis="y", linestyle=":", alpha=0.4)
+    return fig
+
+
+def build_calendar_heatmap_figure(
+    data: PlayerChartData,
+    figsize: tuple[float, float] = (7.0, 3.8),
+) -> Figure:
+    """Day-of-week x month heatmap of mean stat (calendar performance view)."""
+    fig = Figure(figsize=figsize, dpi=100, layout="constrained")
+    ax = fig.add_subplot(111)
+    cal = compute_calendar_performance(data)
+    if cal is None:
+        ax.text(0.5, 0.5, "Not enough date history.", ha="center", va="center",
+                transform=ax.transAxes, fontsize=12, color="#666")
+        ax.set_axis_off()
+        return fig
+
+    matrix = cal["mean_matrix"]
+    im = ax.imshow(matrix, aspect="auto", cmap="YlOrRd")
+    ax.set_xticks(range(len(cal["month_labels"])))
+    ax.set_xticklabels(cal["month_labels"])
+    ax.set_yticks(range(len(cal["weekday_labels"])))
+    ax.set_yticklabels(cal["weekday_labels"])
+    # Annotate non-empty cells with the mean value.
+    for r in range(matrix.shape[0]):
+        for c in range(matrix.shape[1]):
+            v = matrix[r, c]
+            if not np.isnan(v):
+                ax.text(c, r, f"{v:.0f}", ha="center", va="center",
+                        fontsize=8, color="#222")
+    fig.colorbar(im, ax=ax, label=f"mean {data.stat_type}")
+    ax.set_title(f"{data.player_name} - {data.stat_type} by weekday / month")
+    return fig
+
+
 # ----- Splits computations -------------------------------------------------
 
 def compute_home_away_split(data: PlayerChartData) -> dict:
@@ -982,6 +1201,230 @@ def compute_rest_days_split(data: PlayerChartData) -> dict:
     return buckets
 
 
+def compute_minutes_efficiency(data: PlayerChartData) -> Optional[dict]:
+    """Per-game minutes + per-minute productivity for the pace/minutes chart.
+
+    Returns ``None`` without a usable ``minutes`` column. Otherwise a dict with
+    ``dates``, ``minutes``, ``values``, ``per_minute`` (value / minutes, NaN at
+    0 minutes) and ``avg_minutes`` (the project_minutes baseline).
+    """
+    games = data.games
+    if games.empty or "minutes" not in games.columns:
+        return None
+    mins = pd.to_numeric(games["minutes"], errors="coerce").to_numpy(dtype=float)
+    if not np.isfinite(mins).any():
+        return None
+    vals = np.asarray(data.values, dtype=float)
+    if vals.size != mins.size:
+        return None
+    with np.errstate(divide="ignore", invalid="ignore"):
+        per_min = np.where(mins > 0, vals / mins, np.nan)
+    dates = (
+        pd.to_datetime(games["game_date"], errors="coerce")
+        .dt.strftime("%Y-%m-%d").tolist()
+        if "game_date" in games.columns else list(range(len(games)))
+    )
+    avg_minutes = float(np.nanmean(mins))
+    return {
+        "dates": dates,
+        "minutes": mins,
+        "values": vals,
+        "per_minute": per_min,
+        "avg_minutes": avg_minutes,
+    }
+
+
+def fetch_model_vs_fitted_ev(
+    db_path: str,
+    data: PlayerChartData,
+    limit: int = 20,
+) -> pd.DataFrame:
+    """Compare the stored model EV (``predictions`` table) against the EV
+    implied by the player's current fitted-normal at the same line + odds.
+
+    Columns: ``game_date``, ``line_value``, ``model_ev``, ``fitted_ev``,
+    ``model_prob``, ``fitted_prob``. Empty (shaped) frame when there are no
+    predictions for this player + stat.
+    """
+    columns = ["game_date", "line_value", "model_ev", "fitted_ev",
+               "model_prob", "fitted_prob"]
+    with DatabaseManager(db_path=db_path) as db:
+        preds = pd.read_sql_query(
+            """
+            SELECT game_date, line_value, book_odds, prob_over, expected_value
+            FROM predictions
+            WHERE player_id = ? AND lower(stat_type) = lower(?)
+              AND line_value IS NOT NULL
+            ORDER BY game_date DESC
+            LIMIT ?
+            """,
+            db.conn,
+            params=(int(data.player_id), str(data.stat_type), int(max(1, limit))),
+        )
+    if preds.empty:
+        return pd.DataFrame(columns=columns)
+    rows = []
+    for r in preds.itertuples(index=False):
+        line = float(r.line_value)
+        fitted_prob = fitted_prob_over(data, line)
+        odds = int(r.book_odds) if pd.notna(r.book_odds) else None
+        fitted_ev = (expected_value(fitted_prob, odds)
+                     if (fitted_prob is not None and odds is not None) else None)
+        rows.append({
+            "game_date": str(r.game_date)[:10],
+            "line_value": line,
+            "model_ev": (float(r.expected_value)
+                         if pd.notna(r.expected_value) else None),
+            "fitted_ev": fitted_ev,
+            "model_prob": (float(r.prob_over)
+                           if pd.notna(r.prob_over) else None),
+            "fitted_prob": fitted_prob,
+        })
+    return pd.DataFrame(rows, columns=columns)
+
+
+def _extract_opponent(matchup) -> Optional[str]:
+    """Opponent abbrev from a matchup like 'LAL vs. DEN' / 'LAL @ DEN'."""
+    if not isinstance(matchup, str):
+        return None
+    for sep in (" vs. ", " vs ", " @ ", "@"):
+        if sep in matchup:
+            return matchup.split(sep, 1)[1].strip().upper()[:3]
+    return None
+
+
+def compute_opponent_split(data: PlayerChartData) -> dict:
+    """Mean/n per opponent (parsed from ``matchup``), for the matchup filter."""
+    games = data.games
+    if games.empty or "matchup" not in games.columns:
+        return {}
+    series = pd.Series(data.values, index=games.index)
+    opps = games["matchup"].apply(_extract_opponent)
+    out: dict = {}
+    for opp in sorted({o for o in opps if o}):
+        mask = (opps == opp).fillna(False)
+        if mask.any():
+            out[opp] = {
+                "mean": float(series[mask].mean()),
+                "n": int(mask.sum()),
+            }
+    return out
+
+
+def compute_correlation_matrix(
+    db_path: str,
+    player_id: int,
+    stats: "list[str]",
+    n_games: int = 50,
+) -> pd.DataFrame:
+    """PSD-safe correlation matrix across stats for a player's recent games.
+
+    Pulls game logs once, builds one column per requested stat via
+    ``_series_for_stat`` (so PRA/RA composites work), and delegates to
+    ``correlation_calibration.calibrate_correlations``. Returns an empty frame
+    when there's no usable history.
+    """
+    from nba_model.model.correlation_calibration import calibrate_correlations
+
+    canon = [_canonical_stat_type(s) for s in stats]
+    canon = list(dict.fromkeys([c for c in canon if c]))  # dedupe, keep order
+    if len(canon) < 2:
+        return pd.DataFrame()
+    with DatabaseManager(db_path=db_path) as db:
+        games = db.get_player_games(player_id, n_games=max(2, int(n_games)))
+    if games is None or games.empty:
+        return pd.DataFrame()
+    cols = {}
+    for stat in canon:
+        series = _series_for_stat(games, stat)
+        if series.size == len(games):
+            cols[stat] = series
+    if len(cols) < 2:
+        return pd.DataFrame()
+    df = pd.DataFrame(cols)
+    try:
+        return calibrate_correlations(df, stats_cols=list(cols.keys()))
+    except (KeyError, ValueError):
+        return pd.DataFrame()
+
+
+def compute_win_loss_split(data: PlayerChartData) -> dict:
+    """Return {'W': {mean,n}, 'L': {mean,n}} from the games' ``result`` column."""
+    out: dict = {"W": None, "L": None}
+    games = data.games
+    if games.empty or "result" not in games.columns:
+        return out
+    series = pd.Series(data.values, index=games.index)
+    res = games["result"].astype(str).str.upper().str[0]
+    for key in ("W", "L"):
+        mask = res == key
+        if mask.any():
+            out[key] = {
+                "mean": float(series[mask].mean()),
+                "n": int(mask.sum()),
+            }
+    return out
+
+
+def compute_starter_bench_split(
+    data: PlayerChartData, minutes_threshold: float = 20.0,
+) -> dict:
+    """Split by a starter/bench minutes heuristic (``minutes >= threshold``)."""
+    out: dict = {"starter": None, "bench": None}
+    games = data.games
+    if games.empty or "minutes" not in games.columns:
+        return out
+    series = pd.Series(data.values, index=games.index)
+    minutes = pd.to_numeric(games["minutes"], errors="coerce")
+    for key, mask in (
+        ("starter", minutes >= float(minutes_threshold)),
+        ("bench", minutes < float(minutes_threshold)),
+    ):
+        m = mask.fillna(False)
+        if m.any():
+            out[key] = {
+                "mean": float(series[m].mean()),
+                "n": int(m.sum()),
+            }
+    return out
+
+
+def compute_calendar_performance(data: PlayerChartData) -> Optional[dict]:
+    """Mean stat by (day-of-week × month) for a calendar heatmap.
+
+    Returns ``None`` when there's no usable date history. Otherwise a dict with
+    ``weekday_labels`` (Mon..Sun), ``month_labels`` (only months that appear),
+    a ``mean_matrix`` (7 × n_months, NaN where no games) and a ``count_matrix``.
+    """
+    games = data.games
+    if games.empty or "game_date" not in games.columns:
+        return None
+    dates = pd.to_datetime(games["game_date"], errors="coerce")
+    df = pd.DataFrame({
+        "date": dates.to_numpy(),
+        "val": pd.Series(data.values, index=games.index).astype(float).to_numpy(),
+    }).dropna(subset=["date"])
+    if df.empty:
+        return None
+    df["weekday"] = df["date"].dt.dayofweek  # 0=Mon .. 6=Sun
+    df["month"] = df["date"].dt.month
+    months = sorted(df["month"].unique().tolist())
+    weekdays = list(range(7))
+    mean_pivot = df.pivot_table(
+        index="weekday", columns="month", values="val", aggfunc="mean",
+    ).reindex(index=weekdays, columns=months)
+    count_pivot = df.pivot_table(
+        index="weekday", columns="month", values="val", aggfunc="count",
+    ).reindex(index=weekdays, columns=months)
+    return {
+        "weekday_labels": ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"],
+        "month_labels": [calendar.month_abbr[m] for m in months],
+        "months": months,
+        "mean_matrix": mean_pivot.to_numpy(dtype=float),
+        "count_matrix": count_pivot.fillna(0).to_numpy(dtype=int),
+    }
+
+
 # ----- Probability + EV helpers --------------------------------------------
 
 def _american_odds_to_decimal(odds) -> Optional[float]:
@@ -1022,6 +1465,31 @@ def expected_value(prob: float, american_odds) -> Optional[float]:
     return float(prob * (dec - 1.0) - (1.0 - prob))
 
 
+def kelly_stake(prob, american_odds, fraction: float = 1.0) -> float:
+    """Fraction of bankroll to stake per the Kelly criterion.
+
+    ``f* = (b·p − q) / b`` where ``b`` is the net decimal odds (decimal − 1),
+    ``p`` the win probability and ``q = 1 − p``. Returns ``0.0`` when there is
+    no edge or the inputs are unusable, so the UI can show "no bet". ``fraction``
+    scales the recommendation (e.g. ``0.5`` for half-Kelly, the common
+    risk-tempered default).
+    """
+    dec = _american_odds_to_decimal(american_odds)
+    if dec is None or prob is None:
+        return 0.0
+    try:
+        p = float(prob)
+    except (TypeError, ValueError):
+        return 0.0
+    if not 0.0 <= p <= 1.0:
+        return 0.0
+    b = dec - 1.0
+    if b <= 0:
+        return 0.0
+    f = (b * p - (1.0 - p)) / b
+    return float(max(0.0, f * float(fraction)))
+
+
 def evaluate_custom_line(
     data: PlayerChartData,
     line: float,
@@ -1037,6 +1505,12 @@ def evaluate_custom_line(
     ev_under = (
         expected_value(1.0 - p_over, american_odds) if p_over is not None else None
     )
+    kelly_over = (
+        kelly_stake(p_over, american_odds) if p_over is not None else 0.0
+    )
+    kelly_under = (
+        kelly_stake(1.0 - p_over, american_odds) if p_over is not None else 0.0
+    )
     return {
         "line": float(line),
         "p_over": p_over,
@@ -1046,6 +1520,8 @@ def evaluate_custom_line(
         "historical_over_rate": hit_rate,
         "ev_over_per_unit": ev_over,
         "ev_under_per_unit": ev_under,
+        "kelly_over": kelly_over,
+        "kelly_under": kelly_under,
     }
 
 
@@ -1062,10 +1538,21 @@ def book_lines_staleness_summary(data: PlayerChartData) -> Optional[dict]:
     """
     if data.book_lines is None or data.book_lines.empty:
         return None
-    if "game_date" not in data.book_lines.columns:
+    # Prefer the true scrape timestamp; for betting_lines rows ``game_date`` is
+    # the GAME's calendar date (not when the line was scraped), so using it
+    # would mislabel "scraped X ago". ``scraped_at_utc`` carries the real time
+    # (scraped_at for betting_lines, observed_at_utc for web cards). Fall back
+    # to game_date only when no scrape timestamp is present.
+    ts_col = (
+        "scraped_at_utc"
+        if "scraped_at_utc" in data.book_lines.columns
+        and data.book_lines["scraped_at_utc"].notna().any()
+        else "game_date"
+    )
+    if ts_col not in data.book_lines.columns:
         return None
     ts = pd.to_datetime(
-        data.book_lines["game_date"], errors="coerce", utc=True,
+        data.book_lines[ts_col], errors="coerce", utc=True,
     ).dropna()
     if ts.empty:
         return None

@@ -178,5 +178,125 @@ class LineMovementFigureTests(unittest.TestCase):
         self.assertEqual(len(fig.layout.annotations), 1)
 
 
+class BoxQuantileFigureTests(unittest.TestCase):
+    def test_returns_box_trace(self):
+        data = _build_synthetic_data()
+        fig = plc.build_box_quantile_figure(data)
+        self.assertGreaterEqual(len(fig.data), 1)
+        self.assertEqual(fig.data[0].type, "box")
+
+    def test_empty_renders_placeholder(self):
+        empty = pc.PlayerChartData(
+            player_id=0, player_name="X", stat_type="points",
+            games=pd.DataFrame(), values=np.array([], dtype=float),
+        )
+        fig = plc.build_box_quantile_figure(empty)
+        self.assertEqual(len(fig.data), 0)
+        self.assertEqual(len(fig.layout.annotations), 1)
+
+
+class CalendarHeatmapFigureTests(unittest.TestCase):
+    def test_returns_heatmap_trace(self):
+        data = _build_synthetic_data()
+        fig = plc.build_calendar_heatmap_figure(data)
+        self.assertGreaterEqual(len(fig.data), 1)
+        self.assertEqual(fig.data[0].type, "heatmap")
+
+    def test_empty_renders_placeholder(self):
+        empty = pc.PlayerChartData(
+            player_id=0, player_name="X", stat_type="points",
+            games=pd.DataFrame(), values=np.array([], dtype=float),
+        )
+        fig = plc.build_calendar_heatmap_figure(empty)
+        self.assertEqual(len(fig.data), 0)
+        self.assertEqual(len(fig.layout.annotations), 1)
+
+
+class Workstream3Batch2FigureTests(unittest.TestCase):
+    def test_opponent_split_figure(self):
+        data = _build_synthetic_data()
+        # synthetic games all "LAL vs DEN" → one opponent bar.
+        fig = plc.build_opponent_split_figure(data)
+        self.assertGreaterEqual(len(fig.data), 1)
+
+    def test_opponent_split_empty(self):
+        empty = pc.PlayerChartData(
+            player_id=0, player_name="X", stat_type="points",
+            games=pd.DataFrame(), values=np.array([], dtype=float),
+        )
+        fig = plc.build_opponent_split_figure(empty)
+        self.assertEqual(len(fig.data), 0)
+        self.assertEqual(len(fig.layout.annotations), 1)
+
+    def test_correlation_heatmap_figure(self):
+        corr = pd.DataFrame(
+            [[1.0, 0.3], [0.3, 1.0]],
+            index=["points", "rebounds"], columns=["points", "rebounds"],
+        )
+        fig = plc.build_correlation_heatmap_figure(corr, "P")
+        self.assertEqual(fig.data[0].type, "heatmap")
+
+    def test_correlation_heatmap_empty(self):
+        fig = plc.build_correlation_heatmap_figure(pd.DataFrame(), "P")
+        self.assertEqual(len(fig.data), 0)
+        self.assertEqual(len(fig.layout.annotations), 1)
+
+    def test_line_vs_actual_ribbon_figure(self):
+        ribbon = pd.DataFrame({
+            "game_date": ["2025-04-01", "2025-04-02"],
+            "actual": [20.0, 15.0], "line": [18.0, 18.0],
+            "delta": [2.0, -3.0], "result": ["over", "under"],
+        })
+        fig = plc.build_line_vs_actual_ribbon_figure(ribbon, "points")
+        self.assertGreaterEqual(len(fig.data), 2)  # line + actual markers
+
+    def test_line_vs_actual_ribbon_empty(self):
+        fig = plc.build_line_vs_actual_ribbon_figure(pd.DataFrame(), "points")
+        self.assertEqual(len(fig.data), 0)
+        self.assertEqual(len(fig.layout.annotations), 1)
+
+    def test_clv_proxy_figure(self):
+        clv = pd.DataFrame({
+            "book": ["fanduel"], "open_line": [25.0], "close_line": [27.0],
+            "line_delta": [2.0], "n_snapshots": [2],
+        })
+        fig = plc.build_clv_proxy_figure(clv, "points")
+        self.assertGreaterEqual(len(fig.data), 2)  # open + close bars
+
+    def test_clv_proxy_empty(self):
+        fig = plc.build_clv_proxy_figure(pd.DataFrame(), "points")
+        self.assertEqual(len(fig.data), 0)
+        self.assertEqual(len(fig.layout.annotations), 1)
+
+    def test_minutes_efficiency_figure(self):
+        data = _build_synthetic_data()
+        data.games["minutes"] = 32.0
+        fig = plc.build_minutes_efficiency_figure(data)
+        self.assertGreaterEqual(len(fig.data), 2)  # minutes bars + per-min line
+
+    def test_minutes_efficiency_empty(self):
+        empty = pc.PlayerChartData(
+            player_id=0, player_name="X", stat_type="points",
+            games=pd.DataFrame(), values=np.array([], dtype=float),
+        )
+        fig = plc.build_minutes_efficiency_figure(empty)
+        self.assertEqual(len(fig.data), 0)
+        self.assertEqual(len(fig.layout.annotations), 1)
+
+    def test_model_vs_fitted_ev_figure(self):
+        ev_df = pd.DataFrame({
+            "game_date": ["2025-04-01"], "line_value": [24.5],
+            "model_ev": [0.12], "fitted_ev": [0.08],
+            "model_prob": [0.58], "fitted_prob": [0.55],
+        })
+        fig = plc.build_model_vs_fitted_ev_figure(ev_df, "points")
+        self.assertGreaterEqual(len(fig.data), 2)
+
+    def test_model_vs_fitted_ev_empty(self):
+        fig = plc.build_model_vs_fitted_ev_figure(pd.DataFrame(), "points")
+        self.assertEqual(len(fig.data), 0)
+        self.assertEqual(len(fig.layout.annotations), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

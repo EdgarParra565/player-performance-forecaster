@@ -95,6 +95,12 @@ DEFAULT_HEIGHTS = {
     "splits":         440,
     "multi_player":   520,
     "line_movement":  480,
+    "box":            440,
+    "calendar":       420,
+    "opponent":       440,
+    "correlation":    460,
+    "ribbon":         480,
+    "clv":            420,
 }
 
 
@@ -1094,4 +1100,283 @@ def build_line_movement_figure(
     fig.update_layout(
         xaxis_title="snapshot time (UTC)", yaxis_title=stat_type,
     )
+    return fig
+
+
+# --- Box / quantile + calendar heatmap ---------------------------------------
+
+def build_box_quantile_figure(data: pc.PlayerChartData):
+    """Interactive box-and-whisker of the stat with the book line overlaid."""
+    import plotly.graph_objects as go
+    fig = go.Figure()
+    if data.values.size == 0:
+        fig.add_annotation(
+            text="No game data for this player + stat.",
+            showarrow=False, x=0.5, y=0.5, xref="paper", yref="paper",
+            font=dict(size=12, color=THEME["muted"]),
+        )
+        _apply_empty_theme(fig, height=DEFAULT_HEIGHTS["box"])
+        return fig
+
+    fig.add_trace(go.Box(
+        y=data.values, name=data.stat_type,
+        boxmean="sd", boxpoints="all", jitter=0.4, pointpos=0,
+        marker=dict(color=THEME["hist"], size=5,
+                    line=dict(color="#fff", width=0.4)),
+        line=dict(color="#4f46e5"),
+        fillcolor="rgba(99,102,241,0.18)",
+        hovertemplate=f"{data.stat_type}: %{{y}}<extra></extra>",
+    ))
+    if data.market_consensus_line is not None:
+        fig.add_hline(
+            y=float(data.market_consensus_line),
+            line=dict(color="#8b5cf6", width=1.6, dash="dash"),
+            annotation_text=f"book line {float(data.market_consensus_line):.1f}",
+            annotation_position="top right",
+        )
+    _apply_theme(
+        fig,
+        title=f"{data.player_name} — {data.stat_type} spread (n={data.values.size})",
+        height=DEFAULT_HEIGHTS["box"], show_legend=False,
+    )
+    fig.update_layout(yaxis_title=data.stat_type)
+    return fig
+
+
+def build_calendar_heatmap_figure(data: pc.PlayerChartData):
+    """Day-of-week x month heatmap of mean stat (calendar performance)."""
+    import plotly.graph_objects as go
+    fig = go.Figure()
+    cal = pc.compute_calendar_performance(data)
+    if cal is None:
+        fig.add_annotation(
+            text="Not enough date history for a calendar view.",
+            showarrow=False, x=0.5, y=0.5, xref="paper", yref="paper",
+            font=dict(size=12, color=THEME["muted"]),
+        )
+        _apply_empty_theme(fig, height=DEFAULT_HEIGHTS["calendar"])
+        return fig
+
+    matrix = cal["mean_matrix"]
+    text = [[("" if np.isnan(v) else f"{v:.0f}") for v in row] for row in matrix]
+    fig.add_trace(go.Heatmap(
+        z=matrix, x=cal["month_labels"], y=cal["weekday_labels"],
+        text=text, texttemplate="%{text}",
+        colorscale="YlOrRd",
+        colorbar=dict(title=f"mean {data.stat_type}"),
+        hovertemplate="%{y} %{x}<br>mean: %{z:.1f}<extra></extra>",
+    ))
+    _apply_theme(
+        fig,
+        title=f"{data.player_name} — {data.stat_type} by weekday / month",
+        height=DEFAULT_HEIGHTS["calendar"], show_legend=False,
+    )
+    # Heatmaps read better without the shared gridlines.
+    fig.update_xaxes(showgrid=False)
+    fig.update_yaxes(showgrid=False, autorange="reversed")
+    return fig
+
+
+# --- WS3 batch 2: opponent split / correlation / ribbon / CLV ----------------
+
+def build_opponent_split_figure(data: pc.PlayerChartData):
+    """Mean stat per opponent (matchup filter), with the book line overlaid."""
+    import plotly.graph_objects as go
+    fig = go.Figure()
+    split = pc.compute_opponent_split(data)
+    if not split:
+        fig.add_annotation(
+            text="No opponent info in these games.",
+            showarrow=False, x=0.5, y=0.5, xref="paper", yref="paper",
+            font=dict(size=12, color=THEME["muted"]),
+        )
+        _apply_empty_theme(fig, height=DEFAULT_HEIGHTS["opponent"])
+        return fig
+    opps = list(split.keys())
+    means = [split[o]["mean"] for o in opps]
+    ns = [split[o]["n"] for o in opps]
+    fig.add_trace(go.Bar(
+        x=opps, y=means, marker_color=THEME["hist"],
+        customdata=ns,
+        hovertemplate="vs %{x}<br>mean: %{y:.1f}<br>n=%{customdata}<extra></extra>",
+    ))
+    if data.market_consensus_line is not None:
+        fig.add_hline(
+            y=float(data.market_consensus_line),
+            line=dict(color="#8b5cf6", width=1.6, dash="dash"),
+            annotation_text=f"book line {float(data.market_consensus_line):.1f}",
+            annotation_position="top right",
+        )
+    _apply_theme(
+        fig, title=f"{data.player_name} — {data.stat_type} by opponent",
+        height=DEFAULT_HEIGHTS["opponent"], show_legend=False,
+    )
+    fig.update_layout(xaxis_title="opponent", yaxis_title=data.stat_type)
+    return fig
+
+
+def build_correlation_heatmap_figure(corr_df: pd.DataFrame, player_name: str = ""):
+    """Heatmap of a stat-correlation matrix (parlay correlation view)."""
+    import plotly.graph_objects as go
+    fig = go.Figure()
+    if corr_df is None or corr_df.empty or corr_df.shape[0] < 2:
+        fig.add_annotation(
+            text=("Need ≥2 stats with shared game history to compute "
+                  "correlations."),
+            showarrow=False, x=0.5, y=0.5, xref="paper", yref="paper",
+            font=dict(size=12, color=THEME["muted"]),
+        )
+        _apply_empty_theme(fig, height=DEFAULT_HEIGHTS["correlation"])
+        return fig
+    labels = [str(c) for c in corr_df.columns]
+    z = corr_df.to_numpy(dtype=float)
+    text = [[f"{v:.2f}" for v in row] for row in z]
+    fig.add_trace(go.Heatmap(
+        z=z, x=labels, y=labels, text=text, texttemplate="%{text}",
+        zmin=-1.0, zmax=1.0, colorscale="RdBu", reversescale=True,
+        colorbar=dict(title="corr"),
+        hovertemplate="%{y} / %{x}<br>corr: %{z:.2f}<extra></extra>",
+    ))
+    title = "Stat correlation matrix"
+    if player_name:
+        title = f"{player_name} — {title.lower()}"
+    _apply_theme(fig, title=title, height=DEFAULT_HEIGHTS["correlation"],
+                 show_legend=False)
+    fig.update_xaxes(showgrid=False)
+    fig.update_yaxes(showgrid=False, autorange="reversed")
+    return fig
+
+
+def build_line_vs_actual_ribbon_figure(ribbon_df: pd.DataFrame, stat_type: str):
+    """Game-by-game book line vs actual, colored by over/under outcome."""
+    import plotly.graph_objects as go
+    fig = go.Figure()
+    if ribbon_df is None or ribbon_df.empty:
+        fig.add_annotation(
+            text=("No overlap of stored lines and game logs yet. Populates as "
+                  "betting_line_snapshots + game_logs accumulate."),
+            showarrow=False, x=0.5, y=0.5, xref="paper", yref="paper",
+            font=dict(size=12, color=THEME["muted"]),
+        )
+        _apply_empty_theme(fig, height=DEFAULT_HEIGHTS["ribbon"])
+        return fig
+    x = ribbon_df["game_date"].astype(str).tolist()
+    fig.add_trace(go.Scatter(
+        x=x, y=ribbon_df["line"].tolist(), mode="lines+markers",
+        name="book line", line=dict(color="#8b5cf6", width=2),
+    ))
+    colors = [THEME["ok"] if r == "over" else (THEME["accent"] if r == "under"
+              else THEME["muted"]) for r in ribbon_df["result"]]
+    fig.add_trace(go.Scatter(
+        x=x, y=ribbon_df["actual"].tolist(), mode="markers",
+        name="actual", marker=dict(color=colors, size=9,
+                                   line=dict(color="#111", width=0.4)),
+        customdata=ribbon_df["result"].tolist(),
+        hovertemplate="%{x}<br>actual: %{y}<br>%{customdata}<extra></extra>",
+    ))
+    _apply_theme(fig, title=f"Line vs actual ({stat_type})",
+                 height=DEFAULT_HEIGHTS["ribbon"], legend_top=True)
+    fig.update_layout(xaxis_title="game date", yaxis_title=stat_type)
+    return fig
+
+
+def build_clv_proxy_figure(clv_df: pd.DataFrame, stat_type: str):
+    """Open vs close line per book (CLV proxy), drift annotated."""
+    import plotly.graph_objects as go
+    fig = go.Figure()
+    if clv_df is None or clv_df.empty:
+        fig.add_annotation(
+            text="No line snapshots to compute a CLV proxy yet.",
+            showarrow=False, x=0.5, y=0.5, xref="paper", yref="paper",
+            font=dict(size=12, color=THEME["muted"]),
+        )
+        _apply_empty_theme(fig, height=DEFAULT_HEIGHTS["clv"])
+        return fig
+    books = clv_df["book"].tolist()
+    fig.add_trace(go.Bar(
+        x=books, y=clv_df["open_line"].tolist(), name="open",
+        marker_color=THEME["muted"],
+    ))
+    fig.add_trace(go.Bar(
+        x=books, y=clv_df["close_line"].tolist(), name="current",
+        marker_color=THEME["hist"],
+    ))
+    _apply_theme(fig, title=f"Open → current line per book ({stat_type})",
+                 height=DEFAULT_HEIGHTS["clv"], legend_top=True)
+    fig.update_layout(barmode="group", xaxis_title="book",
+                      yaxis_title=stat_type)
+    return fig
+
+
+def build_minutes_efficiency_figure(data: pc.PlayerChartData):
+    """Per-game minutes (bars) + per-minute productivity (line) with the
+    projected-minutes baseline marked."""
+    import plotly.graph_objects as go
+    fig = go.Figure()
+    eff = pc.compute_minutes_efficiency(data)
+    if eff is None:
+        fig.add_annotation(
+            text="No minutes data for these games.",
+            showarrow=False, x=0.5, y=0.5, xref="paper", yref="paper",
+            font=dict(size=12, color=THEME["muted"]),
+        )
+        _apply_empty_theme(fig, height=DEFAULT_HEIGHTS["recent"])
+        return fig
+    x = [str(d) for d in eff["dates"]]
+    fig.add_trace(go.Bar(
+        x=x, y=eff["minutes"], name="minutes",
+        marker_color="rgba(99,102,241,0.35)", yaxis="y",
+        hovertemplate="%{x}<br>minutes: %{y:.1f}<extra></extra>",
+    ))
+    fig.add_trace(go.Scatter(
+        x=x, y=eff["per_minute"], name=f"{data.stat_type}/min",
+        mode="lines+markers", line=dict(color=THEME["accent"], width=2),
+        yaxis="y2",
+        hovertemplate="%{x}<br>per-min: %{y:.3f}<extra></extra>",
+    ))
+    fig.add_hline(
+        y=float(eff["avg_minutes"]),
+        line=dict(color=THEME["muted"], width=1.2, dash="dot"),
+        annotation_text=f"proj minutes {eff['avg_minutes']:.0f}",
+        annotation_position="top left",
+    )
+    _apply_theme(fig, title=f"{data.player_name} — minutes & per-minute "
+                 f"{data.stat_type}", height=DEFAULT_HEIGHTS["recent"],
+                 legend_top=True)
+    fig.update_layout(
+        yaxis=dict(title="minutes"),
+        yaxis2=dict(title=f"{data.stat_type}/min", overlaying="y",
+                    side="right", showgrid=False),
+    )
+    return fig
+
+
+def build_model_vs_fitted_ev_figure(ev_df: pd.DataFrame, stat_type: str):
+    """Grouped bars: stored model EV vs the fitted-from-recent-data EV per
+    prediction date."""
+    import plotly.graph_objects as go
+    fig = go.Figure()
+    if ev_df is None or ev_df.empty:
+        fig.add_annotation(
+            text=("No predictions stored for this player + stat yet "
+                  "(run the prediction job / daily ETL)."),
+            showarrow=False, x=0.5, y=0.5, xref="paper", yref="paper",
+            font=dict(size=12, color=THEME["muted"]),
+        )
+        _apply_empty_theme(fig, height=DEFAULT_HEIGHTS["hit_rate"])
+        return fig
+    x = ev_df["game_date"].astype(str).tolist()
+    fig.add_trace(go.Bar(
+        x=x, y=ev_df["model_ev"].tolist(), name="model EV",
+        marker_color=THEME["hist"],
+    ))
+    fig.add_trace(go.Bar(
+        x=x, y=ev_df["fitted_ev"].tolist(), name="fitted-from-data EV",
+        marker_color=THEME["ok"],
+    ))
+    fig.add_hline(y=0.0, line=dict(color=THEME["muted"], width=1.0))
+    _apply_theme(fig, title=f"Model vs fitted EV ({stat_type})",
+                 height=DEFAULT_HEIGHTS["hit_rate"], legend_top=True)
+    fig.update_layout(barmode="group", xaxis_title="prediction date",
+                      yaxis_title="EV per unit")
     return fig

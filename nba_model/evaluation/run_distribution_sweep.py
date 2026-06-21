@@ -11,6 +11,24 @@ from nba_model.evaluation.significance import win_rate_significance_summary
 from nba_model.model.simulation import SUPPORTED_DISTRIBUTIONS
 
 ARTIFACT_DIR = Path("nba_model/evaluation/artifacts")
+
+# Realistic per-stat lines a book would actually post. Used as the default
+# when the caller supplies neither --use-market-lines nor an explicit --line,
+# so symmetric distributions aren't settled at line == model mean (which makes
+# P(over) ≈ 0.5, the 0.55 edge filter rejects every wager, and the sweep
+# returns zero bets — the degenerate case the per-stat sweep was built to fix).
+# Kept here as the canonical source; run_per_stat_sweep imports it.
+DEFAULT_LINES_BY_STAT: dict[str, float] = {
+    "points":   24.5,
+    "assists":   6.5,
+    "rebounds":  7.5,
+    "pra":      35.5,
+    "ra":       11.5,
+    "three_pointers_made": 2.5,
+    "field_goals_made":    9.5,
+    "minutes": 33.5,
+}
+
 DEFAULT_PLAYERS = [
     "LeBron James",
     "Stephen Curry",
@@ -45,6 +63,32 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--american-odds", type=int, default=-110)
     parser.add_argument("--output-prefix", default="distribution_sweep")
     return parser
+
+
+def _resolve_stat_lines(
+    stat_types: list[str],
+    line: "float | None",
+    use_market_lines: bool,
+) -> dict:
+    """Resolve the per-stat line to settle on.
+
+    - ``use_market_lines``: every stat → ``line`` (may be ``None``, meaning the
+      backtest pulls the book's market line).
+    - explicit ``--line``: every stat → that fixed line.
+    - neither: each stat → its realistic ``DEFAULT_LINES_BY_STAT`` value so we
+      never silently fall back to ``line == model mean``. Stats without a
+      default map to ``None`` (caller warns/skips).
+    """
+    out: dict = {}
+    for stat in stat_types:
+        s = stat.lower()
+        if use_market_lines:
+            out[s] = line
+        elif line is not None:
+            out[s] = float(line)
+        else:
+            out[s] = DEFAULT_LINES_BY_STAT.get(s)
+    return out
 
 
 def build_distribution_summary(
@@ -152,21 +196,54 @@ def _write_artifacts(
 
 def main():
     args = _build_parser().parse_args()
-    results_df, failures_df = run_batch_backtest(
-        players=args.players,
-        windows=args.windows,
-        stat_types=[s.lower() for s in args.stat_types],
-        distributions=[d.lower() for d in args.distributions],
-        start_date=args.start_date,
-        end_date=args.end_date,
-        line=args.line,
-        use_market_lines=args.use_market_lines,
-        require_market_line=args.require_market_line,
-        market_book=args.market_book,
-        market_line_agg=args.market_line_agg,
-        history_games=args.history_games,
-        confidence=args.confidence,
-        american_odds=args.american_odds,
+    stat_types = [s.lower() for s in args.stat_types]
+    stat_lines = _resolve_stat_lines(
+        stat_types, args.line, args.use_market_lines,
+    )
+    if not args.use_market_lines and args.line is None:
+        print(
+            "No --use-market-lines / --line given: settling each stat at its "
+            "realistic default line (avoids the line==mean degeneracy). "
+            f"Lines: {stat_lines}"
+        )
+
+    # Run each stat at its own line so symmetric distributions aren't forced
+    # to settle at the model mean. Concatenate into one results/failures frame.
+    results_frames: list[pd.DataFrame] = []
+    failures_frames: list[pd.DataFrame] = []
+    for stat in stat_types:
+        line = stat_lines.get(stat)
+        if line is None and not args.use_market_lines:
+            print(f"  skipping {stat!r}: no default line (pass --line).")
+            continue
+        res, fail = run_batch_backtest(
+            players=args.players,
+            windows=args.windows,
+            stat_types=[stat],
+            distributions=[d.lower() for d in args.distributions],
+            start_date=args.start_date,
+            end_date=args.end_date,
+            line=line,
+            use_market_lines=args.use_market_lines,
+            require_market_line=args.require_market_line,
+            market_book=args.market_book,
+            market_line_agg=args.market_line_agg,
+            history_games=args.history_games,
+            confidence=args.confidence,
+            american_odds=args.american_odds,
+        )
+        if res is not None and not res.empty:
+            results_frames.append(res)
+        if fail is not None and not fail.empty:
+            failures_frames.append(fail)
+
+    results_df = (
+        pd.concat(results_frames, ignore_index=True)
+        if results_frames else pd.DataFrame()
+    )
+    failures_df = (
+        pd.concat(failures_frames, ignore_index=True)
+        if failures_frames else pd.DataFrame()
     )
     distribution_df = build_distribution_summary(
         results_df=results_df,

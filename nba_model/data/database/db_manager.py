@@ -73,6 +73,15 @@ class DatabaseManager:
         self.conn = None
         self._initialize_database()
 
+    # Tables that gain a ``sport`` discriminator for the multi-sport rollout
+    # (NFL first). Added via idempotent migration rather than editing every
+    # CREATE TABLE so existing DBs upgrade in place. Default 'nba' keeps all
+    # current rows + inserts that omit the column working unchanged.
+    _SPORT_COLUMN_TABLES = (
+        "game_logs", "betting_lines", "betting_line_snapshots",
+        "players", "web_prop_cards", "predictions",
+    )
+
     def _initialize_database(self):
         """Create database and tables if they don't exist."""
         self.conn = sqlite3.connect(self.db_path)
@@ -82,7 +91,29 @@ class DatabaseManager:
         with open(schema_path, "r", encoding="utf-8") as f:
             self.conn.executescript(f.read())
 
+        self._ensure_sport_columns()
+
         logger.info("Database initialized at %s", self.db_path)
+
+    def _ensure_sport_columns(self):
+        """Add ``sport TEXT NOT NULL DEFAULT 'nba'`` to the multi-sport tables
+        when missing. Idempotent; table names come from a hardcoded tuple
+        (no injection)."""
+        for table in self._SPORT_COLUMN_TABLES:
+            try:
+                cols = {
+                    r[1] for r in self.conn.execute(
+                        f"PRAGMA table_info({table})").fetchall()
+                }
+            except sqlite3.OperationalError:
+                continue
+            if not cols or "sport" in cols:
+                continue
+            self.conn.execute(
+                f"ALTER TABLE {table} "
+                "ADD COLUMN sport TEXT NOT NULL DEFAULT 'nba'"
+            )
+        self.conn.commit()
 
     def get_team_recent_avg_total(
         self,
@@ -114,6 +145,36 @@ class DatabaseManager:
         if not totals:
             return None
         return sum(totals) / len(totals)
+
+    def get_team_recent_avg_points(
+        self,
+        team_abbrev: str,
+        n_games: int = 20,
+    ) -> Optional[float]:
+        """Average points the team itself scored over its last N games.
+
+        This is the *per-team* baseline that matches ``team_priors``'
+        per-team ``implied_team_total`` (≈ ``(consensus_total ± spread) / 2``),
+        so ``blend_team_prior`` compares like-with-like. (Contrast
+        ``get_team_recent_avg_total`` which returns the full game total
+        ``pts + opp_pts``.) Returns ``None`` when the team has no recent games.
+        """
+        if not team_abbrev:
+            return None
+        rows = self.conn.execute(
+            """
+            SELECT pts FROM games
+            WHERE upper(team_abbrev) = upper(?)
+              AND pts IS NOT NULL
+            ORDER BY game_date DESC
+            LIMIT ?
+            """,
+            (team_abbrev, int(max(1, n_games))),
+        ).fetchall()
+        pts = [float(r[0]) for r in rows if r and r[0] is not None]
+        if not pts:
+            return None
+        return sum(pts) / len(pts)
 
     def upsert_team_priors(self, records):
         """Upsert reverse-engineered priors (one row per matchup)."""
@@ -176,6 +237,62 @@ class DatabaseManager:
                 "home_win_prob_devig", "away_win_prob_devig",
                 "pace_factor", "n_books", "latest_observed_at"]
         return dict(zip(keys, row))
+
+    def get_team_prior_inputs(self, player_team: str, opponent_team: str) -> dict:
+        """Resolve the team-prior signals for a player's team in a matchup.
+
+        ``team_priors`` is keyed by ``(away_team, home_team)``; we don't know
+        which side the player is on, so we try both orientations and read the
+        matching ``*_team_total`` for the player's side. Returns a dict ready
+        to splat into ``simulation.blend_team_prior``
+        (``pace_factor`` / ``implied_team_total`` / ``team_recent_avg_total``),
+        or ``{}`` when no prior exists for the matchup.
+        """
+        if not player_team or not opponent_team:
+            return {}
+        # Player at home → matchup stored as (opponent=away, player=home).
+        prior = self.get_team_prior(opponent_team, player_team)
+        player_is_home = True
+        if prior is None:
+            prior = self.get_team_prior(player_team, opponent_team)
+            player_is_home = False
+        if prior is None:
+            return {}
+        implied = (prior.get("home_team_total") if player_is_home
+                   else prior.get("away_team_total"))
+        return {
+            "pace_factor": prior.get("pace_factor"),
+            "implied_team_total": implied,
+            "team_recent_avg_total": self.get_team_recent_avg_points(player_team),
+        }
+
+    def get_team_prior_inputs_map(self) -> dict:
+        """Map every team in ``team_priors`` to its ``blend_team_prior`` inputs.
+
+        Each matchup row contributes both sides (home + away). When a team
+        appears in multiple matchups the last row wins — fine for a single
+        current slate. Used by the prop-board / hourly recompute paths to
+        blend priors for the whole slate at once.
+        """
+        rows = self.conn.execute(
+            "SELECT away_team, home_team, away_team_total, home_team_total, "
+            "pace_factor FROM team_priors"
+        ).fetchall()
+        out: dict = {}
+        for away, home, away_tt, home_tt, pace in rows:
+            if home:
+                out[str(home).upper()] = {
+                    "pace_factor": pace,
+                    "implied_team_total": home_tt,
+                    "team_recent_avg_total": self.get_team_recent_avg_points(home),
+                }
+            if away:
+                out[str(away).upper()] = {
+                    "pace_factor": pace,
+                    "implied_team_total": away_tt,
+                    "team_recent_avg_total": self.get_team_recent_avg_points(away),
+                }
+        return out
 
     def backfill_predictions_outcomes(self):
         """Settle every pending ``predictions`` row whose game now has logs.
@@ -1535,7 +1652,7 @@ class DatabaseManager:
             FROM predictions p
             LEFT JOIN game_logs gl
                 ON p.player_id = gl.player_id
-                AND p.game_date = gl.game_date
+                AND DATE(p.game_date) = DATE(gl.game_date)
             WHERE p.game_date BETWEEN ? AND ?
               AND p.actual_result IS NOT NULL
             ORDER BY p.game_date DESC

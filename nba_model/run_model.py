@@ -23,6 +23,7 @@ from nba_model.model.parlay_ev import calculate_parlay_ev
 from nba_model.model.parlay_simulation import simulate_multi_leg_sgp
 from nba_model.model.simulation import (
     SUPPORTED_DISTRIBUTIONS,
+    blend_team_prior,
     monte_carlo_over,
     normalize_distribution_name,
 )
@@ -156,9 +157,20 @@ def run_single_prop(
     defense_severity: float = 1.0,
     minutes_penalty_severity: float = 1.0,
     sigma_severity: float = 1.0,
+    player_team: Optional[str] = None,
+    opponent_team: Optional[str] = None,
+    team_prior_alpha: float = 0.3,
+    db_path: str = "data/database/nba_data.db",
 ):
-    """Run single-leg points model flow using unified feature columns."""
-    loader = DataLoader()
+    """Run single-leg points model flow using unified feature columns.
+
+    When ``player_team`` + ``opponent_team`` are supplied and a cross-book
+    ``team_priors`` row exists for the matchup, the projection (``mu``/``sigma``)
+    is nudged toward the market's implied pace + team total via
+    ``simulation.blend_team_prior`` so the model and the chart's book-mean
+    reference pull from the same signal.
+    """
+    loader = DataLoader(db_path=db_path)
     df = loader.load_player_data(player_name, n_games=n_games)
     df = add_rolling_stats(df, rolling_window)
 
@@ -201,6 +213,26 @@ def run_single_prop(
         league_avg_def_rating=float(league_avg_def_rating),
         sensitivity=effective_defense_sensitivity,
     )
+
+    # Blend in the cross-book team prior (pace + implied team total) when the
+    # matchup is known and a prior exists. No-op otherwise.
+    mu_pre_prior = float(mu)
+    team_prior_inputs: dict = {}
+    if player_team and opponent_team:
+        try:
+            team_prior_inputs = loader.db.get_team_prior_inputs(
+                player_team, opponent_team,
+            )
+        except Exception:  # noqa: BLE001 — prior is best-effort, never fatal
+            team_prior_inputs = {}
+    if team_prior_inputs:
+        mu, adjusted_sigma = blend_team_prior(
+            mu, adjusted_sigma,
+            pace_factor=team_prior_inputs.get("pace_factor"),
+            implied_team_total=team_prior_inputs.get("implied_team_total"),
+            team_recent_avg_total=team_prior_inputs.get("team_recent_avg_total"),
+            alpha=float(team_prior_alpha),
+        )
 
     selected_distribution = normalize_distribution_name(distribution)
     p_over = monte_carlo_over(
@@ -252,6 +284,9 @@ def run_single_prop(
         "defense_severity": float(defense_severity),
         "minutes_penalty_severity": float(minutes_penalty_severity),
         "sigma_severity": float(sigma_severity),
+        "mu_pre_prior": float(mu_pre_prior),
+        "team_prior_applied": bool(team_prior_inputs),
+        "team_prior_inputs": team_prior_inputs or None,
     }
 
 

@@ -191,15 +191,28 @@ def validate_parlay_legs_count(n: int) -> int:
 # Used by the daily ETL + web_prop_cards parser to drop scraper-poisoned rows
 # before they ever reach the betting_lines table.
 
+def _known_stats_for_sport(sport: Optional[str]) -> set:
+    """Canonical stat-type set for a sport. NBA uses the hardcoded
+    ``KNOWN_STAT_TYPES``; other sports read the ``sports/`` registry so we
+    don't hardcode NFL/MLB/etc. stat lists here."""
+    if not sport or str(sport).strip().lower() == "nba":
+        return set(KNOWN_STAT_TYPES)
+    from sports import get_sport
+    return {str(s).strip().lower() for s in get_sport(sport).stat_types}
+
+
 def validate_stat_type(
     stat_type: Any,
     *,
     allowed: Optional[Iterable[str]] = None,
+    sport: Optional[str] = None,
 ) -> str:
     """Coerce + validate a chart stat-type input.
 
     Resolves common aliases ("3pm" → "three_pointers_made") and rejects
-    anything not in ``KNOWN_STAT_TYPES``.  When ``allowed`` is supplied
+    anything not known for the sport.  For NBA (default) the allow-set is
+    ``KNOWN_STAT_TYPES``; for other sports it comes from the ``sports/``
+    registry (``Sport.stat_types``).  When ``allowed`` is supplied
     (e.g. the free-tier preview list), the result must also be in that
     subset — used to enforce per-tier caps without leaking premium-only
     stats through URL params.
@@ -210,10 +223,13 @@ def validate_stat_type(
     if not text:
         raise ValidationError("stat_type is required")
     canonical = STAT_TYPE_ALIASES.get(text, text)
-    if canonical not in KNOWN_STAT_TYPES:
+    known = _known_stats_for_sport(sport)
+    if not known:
+        raise ValidationError(f"no stat types registered for sport {sport!r}")
+    if canonical not in known:
         raise ValidationError(
             f"unknown stat_type {stat_type!r}; "
-            f"expected one of {sorted(KNOWN_STAT_TYPES)}"
+            f"expected one of {sorted(known)}"
         )
     if allowed is not None:
         allowed_set = {str(a).strip().lower() for a in allowed}

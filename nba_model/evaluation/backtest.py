@@ -389,8 +389,20 @@ class Backtester:
                 line = prediction['expected_value']
                 line_source = "model"
 
+            # The bet decision must use P(over) at the SAME line we settle on.
+            # _make_prediction computed prob_over at line_value-or-mean; when the
+            # settlement line differs (market line, or the model-mean fallback)
+            # recompute so the decision, EV, and Brier are all consistent.
+            prob_over = prob_over_distribution(
+                line=line,
+                mu=prediction['expected_value'],
+                sigma=prediction['std_dev'],
+                distribution=self.distribution,
+                sample_size=int(window),
+            )
+
             spread_value, spread_source = self._get_game_spread_with_source(upcoming_game)
-            outcome = self._evaluate_outcome(actual_value, line, prediction['prob_over'])
+            outcome = self._evaluate_outcome(actual_value, line, prob_over)
 
             # Store result
             result = {
@@ -401,7 +413,7 @@ class Backtester:
                 'rolling_window': int(window),
                 'predicted_mean': prediction['expected_value'],
                 'predicted_std': prediction['std_dev'],
-                'prob_over': prediction['prob_over'],
+                'prob_over': prob_over,
                 'line': line,
                 'line_source': line_source,
                 'spread_value': spread_value,

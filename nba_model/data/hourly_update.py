@@ -26,13 +26,18 @@ Idempotency / overlap safety:
 from __future__ import annotations
 
 import argparse
-import fcntl
 import json
 import logging
 import os
 import sys
 import time
 import traceback
+
+try:  # POSIX (the dev Mac / launchd host) — preferred path.
+    import fcntl
+except ImportError:  # pragma: no cover - Windows dev box has no fcntl.
+    fcntl = None
+    import msvcrt
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -57,27 +62,61 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-@contextmanager
-def _acquire_lock(lockfile: str):
-    """Non-blocking fcntl lock. Yields True if acquired, False if already held."""
-    path = Path(lockfile)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fh = open(path, "w", encoding="utf-8")
-    try:
+def _try_lock(fh) -> bool:
+    """Non-blocking exclusive lock. Returns True if acquired, False if held."""
+    if fcntl is not None:
         try:
             fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
         except BlockingIOError:
+            return False
+    # Windows fallback: lock a single byte at offset 0 (mandatory, per-handle).
+    try:
+        fh.seek(0)
+        msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+        return True
+    except OSError:
+        return False
+
+
+def _release_lock(fh) -> None:
+    if fcntl is not None:
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        return
+    try:
+        fh.seek(0)
+        msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+    except OSError:
+        pass
+
+
+@contextmanager
+def _acquire_lock(lockfile: str):
+    """Non-blocking advisory lock. Yields True if acquired, False if already held."""
+    path = Path(lockfile)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # "r+" avoids truncating a file whose byte range another handle has locked
+    # (Windows refuses the truncate); touch first so the file always exists.
+    path.touch(exist_ok=True)
+    fh = open(path, "r+", encoding="utf-8")
+    try:
+        if not _try_lock(fh):
             yield False
             return
-        fh.write(f"pid={os.getpid()} started={_utc_now_iso()}\n")
-        fh.flush()
+        try:
+            fh.seek(0)
+            fh.truncate()
+            fh.write(f"pid={os.getpid()} started={_utc_now_iso()}\n")
+            fh.flush()
+        except OSError:
+            pass
         try:
             yield True
         finally:
-            try:
-                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
-            except OSError:
-                pass
+            _release_lock(fh)
     finally:
         fh.close()
 
@@ -284,6 +323,7 @@ def _run_prediction_recompute(db_path: str) -> dict:
 
     Returns counts; per-prediction errors are aggregated, not raised.
     """
+    from nba_model.data.database.db_manager import DatabaseManager
     from nba_model.model.prop_board import (
         DEFAULT_N_GAMES,
         DEFAULT_ROLLING_WINDOW,
@@ -317,17 +357,67 @@ def _run_prediction_recompute(db_path: str) -> dict:
         except Exception as exc:  # noqa: BLE001 — single-player failure shouldn't kill the run
             history_failures.append({"player": player_name, "error": str(exc)})
 
+    # Blend the cross-book team priors (pace + implied team total) for the
+    # whole slate so the hourly-refreshed projections share the market signal.
+    with DatabaseManager(db_path=db_path) as db:
+        team_priors_map = db.get_team_prior_inputs_map()
+
     board_lines = _build_board_lines(
         rows=rows,
         player_histories=histories,
         rolling_window=DEFAULT_ROLLING_WINDOW,
+        team_priors=team_priors_map,
     )
+
+    # Persist the board lines as predictions so the predictions table widens
+    # beyond points (points/assists/rebounds/pra) and the deployed model's
+    # predicted_mean is actually stored. Idempotent for today's slate:
+    # re-delete this (player, date, stat) before inserting so repeated hourly
+    # ticks don't pile up duplicate rows.
+    name_to_id: dict = {}
+    for r in rows.itertuples(index=False):
+        name_to_id.setdefault(str(r.player_name), int(r.player_id))
+    persisted = _persist_predictions(db_path, board_lines, name_to_id, today)
+
     return {
         "scored": len(board_lines),
+        "predictions_persisted": persisted,
         "target_date": today,
         "history_failures": history_failures,
         "players": len(histories),
+        "teams_with_priors": len(team_priors_map),
     }
+
+
+def _persist_predictions(db_path, board_lines, name_to_id, target_date) -> int:
+    """Write board lines into the predictions table (idempotent per slate)."""
+    if not board_lines:
+        return 0
+    from nba_model.data.database.db_manager import DatabaseManager
+    persisted = 0
+    with DatabaseManager(db_path=db_path) as db:
+        for line in board_lines:
+            pid = name_to_id.get(line.player_name)
+            if pid is None:
+                continue
+            db.conn.execute(
+                "DELETE FROM predictions WHERE player_id = ? "
+                "AND date(game_date) = date(?) AND lower(stat_type) = lower(?)",
+                (int(pid), target_date, str(line.stat_type)),
+            )
+            db.insert_prediction({
+                "player_id": int(pid),
+                "game_date": target_date,
+                "stat_type": str(line.stat_type),
+                "predicted_mean": float(line.mu),
+                "predicted_std": float(line.sigma),
+                "prob_over": float(line.prob_over),
+                "line_value": float(line.line_value),
+                "book_odds": line.over_odds,
+                "expected_value": line.ev_over,
+            })
+            persisted += 1
+    return persisted
 
 
 def run_hourly_update(
@@ -341,8 +431,10 @@ def run_hourly_update(
     max_players: int = 25,
     require_playwright: bool = True,
     skip_recompute: bool = False,
+    alert_webhook_url: Optional[str] = None,
 ) -> dict:
     """Execute the hourly pipeline and return the JSON report dict."""
+    from nba_model.data.etl_alerts import build_alert, maybe_send_alert
     report = {
         "started_at": _utc_now_iso(),
         "ended_at": None,
@@ -364,7 +456,9 @@ def run_hourly_update(
         report["failed_steps"].append("preflight")
         report["ended_at"] = _utc_now_iso()
         report["exit_code"] = EXIT_PREFLIGHT_FAILED
+        report["alert"] = build_alert(report)
         report["report_path"] = _write_report(report, report_dir)
+        maybe_send_alert(report, alert_webhook_url)
         logger.error("preflight failed: %s", exc)
         return report
 
@@ -385,7 +479,9 @@ def run_hourly_update(
     report["ended_at"] = _utc_now_iso()
     report["ok"] = not report["failed_steps"]
     report["exit_code"] = EXIT_OK if report["ok"] else EXIT_STEP_FAILED
+    report["alert"] = build_alert(report)
     report["report_path"] = _write_report(report, report_dir)
+    maybe_send_alert(report, alert_webhook_url)
     return report
 
 
@@ -406,6 +502,10 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Skip the Playwright preflight (useful for unit tests; do NOT use in prod).",
     )
     parser.add_argument("--skip-recompute", action="store_true")
+    parser.add_argument(
+        "--alert-webhook-url", default=None,
+        help="POST a JSON alert here when the run fails or partially fails.",
+    )
     return parser
 
 
@@ -428,6 +528,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             max_players=args.max_players,
             require_playwright=not args.no_require_playwright,
             skip_recompute=args.skip_recompute,
+            alert_webhook_url=args.alert_webhook_url,
         )
 
     logger.info(

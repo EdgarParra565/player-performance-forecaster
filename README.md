@@ -14,8 +14,14 @@ The current baseline is designed to be reproducible offline (synthetic benchmark
 - Per-book scraper package (`nba_model/scrapers/`) registers 20 books — 9 actively producing parsed data (PrizePicks, Underdog, Pick6, ParlayPlay for player props; BetMGM, Caesars, DraftKings, Bovada, Kalshi for team lines). Cross-book consensus rolls into both player and team charts as `book mean X.X`.
 - NBA API ingest (`nba_model/data/nba_results_ingestion.py`) populates a `games` table (8K+ team-game rows) and bulk player game logs (90K+ rows across 3 seasons + 1K players) from `leaguegamefinder` / `playergamelogs`.
 - Streamlit + Tk UIs both expose Player charts, Team charts, Game Results, and Player Stats Browse. All graphing inputs go through `nba_model/web/input_validation.py` (stat type / team code / season / rolling window).
-- Production-ready auth + billing scaffold: native Streamlit OIDC (Google + Microsoft) sign-in, Stripe-powered Free vs Premium tiers, FastAPI webhook handler with HMAC verification, replay tolerance, idempotency, body-size cap (256 KiB), per-IP rate limiting (120/60s), slowloris timeout, and the OWASP-recommended HTTP security headers. Full threat model + 4-layer hardening pass + adversarial / data-poisoning input validation in [docs/SECURITY.md](docs/SECURITY.md).
-- 182/182 tests passing (regression + stress + adversarial + scanners). `bandit` MEDIUM/HIGH baseline = 0; `pip-audit` clean; 30 consecutive stress runs flake-free.
+- **Book Edge Scanner** (`nba_model/model/edge_scanner.py` + the "Line edge scanner" Streamlit view): pick one or more books and rank the whole slate's props by *model-vs-line edge* — each scraped book line compared against the player's fitted-normal projection (μ = last-N mean, σ = sample std). A line below μ is a soft over (P(over) > 50%). DFS books without a posted price are scored against the -110 breakeven (52.4%). μ/σ are memoized per (player, stat) so a 200-prop slate does one game-log fetch per unique player+stat.
+- **Team-line priors wired into the live model**: `blend_team_prior()` (pace + implied team total from the cross-book `team_priors` table) now nudges `run_single_prop`, `prop_board`, and the hourly recompute so the model μ and the chart book-mean share one signal.
+- Production-ready auth + billing scaffold: native Streamlit OIDC (Google + Microsoft) sign-in, Stripe-powered Free vs Premium tiers (with a **Customer Portal "Manage subscription"** link for premium users), FastAPI webhook handler with HMAC verification, replay tolerance, idempotency, body-size cap (256 KiB), per-IP rate limiting (120/60s), slowloris timeout, and the OWASP-recommended HTTP security headers. Full threat model + 4-layer hardening pass + adversarial / data-poisoning input validation in [docs/SECURITY.md](docs/SECURITY.md).
+- Expanded Player Charts: box/quantile, calendar heatmap, win/loss + starter/bench + vs-opponent splits, pace+minutes, cumulative line-vs-actual ribbon, CLV proxy, model-EV-vs-fitted-EV, parlay correlation heatmap, and a Kelly-stake suggestion.
+- Admin dashboard (subscribers / MRR estimate / churn) gated to `is_admin()`; Stripe `STRIPE_MODE=test|live` env toggle; webhook alert on `invoice.payment_failed`; free-tier app-layer scan throttle; optional first-sign-in trial (`ENABLE_TRIAL`).
+- ETL alerting: daily + hourly reports embed an `alert` marker and accept `--alert-webhook-url`. The hourly recompute persists predictions for points/assists/rebounds/pra. The distribution sweep settles each stat at a realistic per-stat line by default (no more `line == mean` degeneracy).
+- **Multi-sport scaffolding (NFL-first):** idempotent `sport` column on the six core tables, per-`(book, sport)` scraper resolution, and registry-driven stat validation. NFL ingestion + scrapers are the next step.
+- **455 tests passing** (regression + stress + adversarial + scanners + edge-scanner + team-prior integration + billing + multi-sport). `bandit` MEDIUM/HIGH baseline = 0; `pip-audit` clean; stress runs flake-free.
 - **Multi-sport scaffolding** in place: `sports/` package at the project root with `Sport` config dataclass + modules for `nba` (live) and stubs for `nfl`, `mlb`, `nhl`, `soccer` (sub-leagues: EPL, La Liga, Serie A, Bundesliga, Ligue 1, UCL; future: Copa Libertadores + Copa Sudamericana). Streamlit sidebar has a sport-picker — selecting a non-live sport shows a roadmap card in the main pane with that sport's stat types, sub-leagues, and open questions. Full rollout plan in [docs/MULTI_SPORT_PLAN.md](docs/MULTI_SPORT_PLAN.md).
 
 ## Repository Layout
@@ -80,7 +86,7 @@ docker compose up streamlit                       # web UI on http://localhost:8
 docker compose --profile billing up webhook        # FastAPI Stripe webhook on :8000
 
 # One-shot services
-docker compose --profile tools run --rm tests      # full pytest suite (194 cases)
+docker compose --profile tools run --rm tests      # full pytest suite (387 cases)
 docker compose --profile tools run --rm etl-bulk   # bulk nba_api ingest
 docker compose --profile tools run --rm \
   -e SEASONS="2025-26 2024-25" etl-bulk            # multi-season refresh
@@ -202,7 +208,14 @@ Quick summary of what's wired:
   `data/database/subscriptions.db` with one row per email; idempotent
   Stripe-event recording.
 - `nba_model/web/stripe_helpers.py` — builds the Checkout URL from either a
-  pre-built **Payment Link** or a server-side Checkout Session.
+  pre-built **Payment Link** or a server-side Checkout Session, and a
+  **Customer Portal** session URL (`customer_portal_url`, return URL via
+  `STRIPE_PORTAL_RETURN_URL`) so premium users can self-manage / cancel.
+- `nba_model/data/publish_db.py` + `scripts/publish_db.sh` — the nightly
+  DB-publish hook: backs up `nba_data.db`, refuses to publish while the DB is
+  locked, logs row counts, supports `--dry-run`, then commits + pushes the
+  refreshed DB so a read-only cloud deploy redeploys with fresh data
+  (DEPLOYMENT.md §14).
 - `nba_model/web/webhook_app.py` — FastAPI app on `/stripe/webhook` that
   verifies signatures with the Stripe SDK and updates the subscription store
   on `checkout.session.completed`, `customer.subscription.{created,updated,
@@ -221,8 +234,10 @@ Quick summary of what's wired:
 | Team charts                      | yes (preview stats only)              | yes (all stats) |
 | Game Results browser             | yes                                   | yes     |
 | Player Stats Browse              | yes                                   | yes     |
+| Line edge scanner                | preview players/stats (8 scans/min)   | full slate, unthrottled |
 | All-stats overview               | locked                                | yes     |
 | Parlay analysis (single + multi) | locked                                | yes     |
+| Admin dashboard                  | n/a                                   | admin-only (subscribers / MRR / churn) |
 
 ### 1a) Player Charts Web App (Streamlit)
 
@@ -237,9 +252,12 @@ summary on selection change. Switching player reloads everything live.
 Then open http://localhost:8501. Layout:
 
 - **Sidebar**: DB path, team filter, player dropdown, **view mode** radio
-  (`Player charts | Team charts | Game Results | Player Stats Browse` for free,
-  premium adds `All stats overview` + `Parlay analysis`), stat, last-N games, rolling
-  window, distribution overlay checkboxes (normal / poisson / negative-binomial),
+  (`Player charts | Team charts | Compare players | Line edge scanner |
+  Game Results | Player Stats Browse` for free; premium adds `All stats
+  overview | Single prop (model) | Parlay analysis | Manual lines import`;
+  admins also get `Operations (admin)` + `Admin (dashboard)`), stat, last-N
+  games, rolling window, distribution overlay checkboxes (normal / poisson /
+  negative-binomial),
   "Reload DB indexes" button to bust caches. All numeric/categorical inputs
   (stat type, team code, season, n_games, rolling window) are validated through
   `nba_model/web/input_validation.py` before they hit the DB or model code; bad
@@ -249,13 +267,18 @@ Then open http://localhost:8501. Layout:
   - **Overview** — recent-N-games chart with rolling mean, plus distribution
     histogram with the selected fitted distribution overlays and a vertical
     dashed line per book at that book's current line.
-  - **Splits** — home/away + rest-day-bucket chart, plus the same numbers in two
-    side-by-side tables.
+  - **Splits** — home/away + rest-day-bucket chart and tables, plus
+    **Win/Loss** and **Starter/Bench** (minutes ≥ 20 heuristic) tables, a
+    **box / quantile** chart of the stat with the book line overlaid, and a
+    **calendar heatmap** of mean stat by weekday × month.
   - **Hit Rate + Custom Line** — historical-over-rate-per-book bar chart with a
     tick at each book's break-even, then a sortable book-lines table with
     progress-bar columns for `P(over)` and `hit_rate`, then a custom-line probe
     form (line + American odds → fitted P(over), historical over-rate, EV per
-    unit for OVER and UNDER, plus a `+EV/-EV` verdict).
+    unit for OVER and UNDER, a `+EV/-EV` verdict, and a **Kelly stake**
+    suggestion for the best side — full + half-Kelly).
+  - **Line Movement** — open→current line drift per book from
+    `betting_line_snapshots` (empty-state when no snapshots are stored yet).
   - **Raw data** — the actual game-log rows used to build the charts.
 
 The Player charts view above is one of a growing set of top-level view modes.
@@ -266,6 +289,15 @@ The others:
   only stat books surface at the lobby level). Free tier sees preview
   stats; premium sees all of `points / assists / rebounds / pra / 3pm /
   fgm / minutes`.
+- **Line edge scanner** (free preview + premium): pick one or more books and
+  see every current prop ranked by model-vs-line edge (P(over) under the
+  fitted normal vs the implied breakeven). Filters for books / stats / history
+  window / min-edge / min-P(over) / only-+EV, a model-mode toggle
+  (last-N mean | rolling window), a KPI row (props scanned / +EV / freshness),
+  a sortable table with progress-bar columns for `p_over` and `model_edge`,
+  CSV export, and an "open in Player Charts" jump. Free tier is limited to the
+  preview players/stats; premium scans the full slate. CLI equivalent:
+  `python3 -m nba_model.model.edge_scanner --books underdog prizepicks --min-edge 0.05`.
 - **Compare players** (free + premium): overlay 2–3 players' distributions
   for the same stat to find the strongest fit for a parlay leg.
 - **Game Results** (free): recent NBA matchups with final scores + winner.
@@ -939,7 +971,9 @@ Latest results are generated into:
 - Benchmark metrics are synthetic and validate pipeline behavior, not live betting edge.
 - Live NBA API calls require network access when cache/database does not already contain player games.
 - Cross-book/model-vs-book and monthly diagnostics depend on having populated `betting_lines` and `predictions` data.
-- Historical open/close line snapshots are not yet stored, so line-move analysis is still limited.
+- The Book Edge Scanner and Line Movement views need scraped `web_prop_cards` / `betting_line_snapshots` rows from the Chrome-host ETL; both show an empty-state until that data is present.
+- 11 of 20 scrapers are still parser-less (need authenticated CDP snapshots from the dev-Mac Chrome host).
+- `betting_lines` market coverage is thin (~2 days), which blocks `--use-market-lines` distribution sweeps and meaningful CLV analysis.
 
 ## Operational Runbook (ETL & Odds Ingestion)
 

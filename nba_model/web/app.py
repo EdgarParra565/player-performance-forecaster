@@ -21,6 +21,7 @@ if str(_PROJECT_ROOT) not in sys.path:
 import pandas as pd
 import streamlit as st
 
+from nba_model.model import edge_scanner as es
 from nba_model.model.simulation import SUPPORTED_DISTRIBUTIONS
 from nba_model.visualization import player_charts as pc
 from nba_model.visualization import plotly_charts as plc
@@ -336,6 +337,17 @@ def _custom_line_panel(data: pc.PlayerChartData) -> None:
         verdict = "+EV" if best_ev > 0 else "-EV"
         side = "OVER" if best_over else "UNDER"
         st.success(f"Best side: **{side}** — {verdict} ({best_ev:+.3f} per unit)")
+
+        # Kelly stake suggestion for the best side (full + half-Kelly).
+        kelly = res["kelly_over"] if best_over else res["kelly_under"]
+        if kelly and kelly > 0:
+            st.caption(
+                f"Kelly stake ({side}): **{kelly:.1%}** of bankroll "
+                f"(half-Kelly {kelly / 2:.1%}). Full Kelly is aggressive — "
+                "many bettors use ¼–½."
+            )
+        else:
+            st.caption("Kelly stake: 0% — no edge at these odds, no bet.")
 
     # Probe history: keep a running list per-session so power users can
     # iterate through lines and then export the whole audit as CSV.
@@ -876,8 +888,8 @@ def _parlay_multi(
                     lines=[leg.line for leg in legs],
                     american_odds=(validated_parlay_odds or 0),
                     sportsbook="custom",
-                    n_games=int(n_games),
-                    n_sims=int(n_sims),
+                    n_games=int(validated_ngames),
+                    n_sims=int(validated_n_sims),
                 )
             parlay_rows.insert(0, {
                 "method": "Model SGP (correlated Gaussian)",
@@ -918,11 +930,252 @@ def _parlay_multi(
 
 def _ev_quick(prob, american_odds) -> Optional[float]:
     """Tiny EV helper for the parlay view."""
-    if prob is None or american_odds is None:
+    if prob is None or not american_odds:
         return None
     o = int(american_odds)
+    if o == 0:
+        return None
     dec = 1.0 + (o / 100.0 if o > 0 else 100.0 / abs(o))
     return float(prob * (dec - 1.0) - (1.0 - prob))
+
+
+@st.cache_data(show_spinner=False)
+def _cached_scanner_books(db_path: str) -> list[str]:
+    """Distinct books currently in web_prop_cards, unioned with the expected set."""
+    from nba_model.data.database.db_manager import DatabaseManager
+    found: list[str] = []
+    try:
+        with DatabaseManager(db_path=db_path) as db:
+            rows = db.conn.execute(
+                "SELECT DISTINCT book FROM web_prop_cards "
+                "WHERE player_classification = 'active_nba'"
+            ).fetchall()
+        found = [str(r[0]) for r in rows if r and r[0]]
+    except Exception:
+        found = []
+    # Union with the expected DFS/sportsbook set (title-cased for display),
+    # preserving any exact scraped casing first.
+    seen = {b.lower() for b in found}
+    for b in pc.EXPECTED_BOOKS:
+        if b.lower() not in seen:
+            found.append(b.title())
+            seen.add(b.lower())
+    return sorted(found, key=str.lower)
+
+
+def _admin_dashboard_view() -> None:
+    """Admin-only: subscriber counts, MRR estimate, recent churn."""
+    from nba_model.web import subscriptions
+    st.subheader(":bar_chart: Admin dashboard")
+    st.caption(
+        "Subscription health from the configured backend "
+        f"(`{subscriptions.selected_backend()}`). MRR uses "
+        "`STRIPE_PRICE_MONTHLY_USD` (env) × active premium."
+    )
+    try:
+        stats = subscriptions.aggregate_stats()
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"Could not load subscription stats: {exc}")
+        return
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Premium", stats["premium"])
+    c2.metric("Free / total", f"{stats['free']} / {stats['total']}")
+    c3.metric(
+        "MRR estimate",
+        f"${stats['mrr_estimate']:,.0f}" if stats["mrr_estimate"] is not None
+        else "— (set price)",
+    )
+    c4.metric("Recent churn", stats["churned"],
+              help="Subscriptions whose last Stripe event was a cancellation.")
+    if stats["price_monthly"] is None:
+        st.info(
+            "Set `STRIPE_PRICE_MONTHLY_USD` to estimate MRR "
+            "(e.g. `export STRIPE_PRICE_MONTHLY_USD=9.99`)."
+        )
+
+
+def _edge_scanner_view(db_path: str, user) -> None:
+    """Book Edge Scanner: rank slate-wide props by model-vs-line edge.
+
+    Picks one or more books, fits each player's last-N normal (μ/σ) and ranks
+    every current line by how far the model's P(best side) beats the implied
+    breakeven (DFS lines priced at -110 by default)."""
+    st.subheader(":mag: Book Edge Scanner")
+    st.caption(
+        "Slate-wide model-vs-line edge: each book line vs the player's "
+        "fitted-normal projection (μ = last-N mean). A line **below μ** is a "
+        "soft over (P(over) > 50%). DFS books without a posted price are "
+        "scored against the -110 breakeven (52.4%)."
+    )
+
+    all_books = _cached_scanner_books(db_path)
+    if not all_books:
+        st.warning(
+            "No scraped prop cards in the DB yet. Run the web-text ETL "
+            "(`nba_model.data.daily_etl` / hourly update) on the Chrome host "
+            "to populate `web_prop_cards`."
+        )
+        return
+
+    is_premium = bool(getattr(user, "is_premium", False))
+    stat_options = (STAT_CHOICES if is_premium
+                    else tuple(web_auth.PREVIEW_STATS))
+    n_games_max = 200 if is_premium else web_auth.PREVIEW_MAX_GAMES
+
+    with st.sidebar:
+        st.markdown("### Edge scanner")
+        books = st.multiselect(
+            "Books", all_books,
+            default=all_books[: min(3, len(all_books))],
+            help="Only props from these books are scanned.",
+            key="es_books",
+        )
+        stats = st.multiselect(
+            "Stat types", stat_options, default=list(stat_options),
+            key="es_stats",
+        )
+        n_games = st.slider(
+            "History window (games for μ/σ)", min_value=2,
+            max_value=int(n_games_max),
+            value=min(25, int(n_games_max)), key="es_ngames",
+        )
+        model_mode_label = st.radio(
+            "Model", ["Last-N mean (charts)", "Rolling window (prop board)"],
+            index=0, key="es_model_mode",
+        )
+        model_mode = ("chart_mean" if model_mode_label.startswith("Last-N")
+                      else "rolling")
+        rolling_window = 10
+        if model_mode == "rolling":
+            rolling_window = st.slider(
+                "Rolling window", min_value=3, max_value=30, value=10,
+                key="es_rolling",
+            )
+        min_p_over = st.slider(
+            "Min P(over) to show", 0.0, 1.0, 0.0, step=0.05, key="es_minp",
+        )
+        min_edge = st.slider(
+            "Min model edge", 0.0, 0.5, 0.0, step=0.01, key="es_minedge",
+        )
+        only_positive_ev = st.checkbox(
+            "Only +EV rows", value=False, key="es_posev",
+        )
+        if st.button("Refresh scan", key="es_refresh"):
+            _cached_scanner_books.clear()
+            st.rerun()
+
+    if not books:
+        st.info("Select at least one book in the sidebar to scan.")
+        return
+
+    # Free-tier app-layer throttle: cap full-slate scans per session so a tight
+    # rerun loop can't hammer the DB. Premium is unthrottled.
+    if not is_premium:
+        from nba_model.web import throttle
+        if not throttle.session_rate_limit("edge_scan", max_calls=8,
+                                           window_seconds=60.0):
+            st.warning(
+                "Scan rate limit reached for the free tier (8 / minute). "
+                "Wait a moment or upgrade for unthrottled scans."
+            )
+            return
+
+    try:
+        lines = es.fetch_latest_prop_lines(
+            db_path, books=books, stat_types=stats or None,
+        )
+        scored = es.score_prop_edges(
+            lines, db_path=db_path, n_games=int(n_games),
+            model_mode=model_mode, rolling_window=int(rolling_window),
+        )
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"Edge scan failed: {exc}")
+        return
+
+    # Free tier: restrict to the preview player set (same gate as other views).
+    if not is_premium and not scored.empty:
+        preview = {p.casefold() for p in web_auth.PREVIEW_PLAYERS}
+        scored = scored[
+            scored["player_name"].str.casefold().isin(preview)
+        ].reset_index(drop=True)
+
+    ranked = es.top_edges(
+        scored,
+        min_p_over=(min_p_over or None),
+        min_edge=(min_edge or None),
+        only_positive_ev=only_positive_ev,
+        limit=200,
+    )
+
+    # ---- KPI row ----
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Props scanned", int(len(scored)))
+    k2.metric("Clearing filters", int(len(ranked)))
+    pos_ev = int((scored["ev_best"].fillna(-1) > 0).sum()) if not scored.empty else 0
+    k3.metric("+EV props", pos_ev)
+    if not scored.empty and scored["observed_hours_ago"].notna().any():
+        freshest = float(scored["observed_hours_ago"].min())
+        k4.metric("Freshest line", pc._format_staleness(freshest))
+    else:
+        k4.metric("Freshest line", "—")
+
+    if not is_premium:
+        st.info(
+            "Free preview: scanner limited to "
+            f"{', '.join(web_auth.PREVIEW_PLAYERS)} "
+            f"({', '.join(web_auth.PREVIEW_STATS)}, last "
+            f"{web_auth.PREVIEW_MAX_GAMES} games). Upgrade for the full slate."
+        )
+
+    if ranked.empty:
+        st.warning("No props cleared the current filters.")
+        return
+
+    # ---- Main table ----
+    display = ranked.drop(columns=["observed_at_utc"], errors="ignore")
+    st.dataframe(
+        display,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "p_over": st.column_config.ProgressColumn(
+                "P(over)", min_value=0.0, max_value=1.0, format="%.2f",
+            ),
+            "model_edge": st.column_config.ProgressColumn(
+                "Model edge", min_value=0.0, max_value=0.5, format="%.3f",
+            ),
+            "book_line": st.column_config.NumberColumn("Line", format="%.1f"),
+            "model_mu": st.column_config.NumberColumn("μ (model)", format="%.1f"),
+            "line_vs_mu": st.column_config.NumberColumn("Line − μ", format="%.1f"),
+            "ev_best": st.column_config.NumberColumn("EV (best)", format="%.3f"),
+            "consensus_mean": st.column_config.NumberColumn(
+                "Consensus", format="%.1f"),
+            "observed_hours_ago": st.column_config.NumberColumn(
+                "Age (h)", format="%.1f"),
+        },
+    )
+    st.caption(
+        "Gold opportunities: P(over) > 0.55 **and** line < μ (soft overs). "
+        "Sorted by model edge."
+    )
+
+    _csv_download_button(
+        ranked, label="Download edge scan as CSV",
+        filename="book_edge_scan.csv", key="csv_edge_scan",
+    )
+
+    # ---- Jump into Player Charts for a row ----
+    players_in_scan = list(dict.fromkeys(ranked["player_name"].tolist()))
+    jump = st.selectbox(
+        "Open a player in Player Charts", ["(pick a player)"] + players_in_scan,
+        index=0, key="es_jump",
+    )
+    if jump and jump != "(pick a player)":
+        if st.button(f"Go to {jump}", key="es_jump_go"):
+            row = ranked[ranked["player_name"] == jump].iloc[0]
+            _qp_set(player=jump, stat=str(row["stat_type"]),
+                    view="Player charts")
+            st.rerun()
 
 
 def _game_results_view(db_path: str) -> None:
@@ -1841,16 +2094,18 @@ def main() -> None:
     # ---- Primary nav (View mode = top-level pills) ----
     free_views = [
         "Player charts", "Team charts", "Compare players",
+        "Line edge scanner",
         "Game Results", "Player Stats Browse",
     ]
     premium_views = [
         "Player charts", "Team charts", "Compare players",
+        "Line edge scanner",
         "All stats (overview)", "Single prop (model)",
         "Parlay analysis", "Manual lines import",
         "Game Results", "Player Stats Browse",
     ]
     if web_auth.is_admin():
-        premium_views = premium_views + ["Operations (admin)"]
+        premium_views = premium_views + ["Operations (admin)", "Admin (dashboard)"]
     view_options = premium_views if user.is_premium else free_views
     view_default = _qp_get(_QP_VIEW, view_options[0])
 
@@ -1876,6 +2131,8 @@ def main() -> None:
     is_single_model  = view_mode.startswith("Single prop")
     is_manual_lines  = view_mode.startswith("Manual lines")
     is_operations    = view_mode.startswith("Operations")
+    is_admin_dash    = view_mode.startswith("Admin")
+    is_edge_scanner  = view_mode.startswith("Line edge")
 
     # ---- Views with their own controls (no shared selection row) ----
     if is_game_results:
@@ -1885,6 +2142,10 @@ def main() -> None:
     if is_player_browse:
         st.markdown("<hr class='section-divider'/>", unsafe_allow_html=True)
         _player_browse_view(db_path)
+        return
+    if is_edge_scanner:
+        st.markdown("<hr class='section-divider'/>", unsafe_allow_html=True)
+        _edge_scanner_view(db_path, user)
         return
     if is_single_model:
         st.markdown("<hr class='section-divider'/>", unsafe_allow_html=True)
@@ -1912,6 +2173,14 @@ def main() -> None:
         st.markdown("<hr class='section-divider'/>", unsafe_allow_html=True)
         from nba_model.web import operations_panel as _ops
         _ops.render_operations_panel(on_authorized=web_auth.is_admin)
+        return
+    if is_admin_dash:
+        # Same hard admin gate as Operations (defends ?view= deep-links).
+        if not web_auth.is_admin():
+            st.error(":lock: The admin dashboard is admin-only.")
+            return
+        st.markdown("<hr class='section-divider'/>", unsafe_allow_html=True)
+        _admin_dashboard_view()
         return
 
     # ---- Shared selection bar (Team / Player / Stat / N games + Filters) ----
@@ -2206,8 +2475,9 @@ def main() -> None:
         return
 
     # ---- Charts (tabs) -------------------------------------------------
-    tab_overview, tab_splits, tab_hitrate, tab_data = st.tabs(
-        ["Overview", "Splits", "Hit Rate + Custom Line", "Raw data"]
+    tab_overview, tab_splits, tab_hitrate, tab_movement, tab_data = st.tabs(
+        ["Overview", "Splits", "Hit Rate + Custom Line",
+         "Line Movement", "Raw data"]
     )
 
     with tab_overview:
@@ -2258,6 +2528,66 @@ def main() -> None:
             hide_index=True, use_container_width=True,
         )
 
+        # Win/loss + starter/bench splits.
+        wl = pc.compute_win_loss_split(data)
+        sb = pc.compute_starter_bench_split(data)
+        cols2 = st.columns(2)
+        cols2[0].markdown("**Win / Loss**")
+        cols2[0].dataframe(
+            pd.DataFrame([
+                {"result": k, "mean": v["mean"], "n": v["n"]}
+                for k, v in wl.items() if v
+            ]),
+            hide_index=True, use_container_width=True,
+        )
+        cols2[1].markdown("**Starter / bench** (minutes ≥ 20)")
+        cols2[1].dataframe(
+            pd.DataFrame([
+                {"role": k, "mean": v["mean"], "n": v["n"]}
+                for k, v in sb.items() if v
+            ]),
+            hide_index=True, use_container_width=True,
+        )
+
+        st.markdown("---")
+        st.caption("Distribution spread (box / quantiles)")
+        st.plotly_chart(
+            plc.build_box_quantile_figure(data),
+            use_container_width=True,
+            key=f"plotly_box_single_{data.player_id}_{data.stat_type}",
+        )
+        st.caption("Calendar performance (mean by weekday / month)")
+        st.plotly_chart(
+            plc.build_calendar_heatmap_figure(data),
+            use_container_width=True,
+            key=f"plotly_calendar_single_{data.player_id}_{data.stat_type}",
+        )
+        st.caption("Mean by opponent (matchup split)")
+        st.plotly_chart(
+            plc.build_opponent_split_figure(data),
+            use_container_width=True,
+            key=f"plotly_opp_single_{data.player_id}_{data.stat_type}",
+        )
+        st.caption("Minutes & per-minute productivity (projected-minutes baseline)")
+        st.plotly_chart(
+            plc.build_minutes_efficiency_figure(data),
+            use_container_width=True,
+            key=f"plotly_minutes_single_{data.player_id}_{data.stat_type}",
+        )
+        with st.expander("Stat correlations (parlay context)", expanded=False):
+            try:
+                corr = pc.compute_correlation_matrix(
+                    db_path, data.player_id,
+                    ["points", "rebounds", "assists"],
+                )
+            except Exception:  # noqa: BLE001
+                corr = pd.DataFrame()
+            st.plotly_chart(
+                plc.build_correlation_heatmap_figure(corr, data.player_name),
+                use_container_width=True,
+                key=f"plotly_corr_single_{data.player_id}",
+            )
+
     with tab_hitrate:
         st.caption("Historical over-rate per book line; 50% reference shown")
         st.plotly_chart(
@@ -2271,6 +2601,83 @@ def main() -> None:
         st.markdown("---")
         st.markdown("### Custom line probe")
         _custom_line_panel(data)
+        st.markdown("---")
+        st.markdown("### Model EV vs fitted-from-data EV")
+        st.caption(
+            "Stored model EV (predictions table) vs the EV implied by the "
+            "player's current fitted normal at the same line + odds."
+        )
+        try:
+            ev_df = pc.fetch_model_vs_fitted_ev(db_path, data)
+        except Exception as exc:  # noqa: BLE001
+            ev_df = None
+            st.error(f"Failed to build model-vs-fitted EV: {exc}")
+        if ev_df is not None:
+            st.plotly_chart(
+                plc.build_model_vs_fitted_ev_figure(ev_df, data.stat_type),
+                use_container_width=True,
+                key=f"plotly_modelev_single_{data.player_id}_{data.stat_type}",
+            )
+
+    with tab_movement:
+        st.caption(
+            "Open → current line drift per book from betting_line_snapshots "
+            "(last 7 days)"
+        )
+        try:
+            snapshots = pc.fetch_line_movement_snapshots(
+                db_path=db_path,
+                player_id=data.player_id,
+                stat_type=data.stat_type,
+            )
+        except Exception as exc:  # noqa: BLE001
+            snapshots = None
+            st.error(f"Failed to load line snapshots: {exc}")
+        if snapshots is not None:
+            st.plotly_chart(
+                plc.build_line_movement_figure(
+                    snapshots,
+                    stat_type=data.stat_type,
+                    current_line=data.market_consensus_line,
+                ),
+                use_container_width=True,
+                key=f"plotly_movement_single_{data.player_id}_{data.stat_type}",
+            )
+            if snapshots.empty:
+                st.info(
+                    "No line snapshots stored yet for this player + stat. "
+                    "The timeline fills in as the daily/hourly ETL writes to "
+                    "betting_line_snapshots."
+                )
+        st.markdown("---")
+        st.caption("Game-by-game book line vs actual (over/under outcomes)")
+        try:
+            ribbon = pc.fetch_cumulative_line_vs_actual(
+                db_path, data.player_id, data.stat_type,
+            )
+        except Exception as exc:  # noqa: BLE001
+            ribbon = None
+            st.error(f"Failed to build line-vs-actual: {exc}")
+        if ribbon is not None:
+            st.plotly_chart(
+                plc.build_line_vs_actual_ribbon_figure(ribbon, data.stat_type),
+                use_container_width=True,
+                key=f"plotly_ribbon_single_{data.player_id}_{data.stat_type}",
+            )
+        st.caption("CLV proxy — open vs current line per book")
+        try:
+            clv = pc.fetch_clv_proxy_by_book(
+                db_path, data.player_id, data.stat_type,
+            )
+        except Exception as exc:  # noqa: BLE001
+            clv = None
+            st.error(f"Failed to build CLV proxy: {exc}")
+        if clv is not None:
+            st.plotly_chart(
+                plc.build_clv_proxy_figure(clv, data.stat_type),
+                use_container_width=True,
+                key=f"plotly_clv_single_{data.player_id}_{data.stat_type}",
+            )
 
     with tab_data:
         st.caption(f"Last {data.values.size} games")

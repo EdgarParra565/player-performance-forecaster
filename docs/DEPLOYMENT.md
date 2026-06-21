@@ -451,9 +451,36 @@ Pieces:
 1. `scripts/scheduler/hourly_update.sh` does the work hour-by-hour;
    the JSON report under `nba_model/data/artifacts/hourly/` flags whether
    the run was clean enough to publish.
-2. Add a downstream "publish" hook (left as a follow-up; not on the
-   critical path for billing launch) that, on a clean run, does:
-   `git add data/database/nba_data.db && git commit -m "etl: hourly snapshot $(date -u +%FT%TZ)" && git push origin main`.
+2. **`scripts/publish_db.sh`** (implemented) is the downstream "publish"
+   hook. On invocation it backs up the DB, refuses to publish when the DB
+   is locked (an ETL writer is still active), logs row counts for the
+   headline tables, then `git add` + `commit` + `push` only when the DB
+   actually changed. It's a thin wrapper that re-execs
+   `.venv/bin/python3 -m nba_model.data.publish_db` so cron / launchd can't
+   pick up system python.
+
+   Install: chain it after a clean hourly run. Either append to the
+   launchd wrapper / a wrapping shell line:
+
+   ```bash
+   scripts/scheduler/hourly_update.sh && scripts/publish_db.sh
+   ```
+
+   or add a second launchd job that runs `scripts/publish_db.sh` a few
+   minutes after the hourly tick. Flags:
+
+   ```bash
+   scripts/publish_db.sh --dry-run                 # print plan, touch nothing
+   scripts/publish_db.sh --branch data --remote origin
+   scripts/publish_db.sh --message "etl: manual publish"
+   ```
+
+   Exit codes: `0` ok / nothing-changed, `2` DB missing, `3` DB locked
+   (retry next tick), `4` a git command failed. Pre-publish backups land
+   in `data/database/backups/nba_data_<UTC>.db`.
+
+   Note: `data/database/*.db` is gitignored, so the hook stages with
+   `git add -f` — publishing the DB blob is deliberate, not accidental.
 3. Streamlit Cloud auto-redeploys on push; the app reads
    `data/database/nba_data.db` at startup as today.
 

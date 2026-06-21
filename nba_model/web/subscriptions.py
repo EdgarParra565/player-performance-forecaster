@@ -507,6 +507,71 @@ def lookup(email: str, db_path: Optional[str] = None) -> Optional[dict]:
     return _sqlite_lookup(target, normalized)
 
 
+def _all_subscription_rows(db_path: Optional[str] = None) -> list:
+    """Return every subscription row as a list of dicts (both backends)."""
+    backend = _selected_backend(db_path)
+    target = _resolved_target(db_path)
+    cols = ("email", "tier", "last_event_type", "updated_at",
+            "current_period_end")
+    if backend == "postgres":
+        with _connect_postgres(target) as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT email, tier, last_event_type, updated_at, "
+                "current_period_end FROM user_subscriptions")
+            return [dict(zip(cols, r)) for r in cur.fetchall()]
+    with _connect_sqlite(target) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT email, tier, last_event_type, updated_at, "
+            "current_period_end FROM user_subscriptions").fetchall()
+    return [dict(r) for r in rows]
+
+
+def _resolve_price_monthly(price_monthly: Optional[float]) -> Optional[float]:
+    if price_monthly is not None:
+        return float(price_monthly)
+    raw = os.environ.get("STRIPE_PRICE_MONTHLY_USD")
+    if raw:
+        try:
+            return float(raw)
+        except ValueError:
+            return None
+    return None
+
+
+def _aggregate_from_rows(rows: list, price_monthly: Optional[float] = None) -> dict:
+    """Pure aggregation for the admin dashboard (testable without a DB)."""
+    n_premium = sum(1 for r in rows if str(r.get("tier")) == "premium")
+    n_total = len(rows)
+    n_free = n_total - n_premium
+    churned = sum(
+        1 for r in rows
+        if "deleted" in str(r.get("last_event_type") or "").lower()
+    )
+    mrr = round(n_premium * float(price_monthly), 2) if price_monthly else None
+    return {
+        "premium": n_premium,
+        "free": n_free,
+        "total": n_total,
+        "churned": churned,
+        "mrr_estimate": mrr,
+        "price_monthly": float(price_monthly) if price_monthly else None,
+    }
+
+
+def aggregate_stats(
+    db_path: Optional[str] = None,
+    price_monthly: Optional[float] = None,
+) -> dict:
+    """Subscriber counts + MRR estimate + recent churn for the admin view.
+
+    ``price_monthly`` falls back to the ``STRIPE_PRICE_MONTHLY_USD`` env var;
+    when neither is set ``mrr_estimate`` is ``None`` (we can't infer revenue).
+    """
+    rows = _all_subscription_rows(db_path)
+    return _aggregate_from_rows(rows, _resolve_price_monthly(price_monthly))
+
+
 def selected_backend(db_path: Optional[str] = None) -> str:
     """Inspect which backend would be used for the given override (or env).
 

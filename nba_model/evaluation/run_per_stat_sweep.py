@@ -28,7 +28,10 @@ import argparse
 import logging
 from datetime import datetime, timezone
 
-from nba_model.evaluation.run_distribution_sweep import DEFAULT_PLAYERS
+from nba_model.evaluation.run_distribution_sweep import (
+    DEFAULT_LINES_BY_STAT,
+    DEFAULT_PLAYERS,
+)
 from nba_model.evaluation.run_batch_backtest import run_batch_backtest
 
 DEFAULT_WINDOWS = [5, 7, 10, 15]
@@ -40,19 +43,8 @@ DEFAULT_DISTRIBUTIONS = ["normal", "poisson"]
 logger = logging.getLogger(__name__)
 
 
-# Realistic per-stat lines.  These are the kind of numbers a book would
-# actually price for star NBA players; the line=25.5 default in the
-# vanilla sweep made the sweep meaningless for assists / rebounds / PRA.
-DEFAULT_LINES_BY_STAT: dict[str, float] = {
-    "points":   24.5,
-    "assists":   6.5,
-    "rebounds":  7.5,
-    "pra":      35.5,
-    "ra":       11.5,
-    "three_pointers_made": 2.5,
-    "field_goals_made":    9.5,
-    "minutes": 33.5,
-}
+# Realistic per-stat lines now live in run_distribution_sweep as the canonical
+# source (the main sweep uses them too); imported above as DEFAULT_LINES_BY_STAT.
 
 
 def _parse_line_overrides(items: list[str] | None) -> dict[str, float]:

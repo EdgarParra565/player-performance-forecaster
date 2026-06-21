@@ -370,8 +370,12 @@ class DBResilienceTests(unittest.TestCase):
         os.environ["SUBSCRIPTIONS_DB_PATH"] = path
         # Force schema creation
         subscriptions.upsert(email="warm@example.com", tier="premium")
-        with sqlite3.connect(path) as raw:
+        raw = sqlite3.connect(path)
+        try:
             raw.execute("DROP TABLE user_subscriptions")
+            raw.commit()
+        finally:
+            raw.close()
         # Next read should recreate via _SCHEMA and return free for unknown.
         try:
             tier = subscriptions.tier_for("warm@example.com")

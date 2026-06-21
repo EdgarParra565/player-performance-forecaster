@@ -64,15 +64,20 @@ SCRAPERS: tuple[BookScraper, ...] = (
 
 BY_DOMAIN: dict[str, BookScraper] = {s.domain: s for s in SCRAPERS}
 BY_NAME: dict[str, BookScraper] = {s.name: s for s in SCRAPERS}
+# (book, sport) -> scraper. A book may have one config per sport once non-NBA
+# scrapers land; today every entry is sport='nba'.
+BY_NAME_SPORT: dict[tuple, BookScraper] = {(s.name, s.sport): s for s in SCRAPERS}
 
 
-def get_scraper_for_url(url: str) -> Optional[BookScraper]:
+def get_scraper_for_url(url: str, sport: Optional[str] = None) -> Optional[BookScraper]:
     """Return the scraper whose domain (or alias) matches ``url``'s host.
 
     When multiple scrapers match (e.g. ``pick6.draftkings.com`` matches both
     ``pick6.draftkings.com`` and ``draftkings.com``), the one with the
     longest matching domain wins so subdomain-specific scrapers take
-    precedence over their parents.
+    precedence over their parents. When ``sport`` is given, only scrapers for
+    that sport are considered (the multi-sport rollout: same domain can host
+    a different per-sport config).
     """
     try:
         host = urlparse(str(url or "")).netloc.lower()
@@ -81,9 +86,12 @@ def get_scraper_for_url(url: str) -> Optional[BookScraper]:
     if host.startswith("www."):
         host = host[4:]
     host = host.split(":")[0]
+    sport_key = str(sport).strip().lower() if sport else None
     best: Optional[BookScraper] = None
     best_specificity = -1
     for scraper in SCRAPERS:
+        if sport_key is not None and scraper.sport != sport_key:
+            continue
         for candidate in (scraper.domain,) + scraper.aliases:
             if host == candidate or host.endswith(f".{candidate}"):
                 if len(candidate) > best_specificity:
@@ -98,12 +106,21 @@ def get_scraper_by_name(name: str) -> Optional[BookScraper]:
     return BY_NAME.get(str(name or "").strip().lower())
 
 
+def get_scraper_for_book_sport(book: str, sport: str = "nba") -> Optional[BookScraper]:
+    """Resolve a scraper by ``(book, sport)`` — the multi-sport lookup."""
+    return BY_NAME_SPORT.get(
+        (str(book or "").strip().lower(), str(sport or "nba").strip().lower())
+    )
+
+
 __all__ = [
     "BookScraper",
     "SessionMarkers",
     "SCRAPERS",
     "BY_DOMAIN",
     "BY_NAME",
+    "BY_NAME_SPORT",
     "get_scraper_for_url",
     "get_scraper_by_name",
+    "get_scraper_for_book_sport",
 ]

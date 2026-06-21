@@ -60,6 +60,10 @@ class BookScraper:
 
     name: str
     domain: str
+    # Sport this scraper config targets. NBA is the only live sport today; the
+    # field exists so per-(book, sport) resolution works once NFL/MLB/etc.
+    # scrapers land (a book can have one config per sport).
+    sport: str = "nba"
     wait_selectors: tuple[str, ...] = ()
     extra_wait_seconds: float = 0.0
     session_markers: SessionMarkers = field(default_factory=SessionMarkers)

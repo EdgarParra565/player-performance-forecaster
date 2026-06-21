@@ -402,6 +402,12 @@ def extract_session_via_cdp(
         if token_keys:
             logger.info("Auth-related localStorage keys found: %s", token_keys)
 
+        # Disconnect the CDP client (does not kill the user's Chrome).
+        try:
+            browser.close()
+        except Exception:
+            pass
+
     return {
         "status": "saved",
         "auth_state_file": str(auth_path),
@@ -992,6 +998,14 @@ def _fetch_url_text_via_cdp(
         finally:
             if opened_new_tab:
                 page.close()
+            # Disconnect the CDP client so we don't leak a websocket to the
+            # real Chrome on every URL in the ingestion loop. close() on a
+            # connect_over_cdp browser only disconnects — it does NOT kill the
+            # user's Chrome.
+            try:
+                browser.close()
+            except Exception:
+                pass
 
     max_chars = max(0, int(max_chars))
     if max_chars > 0 and len(visible_text) > max_chars:

@@ -257,6 +257,33 @@ def _email_from_event(obj) -> Optional[str]:
         return None
 
 
+def alert_payment_failed(email, *, poster=None) -> dict:
+    """Best-effort admin alert when a known paying user's payment fails.
+
+    Posts a minimal JSON to ``BILLING_ALERT_WEBHOOK_URL`` (Slack/Discord/
+    generic) so the operator can reach out before the subscription lapses.
+    The email is sent only to that operator-controlled endpoint — never logged
+    here (the webhook's no-PII-in-logs policy still holds). Never raises.
+    ``poster`` is injected for tests.
+    """
+    url = os.environ.get("BILLING_ALERT_WEBHOOK_URL")
+    if not url or not email:
+        return {"sent": False, "reason": "no_webhook_or_email"}
+    try:
+        if poster is None:
+            import requests
+            poster = requests.post
+        resp = poster(
+            url,
+            json={"text": f"Payment failed for paying user: {email}",
+                  "event": "invoice.payment_failed", "email": email},
+            timeout=10,
+        )
+        return {"sent": True, "status_code": getattr(resp, "status_code", None)}
+    except Exception as exc:  # noqa: BLE001 — alerting must never break the webhook
+        return {"sent": False, "reason": f"post_failed: {type(exc).__name__}"}
+
+
 @app.get("/healthz")
 def healthz() -> dict:
     """Liveness probe. Intentionally returns no app version or build info to
@@ -397,6 +424,10 @@ async def stripe_webhook(request: Request) -> dict:
                 event_id, type(exc).__name__,
             )
             return {"received": True, "rejected": True}
+
+        # Alert the operator when a paying user's payment fails (best-effort).
+        if event_type == "invoice.payment_failed":
+            alert_payment_failed(email)
 
     # Don't echo the email back in the response body. Stripe doesn't read it,
     # and a misconfigured proxy could log responses.

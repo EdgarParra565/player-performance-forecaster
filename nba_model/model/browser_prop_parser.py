@@ -225,12 +225,18 @@ def _canonicalize_stat(raw_stat: str) -> Optional[str]:
 
 
 def _parse_line_value(raw_line: str) -> Optional[float]:
-    """Parse numeric line value and keep reasonable prop ranges."""
+    """Parse numeric line value and keep reasonable prop ranges.
+
+    Ceiling is 250, not 100: `fantasy_points` and combo (PRA-style) lines can
+    legitimately exceed 100, and dropping them silently lost a whole stat
+    category. Absurd scraper noise (e.g. 9999.5) is still rejected here and
+    again by ``is_plausible_betting_line`` at DB insert.
+    """
     try:
         value = float(raw_line)
     except (TypeError, ValueError):
         return None
-    if value < 0 or value > 100:
+    if value < 0 or value > 250:
         return None
     return value
 

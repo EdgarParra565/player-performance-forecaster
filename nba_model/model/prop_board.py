@@ -29,7 +29,7 @@ from nba_model.data.database.db_manager import DatabaseManager
 from nba_model.model.feature_engineering import add_rolling_stats
 from nba_model.model.odds import american_to_implied_prob, expected_value
 from nba_model.model.probability import prob_over_distribution
-from nba_model.model.simulation import get_default_distribution
+from nba_model.model.simulation import blend_team_prior, get_default_distribution
 
 
 DEFAULT_DB_PATH = "data/database/nba_data.db"
@@ -75,29 +75,30 @@ def _fetch_betting_lines_for_game(
         raise ValueError("At least one stat_type must be provided")
 
     with DatabaseManager(db_path=db_path) as db:
+        # NOTE: sqlite3 cannot expand a tuple bound to a single named/qmark
+        # placeholder, so multi-value IN clauses are built with one ``?`` per
+        # value and fed via a positional params list (same pattern as
+        # edge_scanner.fetch_latest_prop_lines).
+        stat_placeholders = ",".join("?" * len(stat_types))
         clauses: list[str] = [
-            "bl.game_date = :game_date",
-            "lower(bl.stat_type) IN (:stat_types)",
+            "bl.game_date = ?",
+            f"lower(bl.stat_type) IN ({stat_placeholders})",
         ]
-        params: dict = {
-            "game_date": str(game_date)[:10],
-            "stat_types": tuple(stat_types),
-        }
+        params: list = [str(game_date)[:10], *stat_types]
 
         if home_team and away_team:
-            clauses.append("p.team IN (:home_team, :away_team)")
-            params["home_team"] = home_team
-            params["away_team"] = away_team
+            clauses.append("p.team IN (?, ?)")
+            params.extend([home_team, away_team])
         elif home_team or away_team:
-            team = home_team or away_team
-            clauses.append("p.team = :team")
-            params["team"] = team
+            clauses.append("p.team = ?")
+            params.append(home_team or away_team)
 
         if books:
             books_norm = [str(b).strip() for b in books if str(b).strip()]
             if books_norm:
-                clauses.append("bl.book IN (:books)")
-                params["books"] = tuple(books_norm)
+                book_placeholders = ",".join("?" * len(books_norm))
+                clauses.append(f"bl.book IN ({book_placeholders})")
+                params.extend(books_norm)
 
         where_sql = " AND ".join(clauses)
         sql = f"""
@@ -164,7 +165,16 @@ def _build_board_lines(
     rows: pd.DataFrame,
     player_histories: dict[str, pd.Series],
     rolling_window: int,
+    team_priors: Optional[dict] = None,
+    team_prior_alpha: float = 0.3,
 ) -> List[BoardLine]:
+    """Build per-line projections.
+
+    ``team_priors`` (optional) maps an upper-cased team abbrev to the
+    ``blend_team_prior`` inputs for that team in this game; when a row's team
+    matches, its (mu, sigma) is nudged toward the market's pace + team total.
+    """
+    team_priors = team_priors or {}
     lines: List[BoardLine] = []
 
     for _, row in rows.iterrows():
@@ -175,6 +185,16 @@ def _build_board_lines(
             continue
 
         mu, sigma = _project_stat_from_history(latest, stat_type=stat_type)
+        team_abbrev = str(row.get("team") or "").upper()
+        prior_inputs = team_priors.get(team_abbrev)
+        if prior_inputs:
+            mu, sigma = blend_team_prior(
+                mu, sigma,
+                pace_factor=prior_inputs.get("pace_factor"),
+                implied_team_total=prior_inputs.get("implied_team_total"),
+                team_recent_avg_total=prior_inputs.get("team_recent_avg_total"),
+                alpha=float(team_prior_alpha),
+            )
         line_value = float(row["line_value"])
         distribution = get_default_distribution(stat_type)
 
@@ -275,10 +295,22 @@ def main():
         except Exception as exc:  # pragma: no cover - defensive skip for bad histories
             print(f"Skipping {player_name}: {exc}")
 
+    # Resolve cross-book team priors for both sides of the matchup (when the
+    # teams are known) so projections share the market's pace/total signal.
+    team_priors: dict = {}
+    if args.home_team and args.away_team:
+        with DatabaseManager(db_path=args.db_path) as db:
+            team_priors[args.home_team.upper()] = db.get_team_prior_inputs(
+                args.home_team, args.away_team)
+            team_priors[args.away_team.upper()] = db.get_team_prior_inputs(
+                args.away_team, args.home_team)
+        team_priors = {k: v for k, v in team_priors.items() if v}
+
     board_lines = _build_board_lines(
         rows=rows,
         player_histories=player_histories,
         rolling_window=args.rolling_window,
+        team_priors=team_priors,
     )
 
     if not board_lines:
