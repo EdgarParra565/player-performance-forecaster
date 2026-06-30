@@ -265,10 +265,18 @@ def _run_game_log_refresh(db_path: str, max_players: int) -> dict:
 
     db = DatabaseManager(db_path=db_path)
     # Players that already have history in the DB — same set the daily ETL uses.
+    # game_logs is keyed by player_id (no name column), so resolve the name via
+    # the scraper-synced active-players ref, falling back to the players table.
     rows = db.conn.execute(
-        "SELECT DISTINCT player_name FROM game_logs "
-        "WHERE player_name IS NOT NULL "
-        "ORDER BY player_name LIMIT ?",
+        """
+        SELECT DISTINCT COALESCE(r.player_name, p.name) AS name
+        FROM game_logs gl
+        LEFT JOIN nba_active_players_ref r ON r.player_id = gl.player_id
+        LEFT JOIN players p ON p.player_id = gl.player_id
+        WHERE COALESCE(r.player_name, p.name) IS NOT NULL
+        ORDER BY name
+        LIMIT ?
+        """,
         (int(max_players),),
     ).fetchall()
     loader = DataLoader()

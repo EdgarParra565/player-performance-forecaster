@@ -67,6 +67,9 @@ class PlayerChartData:
     book_lines: pd.DataFrame = field(default_factory=pd.DataFrame)
     market_consensus_line: Optional[float] = None
     notes: list[str] = field(default_factory=list)
+    # Per-book line-movement summaries (only books whose line actually moved
+    # within the lookback window). See ``_fetch_line_movement``.
+    line_movement: list[dict] = field(default_factory=list)
 
     @property
     def market_median_line(self) -> Optional[float]:
@@ -134,6 +137,8 @@ def fetch_player_chart_data(
             db, player_id, canonical, player_name=player_name,
         )
         market_line = _market_consensus_line(book_lines)
+        resolved_name = _resolve_web_player_name(db, player_id, player_name)
+        line_movement = _fetch_line_movement(db, canonical, resolved_name)
 
     if games.empty:
         notes.append("No game logs found for this player.")
@@ -149,6 +154,7 @@ def fetch_player_chart_data(
         book_lines=book_lines,
         market_consensus_line=market_line,
         notes=notes,
+        line_movement=line_movement,
     )
 
 
@@ -282,6 +288,108 @@ def fetch_clv_proxy_by_book(
             "n_snapshots": int(len(grp)),
         })
     return pd.DataFrame(rows, columns=columns)
+
+
+def _resolve_web_player_name(
+    db: DatabaseManager, player_id: int, player_name: Optional[str]
+) -> str:
+    """Resolve the player name used to key ``web_prop_cards``.
+
+    Prefers the passed name, then ``nba_active_players_ref`` (kept in sync by
+    the scraper), then the sparse ``players`` table.
+    """
+    resolved = (player_name or "").strip()
+    if resolved:
+        return resolved
+    row = db.conn.execute(
+        "SELECT player_name FROM nba_active_players_ref WHERE player_id = ?",
+        (int(player_id),),
+    ).fetchone()
+    if row and row[0]:
+        return str(row[0])
+    row = db.conn.execute(
+        "SELECT name FROM players WHERE player_id = ?", (int(player_id),)
+    ).fetchone()
+    return str(row[0]) if row and row[0] else ""
+
+
+def _line_movement_text(book: str, previous: float, current: float, direction: str) -> str:
+    """Human sentence describing a single book's line move.
+
+    Up moves are reported from the lowest prior line; down moves from the
+    highest — i.e. the extreme the line travelled away from.
+    """
+    extreme = "low" if direction == "up" else "high"
+    return (
+        f"{book}: line moved {direction} from {previous:g} "
+        f"({extreme}) to {current:g}"
+    )
+
+
+def _fetch_line_movement(
+    db: DatabaseManager,
+    stat_type: str,
+    resolved_name: str,
+    web_lookback_hours: float = 48.0,
+) -> list[dict]:
+    """Per-book line-movement summaries from ``web_prop_cards`` history.
+
+    For each book that posted more than one distinct line within the lookback
+    window, report the current (latest) line and the extreme it moved from:
+    the lowest line when the net move is up, the highest when it is down.
+    Books whose line never moved are omitted.
+    """
+    if not resolved_name:
+        return []
+    query = """
+        SELECT book, line_value, observed_at_utc
+        FROM web_prop_cards
+        WHERE lower(player_name) = lower(?)
+          AND lower(stat_type) = lower(?)
+          AND observed_at_utc >= datetime('now', ?)
+          AND line_value IS NOT NULL
+        ORDER BY book ASC, observed_at_utc ASC
+    """
+    df = pd.read_sql_query(
+        query,
+        db.conn,
+        params=(resolved_name, str(stat_type), f"-{float(web_lookback_hours)} hours"),
+    )
+    if df.empty:
+        return []
+
+    out: list[dict] = []
+    for book, group in df.groupby("book"):
+        vals = pd.to_numeric(group["line_value"], errors="coerce").dropna()
+        series = [round(float(v), 3) for v in vals.tolist()]
+        if len(series) < 2:
+            continue
+        low, high = min(series), max(series)
+        if low == high:  # observed multiple times but never moved
+            continue
+        opening, current = series[0], series[-1]
+        # Net direction by current-vs-opening; on a wash, attribute to the
+        # larger swing so the reported extreme is the meaningful one.
+        if current > opening or (
+            current == opening and (current - low) >= (high - current)
+        ):
+            direction, previous = "up", low
+        else:
+            direction, previous = "down", high
+        if previous == current:
+            continue
+        out.append(
+            {
+                "book": str(book),
+                "current": current,
+                "previous": previous,
+                "direction": direction,
+                "delta": round(current - previous, 3),
+                "n_points": int(len(series)),
+                "text": _line_movement_text(str(book), previous, current, direction),
+            }
+        )
+    return out
 
 
 def _fetch_latest_book_lines(

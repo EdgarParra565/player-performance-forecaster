@@ -131,19 +131,27 @@ STAT_CHOICES = (
 )
 
 
-@st.cache_data(show_spinner=False)
+# TTL bounds how long a running session can show a stale dropdown after the
+# hourly ETL scrapes new game logs. Chart data itself (fetch_player_chart_data)
+# is uncached and already reflects the latest DB on every rerun; these caches
+# only back the team/player pickers, so a 5-minute TTL lets newly-scraped
+# players/teams surface automatically without a manual "Reload DB indexes".
+_INDEX_CACHE_TTL_SECONDS = 300
+
+
+@st.cache_data(show_spinner=False, ttl=_INDEX_CACHE_TTL_SECONDS)
 def _cached_teams(db_path: str) -> list[str]:
     return pc.list_teams(db_path)
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=_INDEX_CACHE_TTL_SECONDS)
 def _cached_team_codes(db_path: str) -> list[str]:
     """Distinct team codes parsed from game_logs.matchup (works even when
     players.team is unset, which is the case for almost every row today)."""
     return pc.list_team_codes(db_path)
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=_INDEX_CACHE_TTL_SECONDS)
 def _cached_players(db_path: str, team: str) -> pd.DataFrame:
     return pc.list_players_with_data(db_path, team=team or None)
 
@@ -229,6 +237,21 @@ def _books_panel(data: pc.PlayerChartData) -> None:
                 f"sigma across books = {consensus['stdev']:.3f}  |  "
                 f"spread (max-min) = {consensus['spread']:.3f}"
             )
+    _render_line_movement(data)
+
+
+def _render_line_movement(data: pc.PlayerChartData) -> None:
+    """Surface per-book line moves drawn from web_prop_cards history."""
+    movement = getattr(data, "line_movement", None)
+    if not movement:
+        return
+    st.markdown("**Line movement (last 48h)**")
+    for mv in movement:
+        icon = "📈" if mv["direction"] == "up" else "📉"
+        st.caption(
+            f"{icon} {mv['text']}  "
+            f"(Δ {mv['delta']:+g} over {mv['n_points']} obs)"
+        )
 
 
 def _render_book_lines_table(data: pc.PlayerChartData) -> None:

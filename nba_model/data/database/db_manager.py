@@ -931,9 +931,67 @@ class DatabaseManager:
         ).fetchall()
         return [str(row[0]).strip() for row in rows if row and str(row[0]).strip()]
 
+    @staticmethod
+    def _norm_line(value):
+        """Round a line to 3 decimals for change comparison; pass None through."""
+        if value is None:
+            return None
+        try:
+            return round(float(value), 3)
+        except (TypeError, ValueError):
+            return None
+
+    def _latest_web_prop_card_line(self, book, player_name, stat_type, side):
+        """Most-recently-observed line for a (book, player, stat, side), or None.
+
+        Used to skip re-inserting a prop card whose line hasn't moved since the
+        last scrape — a new row is only written when the book actually changes
+        the line (or no prior row exists).
+        """
+        cur = self.conn.execute(
+            """
+            SELECT line_value
+            FROM web_prop_cards
+            WHERE book = ? AND player_name = ? AND stat_type = ? AND side = ?
+            ORDER BY observed_at_utc DESC, card_id DESC
+            LIMIT 1
+            """,
+            (book, player_name, stat_type, side),
+        )
+        row = cur.fetchone()
+        return None if row is None else self._norm_line(row[0])
+
+    def _latest_web_team_line_state(
+        self, book, away_team, home_team, market_type, side, team
+    ):
+        """Most-recent (line_value, odds) for a team-line key, or None.
+
+        ``team`` may be NULL (totals); ``IS`` matches NULL and values alike.
+        """
+        cur = self.conn.execute(
+            """
+            SELECT line_value, odds_american
+            FROM web_team_lines
+            WHERE book = ? AND away_team = ? AND home_team = ?
+              AND market_type = ? AND side = ? AND team IS ?
+            ORDER BY observed_at_utc DESC, line_id DESC
+            LIMIT 1
+            """,
+            (book, away_team, home_team, market_type, side, team),
+        )
+        row = cur.fetchone()
+        if row is None:
+            return None
+        return (self._norm_line(row[0]), row[1])
+
     def insert_web_prop_cards(self, records):
         """
         Insert parsed web prop cards with dedupe via record_sha256.
+
+        Beyond the per-snapshot ``record_sha256`` uniqueness, this also skips
+        any card whose line equals the most-recently-stored line for the same
+        (book, player, stat, side): re-scraping an unchanged game adds no row,
+        and a new row lands only when the book moves the line.
 
         Args:
             records: Iterable[dict] with parser output fields.
@@ -964,6 +1022,11 @@ class DatabaseManager:
         """
 
         payload = []
+        skipped_unchanged = 0
+        # Cache of the line we consider "current" per (book, player, stat, side),
+        # seeded from the DB and updated as we accept rows so two unchanged
+        # cards in the same batch don't both insert.
+        latest_line = {}
         for rec in records:
             snapshot_id = rec.get("snapshot_id")
             line_value = rec.get("line_value")
@@ -1004,22 +1067,37 @@ class DatabaseManager:
                 ]
             ):
                 continue
+
+            key = (row[2], row[4], row[6], row[8])  # book, player, stat, side
+            if key not in latest_line:
+                latest_line[key] = self._latest_web_prop_card_line(*key)
+            new_line = self._norm_line(line_value)
+            if latest_line[key] is not None and latest_line[key] == new_line:
+                skipped_unchanged += 1
+                continue
+            latest_line[key] = new_line
             payload.append(row)
 
         if not payload:
             return {
                 "inserted": 0,
                 "attempted": 0,
+                "skipped_unchanged": skipped_unchanged,
             }
 
         before_changes = self.conn.total_changes
         self.conn.executemany(query, payload)
         self.conn.commit()
         inserted = self.conn.total_changes - before_changes
-        logger.info("Inserted %s web_prop_cards rows", inserted)
+        logger.info(
+            "Inserted %s web_prop_cards rows (%s skipped: line unchanged)",
+            inserted,
+            skipped_unchanged,
+        )
         return {
             "inserted": int(inserted),
             "attempted": int(len(payload)),
+            "skipped_unchanged": int(skipped_unchanged),
         }
 
     def get_consensus_prop_lines(
@@ -1117,9 +1195,15 @@ class DatabaseManager:
         ]
 
     def insert_web_team_lines(self, records):
-        """Insert game-level team lines with dedupe via record_sha256."""
+        """Insert game-level team lines with dedupe via record_sha256.
+
+        Also skips any row whose (line_value, odds) equals the most-recent
+        stored values for the same (book, away, home, market, side, team):
+        re-scraping the same game adds nothing, and a new row is written only
+        when the book moves the line or odds.
+        """
         if not records:
-            return {"inserted": 0, "attempted": 0}
+            return {"inserted": 0, "attempted": 0, "skipped_unchanged": 0}
 
         query = """
             INSERT OR IGNORE INTO web_team_lines (
@@ -1131,6 +1215,9 @@ class DatabaseManager:
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """
         payload = []
+        skipped_unchanged = 0
+        # (book, away, home, market, side, team) -> last (line, odds) we kept.
+        latest_state = {}
         for rec in records:
             try:
                 snapshot_id = int(rec.get("snapshot_id"))
@@ -1169,17 +1256,35 @@ class DatabaseManager:
             # market_type, side, parser_version, record_sha256.
             if not all([row[1], row[2], row[3], row[4], row[5], row[6], row[7], row[13], row[14]]):
                 continue
+
+            # book, away, home, market, side, team
+            key = (row[2], row[4], row[5], row[6], row[7], row[8])
+            if key not in latest_state:
+                latest_state[key] = self._latest_web_team_line_state(*key)
+            new_state = (self._norm_line(line_value), odds)
+            if latest_state[key] is not None and latest_state[key] == new_state:
+                skipped_unchanged += 1
+                continue
+            latest_state[key] = new_state
             payload.append(row)
 
         if not payload:
-            return {"inserted": 0, "attempted": 0}
+            return {"inserted": 0, "attempted": 0, "skipped_unchanged": skipped_unchanged}
 
         before = self.conn.total_changes
         self.conn.executemany(query, payload)
         self.conn.commit()
         inserted = self.conn.total_changes - before
-        logger.info("Inserted %s web_team_lines rows", inserted)
-        return {"inserted": int(inserted), "attempted": int(len(payload))}
+        logger.info(
+            "Inserted %s web_team_lines rows (%s skipped: line unchanged)",
+            inserted,
+            skipped_unchanged,
+        )
+        return {
+            "inserted": int(inserted),
+            "attempted": int(len(payload)),
+            "skipped_unchanged": int(skipped_unchanged),
+        }
 
     def get_consensus_team_lines(
         self,

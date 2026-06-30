@@ -480,7 +480,7 @@ def parse_and_store_web_prop_cards(
             }
         )
 
-    db_summary = {"inserted": 0, "attempted": 0}
+    db_summary = {"inserted": 0, "attempted": 0, "skipped_unchanged": 0}
     if all_records:
         with DatabaseManager(db_path=db_path) as db:
             db_summary = db.insert_web_prop_cards(all_records)
@@ -500,6 +500,7 @@ def parse_and_store_web_prop_cards(
         "min_parse_confidence": float(threshold),
         "db_inserted": int(db_summary.get("inserted", 0)),
         "db_attempted": int(db_summary.get("attempted", 0)),
+        "db_skipped_unchanged": int(db_summary.get("skipped_unchanged", 0)),
         "active_reference_count": int(len(active_names)),
         "results": results,
     }
