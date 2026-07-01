@@ -80,14 +80,30 @@ class ScraperSportResolutionTests(unittest.TestCase):
         s = scrapers.get_scraper_for_book_sport("draftkings", "nba")
         self.assertIsNotNone(s)
         self.assertEqual(s.name, "draftkings")
-        # No NFL config registered yet → None (not a wrong-sport match).
-        self.assertIsNone(scrapers.get_scraper_for_book_sport("draftkings", "nfl"))
+        self.assertEqual(s.sport, "nba")
+        # NFL DraftKings/FanDuel configs are now registered (WS6) and distinct.
+        nfl_dk = scrapers.get_scraper_for_book_sport("draftkings", "nfl")
+        self.assertIsNotNone(nfl_dk)
+        self.assertEqual(nfl_dk.sport, "nfl")
+        self.assertIsNot(nfl_dk, s)
+        self.assertIsNotNone(scrapers.get_scraper_for_book_sport("fanduel", "nfl"))
+        # A book with no NFL config still returns None (not a wrong-sport match).
+        self.assertIsNone(scrapers.get_scraper_for_book_sport("bovada", "nfl"))
 
     def test_url_resolution_sport_filter(self):
-        # NBA filter still resolves; NFL filter finds nothing yet.
+        # NBA filter resolves the NBA config; default (no sport) stays NBA.
         nba = scrapers.get_scraper_for_url(
             "https://app.prizepicks.com/board/nba", sport="nba")
         self.assertIsNotNone(nba)
+        default = scrapers.get_scraper_for_url(
+            "https://sportsbook.draftkings.com/leagues/basketball/nba")
+        self.assertEqual(default.sport, "nba")
+        # NFL filter resolves the NFL config on the same DraftKings domain.
+        nfl = scrapers.get_scraper_for_url(
+            "https://sportsbook.draftkings.com/leagues/football/nfl", sport="nfl")
+        self.assertIsNotNone(nfl)
+        self.assertEqual(nfl.sport, "nfl")
+        # No NFL config exists for PrizePicks yet → None under the NFL filter.
         self.assertIsNone(
             scrapers.get_scraper_for_url(
                 "https://app.prizepicks.com/board/nba", sport="nfl"))

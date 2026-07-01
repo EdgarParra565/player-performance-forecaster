@@ -118,7 +118,8 @@ CREATE TABLE IF NOT EXISTS user_subscriptions (
     stripe_subscription_id TEXT,
     current_period_end     TEXT,
     last_event_type        TEXT,
-    updated_at             TEXT NOT NULL DEFAULT (datetime('now'))
+    updated_at             TEXT NOT NULL DEFAULT (datetime('now')),
+    created_at             TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
 CREATE TABLE IF NOT EXISTS stripe_events (
@@ -128,6 +129,29 @@ CREATE TABLE IF NOT EXISTS stripe_events (
     payload      TEXT
 );
 """
+
+
+def _migrate_sqlite(conn: sqlite3.Connection) -> None:
+    """Idempotently bring legacy ``user_subscriptions`` tables up to current schema.
+
+    Older deployments only carry ``updated_at``. The trial-window logic
+    (``auth.trial_active``) needs a stable ``created_at`` per email — adding it
+    via ALTER TABLE ADD COLUMN (no default; SQLite forbids non-constant defaults
+    on ADD COLUMN) and back-filling from ``updated_at`` (or now()) for any
+    pre-existing rows. Running twice is a no-op because the column existence
+    check guards both statements.
+    """
+    cols = {r[1] for r in conn.execute(
+        "PRAGMA table_info(user_subscriptions)"
+    ).fetchall()}
+    if "created_at" not in cols:
+        conn.execute(
+            "ALTER TABLE user_subscriptions ADD COLUMN created_at TEXT"
+        )
+        conn.execute(
+            "UPDATE user_subscriptions "
+            "SET created_at = COALESCE(created_at, updated_at, datetime('now'))"
+        )
 
 
 def _harden_db_file(path: str) -> None:
@@ -174,6 +198,9 @@ def _bootstrap_sqlite(path: str) -> None:
         try:
             boot.execute("PRAGMA journal_mode=WAL")
             boot.execute("PRAGMA synchronous=NORMAL")
+            # Run schema first so the migration has a table to alter.
+            boot.executescript(_SQLITE_SCHEMA)
+            _migrate_sqlite(boot)
         finally:
             boot.close()
         _harden_db_file(path)
@@ -221,8 +248,8 @@ def _sqlite_upsert(
             """
             INSERT INTO user_subscriptions (
                 email, tier, stripe_customer_id, stripe_subscription_id,
-                current_period_end, last_event_type, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                current_period_end, last_event_type, updated_at, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(email) DO UPDATE SET
                 tier                   = excluded.tier,
                 stripe_customer_id     = COALESCE(excluded.stripe_customer_id,
@@ -234,10 +261,30 @@ def _sqlite_upsert(
                 last_event_type        = COALESCE(excluded.last_event_type,
                                                   user_subscriptions.last_event_type),
                 updated_at             = excluded.updated_at
+                -- created_at is intentionally NOT refreshed: it marks the
+                -- first sign-in time and anchors the trial window.
             """,
             (email, tier, stripe_customer_id, stripe_subscription_id,
-             current_period_end, last_event_type, now),
+             current_period_end, last_event_type, now, now),
         )
+
+
+def _sqlite_touch_first_seen(path: str, email: str, now: str) -> bool:
+    """Insert a free-tier row if absent so trial can be anchored.
+
+    Returns True if the row was actually created (first sign-in), False if a
+    record already existed. Never overwrites an existing row.
+    """
+    with _connect_sqlite(path) as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO user_subscriptions (email, tier, updated_at, created_at)
+            VALUES (?, 'free', ?, ?)
+            ON CONFLICT(email) DO NOTHING
+            """,
+            (email, now, now),
+        )
+        return bool(cur.rowcount)
 
 
 def _sqlite_record_event(path: str, event_id: str, event_type: str, payload: str) -> bool:
@@ -275,7 +322,8 @@ CREATE TABLE IF NOT EXISTS user_subscriptions (
     stripe_subscription_id TEXT,
     current_period_end     TEXT,
     last_event_type        TEXT,
-    updated_at             TEXT NOT NULL DEFAULT (now()::text)
+    updated_at             TEXT NOT NULL DEFAULT (now()::text),
+    created_at             TEXT NOT NULL DEFAULT (now()::text)
 );
 
 CREATE TABLE IF NOT EXISTS stripe_events (
@@ -285,6 +333,14 @@ CREATE TABLE IF NOT EXISTS stripe_events (
     payload      TEXT
 );
 """
+
+# Idempotent ALTER for legacy Postgres tables that pre-date created_at.
+# IF NOT EXISTS is fully supported on Postgres ADD COLUMN and lets the
+# bootstrap run safely on every connect.
+_POSTGRES_MIGRATIONS = (
+    "ALTER TABLE user_subscriptions "
+    "ADD COLUMN IF NOT EXISTS created_at TEXT NOT NULL DEFAULT (now()::text)",
+)
 
 # Postgres analog to SQLite's busy_timeout/synchronous tuning:
 #   - statement_timeout    => abort runaway upserts after 5s (was busy_timeout)
@@ -324,6 +380,8 @@ def _bootstrap_postgres(dsn: str) -> None:
         with psycopg.connect(dsn, autocommit=True, connect_timeout=5) as conn:
             with conn.cursor() as cur:
                 cur.execute(_POSTGRES_SCHEMA)
+                for stmt in _POSTGRES_MIGRATIONS:
+                    cur.execute(stmt)
         _PG_BOOTSTRAPPED_DSNS.add(dsn)
 
 
@@ -362,8 +420,8 @@ def _pg_upsert(
             """
             INSERT INTO user_subscriptions (
                 email, tier, stripe_customer_id, stripe_subscription_id,
-                current_period_end, last_event_type, updated_at
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+                current_period_end, last_event_type, updated_at, created_at
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (email) DO UPDATE SET
                 tier                   = EXCLUDED.tier,
                 stripe_customer_id     = COALESCE(EXCLUDED.stripe_customer_id,
@@ -375,10 +433,25 @@ def _pg_upsert(
                 last_event_type        = COALESCE(EXCLUDED.last_event_type,
                                                   user_subscriptions.last_event_type),
                 updated_at             = EXCLUDED.updated_at
+                -- created_at intentionally NOT refreshed; anchors trial start.
             """,
             (email, tier, stripe_customer_id, stripe_subscription_id,
-             current_period_end, last_event_type, now),
+             current_period_end, last_event_type, now, now),
         )
+
+
+def _pg_touch_first_seen(dsn: str, email: str, now: str) -> bool:
+    """Postgres twin of ``_sqlite_touch_first_seen``."""
+    with _connect_postgres(dsn) as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO user_subscriptions (email, tier, updated_at, created_at)
+            VALUES (%s, 'free', %s, %s)
+            ON CONFLICT (email) DO NOTHING
+            """,
+            (email, now, now),
+        )
+        return bool(cur.rowcount)
 
 
 def _pg_record_event(dsn: str, event_id: str, event_type: str, payload: str) -> bool:
@@ -399,7 +472,7 @@ def _pg_lookup(dsn: str, normalized_email: str) -> Optional[dict]:
     with _connect_postgres(dsn) as conn, conn.cursor() as cur:
         cur.execute(
             "SELECT email, tier, stripe_customer_id, stripe_subscription_id, "
-            "current_period_end, last_event_type, updated_at "
+            "current_period_end, last_event_type, updated_at, created_at "
             "FROM user_subscriptions WHERE email = %s",
             (normalized_email,),
         )
@@ -479,6 +552,30 @@ def upsert(
         last_event_type=last_event_type,
         now=now,
     )
+
+
+def touch_first_seen(email: str, db_path: Optional[str] = None) -> bool:
+    """Anchor the trial window for an email's first sign-in.
+
+    Idempotent: inserts a free-tier row with ``created_at = now`` only when
+    no row exists yet, so subsequent sign-ins keep the original timestamp.
+    Returns True when a new row was created (i.e. this was the first sign-in),
+    False when the email was already known. Validates the email and fails
+    closed (no row, returns False) on invalid input.
+
+    Used by ``auth.tier_for`` when ``ENABLE_TRIAL=1`` so a brand-new user
+    starts the trial clock on first authenticated request.
+    """
+    try:
+        normalized = _validate_email(email)
+    except ValueError:
+        return False
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    backend = _selected_backend(db_path)
+    target = _resolved_target(db_path)
+    if backend == "postgres":
+        return _pg_touch_first_seen(target, normalized, now)
+    return _sqlite_touch_first_seen(target, normalized, now)
 
 
 def record_stripe_event(

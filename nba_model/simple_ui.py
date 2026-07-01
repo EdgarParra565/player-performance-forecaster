@@ -14,6 +14,7 @@ from hashlib import sha1
 from pathlib import Path
 from queue import Empty, Queue
 from tkinter import filedialog, messagebox, scrolledtext, ttk
+from typing import Optional
 
 from nba_api.stats.static import players as static_players
 
@@ -100,6 +101,220 @@ SINGLE_STAT_DEFAULT_LINES = {
     "rebounds": 8.5,
     "pra": 35.5,
 }
+
+
+# ---------------------------------------------------------------------------
+# Pure-logic helpers (tested without spinning a Tk root)
+# ---------------------------------------------------------------------------
+
+def fuzzy_match_players(query: str, names: list[str], limit: int = 12) -> list[str]:
+    """Rank ``names`` against a fuzzy ``query`` for the autocomplete dropdown.
+
+    Scoring is intentionally simple — no rapidfuzz dep — and prioritizes:
+        4 = exact case-insensitive match
+        3 = case-insensitive prefix match ("leb" -> "LeBron James")
+        2 = any token of the name starts with the query
+            ("ja" -> "Jayson Tatum" since "Jayson" starts with "ja")
+        1 = substring match anywhere
+        0 = no match (filtered out)
+
+    Ties broken by alphabetical order so the result list is deterministic.
+    An empty/whitespace query returns the first ``limit`` names so the
+    dropdown shows something when the user clears the field.
+    """
+    if names is None:
+        return []
+    q = (query or "").strip().lower()
+    if not q:
+        return list(names)[: max(0, int(limit))]
+    scored: list[tuple[int, str]] = []
+    for name in names:
+        if not isinstance(name, str):
+            continue
+        lname = name.lower()
+        if lname == q:
+            score = 4
+        elif lname.startswith(q):
+            score = 3
+        elif any(tok.startswith(q) for tok in lname.split()):
+            score = 2
+        elif q in lname:
+            score = 1
+        else:
+            continue
+        scored.append((score, name))
+    scored.sort(key=lambda r: (-r[0], r[1].lower()))
+    return [name for _, name in scored[: max(0, int(limit))]]
+
+
+def parse_date_range(text: str) -> tuple[Optional[str], Optional[str]]:
+    """Parse a "YYYY-MM-DD..YYYY-MM-DD" range string into normalized bounds.
+
+    Accepts open ends ("2025-01-01..", "..2025-03-15"), several common
+    date layouts (slash + dash variants), a single date (used as both start
+    and end), and empty input. Raises ``ValueError`` only on garbage so the
+    caller can show an inline error rather than silently dropping a filter.
+    """
+    Optional = type(None)  # noqa: F841 — keep this readable in tracebacks
+    raw = (text or "").strip()
+    if not raw:
+        return (None, None)
+    parts = raw.split("..", 1)
+    if len(parts) == 1:
+        d = _normalize_iso_date(parts[0])
+        return (d, d)
+    start = _normalize_iso_date(parts[0]) if parts[0].strip() else None
+    end = _normalize_iso_date(parts[1]) if parts[1].strip() else None
+    if start and end and start > end:
+        raise ValueError(f"date range start {start} after end {end}")
+    return (start, end)
+
+
+def _normalize_iso_date(token: str) -> str:
+    """Normalize one date token to YYYY-MM-DD or raise ``ValueError``."""
+    s = (token or "").strip()
+    if not s:
+        raise ValueError("empty date token")
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%m/%d/%Y"):
+        try:
+            return datetime.strptime(s, fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00")).strftime("%Y-%m-%d")
+    except ValueError as exc:
+        raise ValueError(f"invalid date {token!r}") from exc
+
+
+def filter_games_by_date_range(
+    games, values, start: Optional[str], end: Optional[str],
+):
+    """Filter a ``(games, values)`` pair to the inclusive [start, end] range.
+
+    ``games`` is the ``PlayerChartData.games`` DataFrame (must have a
+    ``game_date`` column); ``values`` is the parallel 1-D numpy array. Both
+    are filtered with the SAME mask so the indices stay aligned. When
+    ``start`` / ``end`` are None the corresponding bound is open.
+    """
+    import numpy as np  # noqa: PLC0415 — keep top-level imports light
+    import pandas as pd
+
+    if games is None or games.empty or "game_date" not in games.columns:
+        return games, values
+    dates = pd.to_datetime(games["game_date"], errors="coerce")
+    mask = pd.Series(True, index=games.index)
+    if start:
+        mask &= dates >= pd.Timestamp(start)
+    if end:
+        mask &= dates <= pd.Timestamp(end) + pd.Timedelta(hours=23, minutes=59)
+    filtered_games = games[mask].reset_index(drop=True)
+    if values is None or len(values) != len(games):
+        return filtered_games, values
+    filtered_values = np.asarray(values)[mask.to_numpy()]
+    return filtered_games, filtered_values
+
+
+TK_WATCHLIST_PATH = Path("data/state/tk_watchlist.json")
+TK_WATCHLIST_LIMIT = 25
+
+
+def tk_watchlist_load(path: Path = TK_WATCHLIST_PATH) -> list[str]:
+    """Load the desktop watchlist from disk. Returns [] on missing/corrupt file.
+
+    Independent from the web ``nba_model.web.watchlist`` module because that
+    module's ``_user_key()`` depends on Streamlit cookies and is None in Tk.
+    Same JSON-on-disk pattern, different file so the two UIs can each have
+    their own list without trampling.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return []
+    if not isinstance(data, list):
+        return []
+    out: list[str] = []
+    for item in data:
+        if isinstance(item, str):
+            s = item.strip()
+            if s and s not in out:
+                out.append(s)
+        if len(out) >= TK_WATCHLIST_LIMIT:
+            break
+    return out
+
+
+def tk_watchlist_save(items: list[str], path: Path = TK_WATCHLIST_PATH) -> None:
+    """Persist the desktop watchlist atomically (write tmp + rename)."""
+    cleaned: list[str] = []
+    for item in items or []:
+        if isinstance(item, str):
+            s = item.strip()
+            if s and s not in cleaned:
+                cleaned.append(s)
+        if len(cleaned) >= TK_WATCHLIST_LIMIT:
+            break
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(cleaned, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
+
+def tk_watchlist_add(name: str, path: Path = TK_WATCHLIST_PATH) -> list[str]:
+    items = tk_watchlist_load(path)
+    name = (name or "").strip()
+    if not name:
+        return items
+    if name in items:
+        return items
+    items.append(name)
+    tk_watchlist_save(items, path)
+    return items
+
+
+def tk_watchlist_remove(name: str, path: Path = TK_WATCHLIST_PATH) -> list[str]:
+    items = [n for n in tk_watchlist_load(path) if n != (name or "").strip()]
+    tk_watchlist_save(items, path)
+    return items
+
+
+def tk_watchlist_clear(path: Path = TK_WATCHLIST_PATH) -> None:
+    tk_watchlist_save([], path)
+
+
+def export_chart_snapshot(
+    figure,
+    games,
+    values,
+    out_dir: Path,
+    base_name: str,
+) -> tuple[Path, Path]:
+    """Save the current chart figure as PNG + the underlying rows as CSV.
+
+    Returns ``(png_path, csv_path)``. ``base_name`` is sanitized to a safe
+    filename so a player like "Jokic, Nikola" doesn't blow up on Windows.
+    Pure I/O — no Tk dependency — so it's easy to unit-test by passing a
+    matplotlib Figure built in the test directly.
+    """
+    import pandas as pd
+
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", base_name or "snapshot").strip("_")
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    png_path = out_dir / f"{safe}.png"
+    csv_path = out_dir / f"{safe}.csv"
+    figure.savefig(png_path, dpi=144, bbox_inches="tight")
+    if games is not None and not getattr(games, "empty", False):
+        export_df = games.copy()
+        if values is not None and len(values) == len(export_df):
+            export_df.insert(0, "value", values)
+        export_df.to_csv(csv_path, index=False)
+    else:
+        # Always emit a CSV — even if empty — so the snapshot path is
+        # predictable for downstream tools.
+        pd.DataFrame().to_csv(csv_path, index=False)
+    return png_path, csv_path
 
 
 class _OperationRunner:
@@ -1241,10 +1456,17 @@ class SimpleModelUI:
         ttk.Label(controls, text="Player").grid(
             row=1, column=2, sticky="w", padx=6, pady=4)
         self.charts_player = tk.StringVar(value="")
+        # Combobox in editable mode so the user can type — fuzzy autocomplete
+        # filters the dropdown on every keystroke (_charts_on_player_type).
         self.charts_player_box = ttk.Combobox(
             controls, textvariable=self.charts_player, width=28,
         )
         self.charts_player_box.grid(row=1, column=3, sticky="we", padx=6, pady=4)
+        self.charts_player_box.bind(
+            "<KeyRelease>", self._charts_on_player_type)
+        # Enter-to-submit from the player field (and anywhere in the controls
+        # frame the focus happens to live).
+        self.charts_player_box.bind("<Return>", lambda *_: self._charts_render())
 
         ttk.Label(controls, text="Stat").grid(
             row=2, column=0, sticky="w", padx=6, pady=4)
@@ -1259,8 +1481,9 @@ class SimpleModelUI:
         ttk.Label(controls, text="Last N games").grid(
             row=2, column=2, sticky="w", padx=6, pady=4)
         self.charts_n_games = tk.StringVar(value="25")
-        ttk.Entry(controls, textvariable=self.charts_n_games, width=6).grid(
-            row=2, column=3, sticky="w", padx=6, pady=4)
+        n_games_entry = ttk.Entry(controls, textvariable=self.charts_n_games, width=6)
+        n_games_entry.grid(row=2, column=3, sticky="w", padx=6, pady=4)
+        n_games_entry.bind("<Return>", lambda *_: self._charts_render())
 
         ttk.Label(controls, text="Rolling window").grid(
             row=3, column=0, sticky="w", padx=6, pady=4)
@@ -1282,9 +1505,55 @@ class SimpleModelUI:
         ttk.Checkbutton(dist_box, text="neg-binomial",
                         variable=self.charts_dist_negbin).pack(side="left", padx=4)
 
-        ttk.Button(controls, text="Show charts",
-                   command=self._charts_render).grid(
-            row=4, column=3, sticky="e", padx=6, pady=4)
+        # Date-range filter — applied to the fetched window after the DB
+        # query so n_games still controls how much history we pull.
+        ttk.Label(controls, text="Date range").grid(
+            row=4, column=0, sticky="w", padx=6, pady=4)
+        self.charts_date_range = tk.StringVar(value="")
+        date_entry = ttk.Entry(
+            controls, textvariable=self.charts_date_range, width=28,
+        )
+        date_entry.grid(row=4, column=1, sticky="w", padx=6, pady=4)
+        date_entry.bind("<Return>", lambda *_: self._charts_render())
+        ttk.Label(
+            controls,
+            text="e.g. 2025-01-01..2025-03-15 (open ends allowed)",
+            foreground="#666",
+        ).grid(row=4, column=2, columnspan=2, sticky="w", padx=4)
+
+        # Action row: render, async refresh, save snapshot.
+        action_row = ttk.Frame(controls)
+        action_row.grid(row=5, column=0, columnspan=5, sticky="we", padx=4, pady=(4, 6))
+        ttk.Button(action_row, text="Show charts",
+                   command=self._charts_render).pack(side="left", padx=4)
+        ttk.Button(action_row, text="Refresh (async)",
+                   command=self._charts_async_render).pack(side="left", padx=4)
+        ttk.Button(action_row, text="Save snapshot (PNG + CSV)",
+                   command=self._charts_save_snapshot).pack(side="left", padx=4)
+        self.charts_status = tk.StringVar(value="")
+        ttk.Label(action_row, textvariable=self.charts_status,
+                  foreground="#0a5", anchor="w").pack(side="left", padx=12)
+
+        # Watchlist sub-panel (Tk-side, persisted to data/state/tk_watchlist.json).
+        wl_frame = ttk.LabelFrame(outer, text="Watchlist (Tk)")
+        wl_frame.pack(fill="x", pady=(8, 0))
+        wl_left = ttk.Frame(wl_frame)
+        wl_left.pack(side="left", fill="both", expand=True, padx=4, pady=4)
+        self.charts_wl_listbox = tk.Listbox(wl_left, height=4, exportselection=False)
+        self.charts_wl_listbox.pack(side="left", fill="both", expand=True)
+        # Double-click an entry to jump to that player.
+        self.charts_wl_listbox.bind(
+            "<Double-Button-1>", lambda *_: self._charts_wl_click())
+        wl_btns = ttk.Frame(wl_frame)
+        wl_btns.pack(side="right", padx=4, pady=4)
+        ttk.Button(wl_btns, text="Pin current",
+                   command=self._charts_wl_pin).pack(fill="x", pady=1)
+        ttk.Button(wl_btns, text="Load selected",
+                   command=self._charts_wl_click).pack(fill="x", pady=1)
+        ttk.Button(wl_btns, text="Remove",
+                   command=self._charts_wl_remove).pack(fill="x", pady=1)
+        ttk.Button(wl_btns, text="Clear all",
+                   command=self._charts_wl_clear).pack(fill="x", pady=1)
 
         # --- Sub-notebook with view tabs ----------------------------------
         view_nb = ttk.Notebook(outer)
@@ -1293,9 +1562,17 @@ class SimpleModelUI:
         overview_view = ttk.Frame(view_nb)
         splits_view = ttk.Frame(view_nb)
         hitrate_view = ttk.Frame(view_nb)
+        box_view = ttk.Frame(view_nb)
+        rolling_ci_view = ttk.Frame(view_nb)
+        trend_view = ttk.Frame(view_nb)
+        defense_view = ttk.Frame(view_nb)
         view_nb.add(overview_view, text="Overview")
         view_nb.add(splits_view, text="Splits")
         view_nb.add(hitrate_view, text="Hit Rate + Custom Line")
+        view_nb.add(box_view, text="Box / Quantile")
+        view_nb.add(rolling_ci_view, text="Rolling CI")
+        view_nb.add(trend_view, text="Trend / Form")
+        view_nb.add(defense_view, text="vs Defense")
 
         # Overview view: recent games + distribution stacked
         overview_view.columnconfigure(0, weight=1)
@@ -1318,6 +1595,19 @@ class SimpleModelUI:
         hitrate_view.rowconfigure(0, weight=1)
         self._charts_hitrate_holder = ttk.Frame(hitrate_view)
         self._charts_hitrate_holder.grid(row=0, column=0, sticky="nsew")
+
+        # Newer chart-builder views — populated on every _charts_render call.
+        for parent, attr in (
+            (box_view, "_charts_box_holder"),
+            (rolling_ci_view, "_charts_rolling_ci_holder"),
+            (trend_view, "_charts_trend_holder"),
+            (defense_view, "_charts_defense_holder"),
+        ):
+            parent.columnconfigure(0, weight=1)
+            parent.rowconfigure(0, weight=1)
+            holder = ttk.Frame(parent)
+            holder.grid(row=0, column=0, sticky="nsew")
+            setattr(self, attr, holder)
         probe = ttk.LabelFrame(hitrate_view, text="Custom line probe")
         probe.grid(row=1, column=0, sticky="we", pady=(6, 0))
         ttk.Label(probe, text="Line").grid(row=0, column=0, padx=6, pady=4, sticky="w")
@@ -1351,13 +1641,24 @@ class SimpleModelUI:
         self._charts_bottom_canvas = None
         self._charts_splits_canvas = None
         self._charts_hitrate_canvas = None
+        self._charts_box_canvas = None
+        self._charts_rolling_ci_canvas = None
+        self._charts_trend_canvas = None
+        self._charts_defense_canvas = None
         self._charts_player_index: list[dict] = []
         self._charts_last_data = None  # last fetched PlayerChartData
+        # Track the active figures so save-snapshot can pick the latest one.
+        self._charts_last_figures: dict[str, object] = {}
+        # Async fetch wiring.
+        self._charts_fetch_queue: Queue = Queue()
+        self._charts_fetch_thread: Optional[threading.Thread] = None
+        self._charts_fetch_poll_scheduled = False
 
         try:
             self._charts_reload_lookups()
         except Exception:
             pass
+        self._charts_wl_refresh_listbox()
 
     def _charts_reload_lookups(self) -> None:
         try:
@@ -1387,7 +1688,11 @@ class SimpleModelUI:
         names = df["player_name"].astype(str).tolist()
         self._charts_player_index = df.to_dict("records")
         self.charts_player_box.configure(values=names)
-        if names and self.charts_player.get() not in names:
+        # Don't overwrite a player the user is mid-typing — only seed the
+        # field when it's empty or when the team filter changed and the
+        # current pick is no longer reachable.
+        current = (self.charts_player.get() or "").strip()
+        if names and not current:
             self.charts_player.set(names[0])
 
     def _charts_resolve_player_id(self, raw_name: str) -> tuple[int, str]:
@@ -1414,43 +1719,157 @@ class SimpleModelUI:
 
     def _charts_render(self) -> None:
         try:
-            db_path = self.charts_db_path.get().strip() or "data/database/nba_data.db"
-            player_id, player_name = self._charts_resolve_player_id(
-                self.charts_player.get())
-            stat_type = self.charts_stat.get().strip().lower() or "points"
-            n_games = self._parse_int_or_default(self.charts_n_games.get(), 25)
-            rolling = max(1, self._parse_int_or_default(
-                self.charts_rolling.get(), 5))
-            distributions = self._charts_selected_distributions()
-
+            params = self._charts_collect_params()
             data = self._player_charts_mod.fetch_player_chart_data(
-                db_path=db_path,
-                player_id=player_id,
-                player_name=player_name,
-                stat_type=stat_type,
-                n_games=n_games,
+                db_path=params["db_path"],
+                player_id=params["player_id"],
+                player_name=params["player_name"],
+                stat_type=params["stat_type"],
+                n_games=params["n_games"],
             )
-            self._charts_last_data = data
-
-            top_fig = self._player_charts_mod.build_recent_games_figure(
-                data, rolling_window=rolling)
-            dist_fig = self._player_charts_mod.build_distribution_figure(
-                data, distributions=distributions)
-            splits_fig = self._player_charts_mod.build_splits_figure(data)
-            hit_fig = self._player_charts_mod.build_hit_rate_figure(data)
-            summary = self._player_charts_mod.book_lines_summary_text(data)
+            self._charts_apply_date_filter(data, params["date_start"],
+                                           params["date_end"])
+            self._charts_paint(data, params)
         except Exception as exc:
             messagebox.showerror("Charts", str(exc))
             return
 
+    def _charts_async_render(self) -> None:
+        """Run the DB fetch on a worker thread so the UI keeps painting.
+
+        Reuses the same paint path as the synchronous _charts_render; only
+        the slow DB query happens off the main thread. A status label shows
+        ``fetching...`` while the worker runs.
+        """
+        if (self._charts_fetch_thread is not None
+                and self._charts_fetch_thread.is_alive()):
+            self.charts_status.set("fetch already in progress…")
+            return
+        try:
+            params = self._charts_collect_params()
+        except Exception as exc:
+            messagebox.showerror("Charts", str(exc))
+            return
+        self.charts_status.set("fetching…")
+
+        def _worker() -> None:
+            try:
+                data = self._player_charts_mod.fetch_player_chart_data(
+                    db_path=params["db_path"],
+                    player_id=params["player_id"],
+                    player_name=params["player_name"],
+                    stat_type=params["stat_type"],
+                    n_games=params["n_games"],
+                )
+                self._charts_fetch_queue.put(("ok", data, params))
+            except Exception as exc:  # surface in main thread
+                self._charts_fetch_queue.put(("err", exc, params))
+
+        self._charts_fetch_thread = threading.Thread(target=_worker, daemon=True)
+        self._charts_fetch_thread.start()
+        self._charts_schedule_fetch_poll()
+
+    def _charts_schedule_fetch_poll(self) -> None:
+        if self._charts_fetch_poll_scheduled:
+            return
+        self._charts_fetch_poll_scheduled = True
+        self.root.after(80, self._charts_drain_fetch)
+
+    def _charts_drain_fetch(self) -> None:
+        self._charts_fetch_poll_scheduled = False
+        try:
+            kind, payload, params = self._charts_fetch_queue.get_nowait()
+        except Empty:
+            if (self._charts_fetch_thread is not None
+                    and self._charts_fetch_thread.is_alive()):
+                self._charts_schedule_fetch_poll()
+            return
+        if kind == "err":
+            self.charts_status.set("fetch failed")
+            messagebox.showerror("Charts", str(payload))
+            return
+        data = payload
+        try:
+            self._charts_apply_date_filter(
+                data, params["date_start"], params["date_end"])
+            self._charts_paint(data, params)
+            self.charts_status.set("done")
+        except Exception as exc:
+            self.charts_status.set("paint failed")
+            messagebox.showerror("Charts", str(exc))
+
+    def _charts_collect_params(self) -> dict:
+        """Read the form fields once + validate. Raises ValueError on garbage."""
+        db_path = self.charts_db_path.get().strip() or "data/database/nba_data.db"
+        player_id, player_name = self._charts_resolve_player_id(
+            self.charts_player.get())
+        stat_type = self.charts_stat.get().strip().lower() or "points"
+        n_games = self._parse_int_or_default(self.charts_n_games.get(), 25)
+        rolling = max(1, self._parse_int_or_default(
+            self.charts_rolling.get(), 5))
+        distributions = self._charts_selected_distributions()
+        date_start, date_end = parse_date_range(self.charts_date_range.get())
+        return {
+            "db_path": db_path, "player_id": player_id,
+            "player_name": player_name, "stat_type": stat_type,
+            "n_games": n_games, "rolling": rolling,
+            "distributions": distributions,
+            "date_start": date_start, "date_end": date_end,
+        }
+
+    def _charts_apply_date_filter(self, data, start, end) -> None:
+        """Trim ``data.games`` / ``data.values`` in place to the date range."""
+        if not start and not end:
+            return
+        filtered_games, filtered_values = filter_games_by_date_range(
+            data.games, data.values, start, end,
+        )
+        data.games = filtered_games
+        data.values = filtered_values
+
+    def _charts_paint(self, data, params: dict) -> None:
+        """Build + swap every chart figure from a freshly-fetched ``data``."""
+        self._charts_last_data = data
+        rolling = params["rolling"]
+        distributions = params["distributions"]
+        db_path = params["db_path"]
+
+        figs: dict[str, object] = {}
+        figs["recent"] = self._player_charts_mod.build_recent_games_figure(
+            data, rolling_window=rolling)
+        figs["distribution"] = self._player_charts_mod.build_distribution_figure(
+            data, distributions=distributions)
+        figs["splits"] = self._player_charts_mod.build_splits_figure(data)
+        figs["hit_rate"] = self._player_charts_mod.build_hit_rate_figure(data)
+        # Newer chart builders. Each guards itself against empty data and
+        # returns a "no data" figure rather than raising, so a bare except
+        # here would only hide a programming error — we want to see it.
+        figs["box"] = self._player_charts_mod.build_box_quantile_figure(data)
+        figs["rolling_ci"] = self._player_charts_mod.build_rolling_ci_figure(
+            data, rolling_window=rolling)
+        figs["trend"] = self._player_charts_mod.build_trend_form_figure(
+            data, short_window=rolling)
+        figs["defense"] = self._player_charts_mod.build_defense_scatter_figure(
+            data, db_path=db_path)
+        summary = self._player_charts_mod.book_lines_summary_text(data)
+
         self._charts_swap_figure(self._charts_top_holder,
-                                 "_charts_top_canvas", top_fig)
+                                 "_charts_top_canvas", figs["recent"])
         self._charts_swap_figure(self._charts_bottom_holder,
-                                 "_charts_bottom_canvas", dist_fig)
+                                 "_charts_bottom_canvas", figs["distribution"])
         self._charts_swap_figure(self._charts_splits_holder,
-                                 "_charts_splits_canvas", splits_fig)
+                                 "_charts_splits_canvas", figs["splits"])
         self._charts_swap_figure(self._charts_hitrate_holder,
-                                 "_charts_hitrate_canvas", hit_fig)
+                                 "_charts_hitrate_canvas", figs["hit_rate"])
+        self._charts_swap_figure(self._charts_box_holder,
+                                 "_charts_box_canvas", figs["box"])
+        self._charts_swap_figure(self._charts_rolling_ci_holder,
+                                 "_charts_rolling_ci_canvas", figs["rolling_ci"])
+        self._charts_swap_figure(self._charts_trend_holder,
+                                 "_charts_trend_canvas", figs["trend"])
+        self._charts_swap_figure(self._charts_defense_holder,
+                                 "_charts_defense_canvas", figs["defense"])
+        self._charts_last_figures = figs
 
         self.charts_summary.configure(state="normal")
         self.charts_summary.delete("1.0", tk.END)
@@ -1461,6 +1880,93 @@ class SimpleModelUI:
         if not self.charts_custom_line.get().strip() and data.market_median_line:
             self.charts_custom_line.set(f"{data.market_median_line:.1f}")
         self._charts_evaluate_custom(silent_if_empty=True)
+
+    # ---- Fuzzy autocomplete --------------------------------------------------
+
+    def _charts_on_player_type(self, event=None) -> None:
+        """Refresh the player Combobox dropdown with fuzzy matches.
+
+        Triggered on every keystroke in the player entry. Doesn't rebind the
+        StringVar — the user keeps typing freely; the dropdown just narrows.
+        """
+        names = [str(r.get("player_name", "")) for r in self._charts_player_index]
+        matches = fuzzy_match_players(self.charts_player.get(), names, limit=20)
+        try:
+            self.charts_player_box.configure(values=matches)
+        except tk.TclError:
+            pass
+
+    # ---- Watchlist (Tk-side) -------------------------------------------------
+
+    def _charts_wl_refresh_listbox(self) -> None:
+        if not hasattr(self, "charts_wl_listbox"):
+            return
+        items = tk_watchlist_load()
+        self.charts_wl_listbox.delete(0, tk.END)
+        for name in items:
+            self.charts_wl_listbox.insert(tk.END, name)
+
+    def _charts_wl_pin(self) -> None:
+        name = (self.charts_player.get() or "").strip()
+        if not name:
+            messagebox.showinfo("Watchlist", "Pick a player first.")
+            return
+        tk_watchlist_add(name)
+        self._charts_wl_refresh_listbox()
+
+    def _charts_wl_remove(self) -> None:
+        sel = self.charts_wl_listbox.curselection()
+        if not sel:
+            return
+        name = self.charts_wl_listbox.get(sel[0])
+        tk_watchlist_remove(name)
+        self._charts_wl_refresh_listbox()
+
+    def _charts_wl_clear(self) -> None:
+        if not messagebox.askyesno("Watchlist", "Clear the entire watchlist?"):
+            return
+        tk_watchlist_clear()
+        self._charts_wl_refresh_listbox()
+
+    def _charts_wl_click(self) -> None:
+        sel = self.charts_wl_listbox.curselection()
+        if not sel:
+            return
+        name = self.charts_wl_listbox.get(sel[0])
+        self.charts_player.set(name)
+        self._charts_render()
+
+    # ---- Save snapshot -------------------------------------------------------
+
+    def _charts_save_snapshot(self) -> None:
+        """Export the most-recently-rendered chart + underlying rows as PNG+CSV."""
+        data = self._charts_last_data
+        if data is None or not self._charts_last_figures:
+            messagebox.showinfo(
+                "Save snapshot",
+                "Click 'Show charts' first so there's something to save.",
+            )
+            return
+        out_dir = filedialog.askdirectory(title="Choose snapshot directory")
+        if not out_dir:
+            return
+        ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        base = f"{data.player_name}_{data.stat_type}_{ts}"
+        # We always export the marquee distribution figure since that's the
+        # chart most worth archiving. (PNG path returns a single filename;
+        # the CSV is the underlying game rows + the per-game value.)
+        figure = self._charts_last_figures.get("distribution")
+        try:
+            png, csv = export_chart_snapshot(
+                figure, data.games, data.values, Path(out_dir), base_name=base,
+            )
+        except Exception as exc:
+            messagebox.showerror("Save snapshot", str(exc))
+            return
+        messagebox.showinfo(
+            "Save snapshot",
+            f"Saved:\n  PNG -> {png}\n  CSV -> {csv}",
+        )
 
     def _charts_evaluate_custom(self, silent_if_empty: bool = False) -> None:
         data = self._charts_last_data

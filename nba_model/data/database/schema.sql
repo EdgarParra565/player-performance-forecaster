@@ -241,7 +241,30 @@ CREATE TABLE IF NOT EXISTS prediction_configs (
     FOREIGN KEY (prediction_id) REFERENCES predictions(prediction_id)
 );
 
+-- MLB per-player game logs (long format: one row per player/game/stat).
+-- MLB box scores diverge too much from the NBA-shaped game_logs table to share
+-- it, so MLB lives in its own sport-tagged table (keeps MLB rows out of every
+-- NBA query by construction). Keyed by MLB Stats API personId + gamePk.
+CREATE TABLE IF NOT EXISTS mlb_game_logs (
+    mlb_game_log_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    sport         TEXT NOT NULL DEFAULT 'mlb',
+    player_id     INTEGER NOT NULL,        -- MLB Stats API personId
+    player_name   TEXT,
+    team          TEXT,                    -- team abbreviation (e.g. NYY)
+    opponent      TEXT,                    -- opponent abbreviation
+    game_pk       INTEGER NOT NULL,        -- MLB Stats API gamePk
+    game_date     DATE NOT NULL,
+    season        INTEGER,
+    player_group  TEXT NOT NULL,           -- 'hitting' | 'pitching'
+    stat_type     TEXT NOT NULL,           -- canonical sports/mlb.py stat key
+    value         REAL NOT NULL,
+    created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(player_id, game_pk, stat_type)
+);
+
 -- Indexes for fast queries
+CREATE INDEX IF NOT EXISTS idx_mlb_game_logs_player_stat ON mlb_game_logs(player_id, stat_type, game_date DESC);
+CREATE INDEX IF NOT EXISTS idx_mlb_game_logs_date ON mlb_game_logs(game_date DESC, game_pk);
 CREATE INDEX IF NOT EXISTS idx_game_logs_player_date ON game_logs(player_id, game_date DESC);
 CREATE INDEX IF NOT EXISTS idx_predictions_date ON predictions(game_date DESC);
 CREATE INDEX IF NOT EXISTS idx_betting_lines_player_date ON betting_lines(player_id, game_date);

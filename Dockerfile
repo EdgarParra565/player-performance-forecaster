@@ -35,11 +35,16 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# System packages we actually need: curl (for HEALTHCHECK), tini (PID 1).
+# System packages we actually need: curl (for HEALTHCHECK), tini (PID 1),
+# and libtk8.6 so `import tkinter` from `nba_model.simple_ui` does not blow
+# up at module load. The web container never opens a real Tk root, but the
+# desktop UI module is imported by the test runner (test_simple_ui_helpers
+# exercises module-level pure-logic helpers), and Python's `_tkinter.so`
+# dynamically loads libtk8.6.so on import. The library is ~3 MB on disk.
 # Skip the giant graphics stack; matplotlib only needs libfreetype which is
 # already in python:3.11-slim.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends curl tini \
+ && apt-get install -y --no-install-recommends curl tini libtk8.6 \
  && rm -rf /var/lib/apt/lists/*
 
 # Install Python deps. We install from requirements.txt (compatible-release

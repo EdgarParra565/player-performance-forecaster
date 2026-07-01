@@ -1,6 +1,6 @@
 # NBA Player Performance Forecaster - Working Notes
 
-Last updated: 2026-06-21
+Last updated: 2026-06-30
 
 This file is the active project tracker. It keeps only:
 - current architecture
@@ -11,7 +11,7 @@ Operational runbooks (CLI flags, the PrizePicks CDP workflow, the
 scraper-adding workflow, deployment) live in README.md and docs/. This file
 does not duplicate them.
 
-Test baseline: **455 passing** (`.venv/bin/python3 -m pytest nba_model/tests -q`).
+Test baseline: **566 passing** (`.venv/bin/python3 -m pytest nba_model/tests -q`).
 
 ---
 
@@ -177,38 +177,169 @@ Constraints (do not violate):
 
 ## What's next (priority order)
 
-### Workstream 2 — data quality + consensus  **(blocked on the Chrome host)**
-- [ ] **2c.** Activate 2–3 stub scrapers (FanDuel, BetRivers, ESPNBet): capture
-      CDP snapshot → inspect `web_text_snapshots.text_content` → write parser
-      following `betmgm.py` (team lines) or `pick6.py` (props) → set
-      `prop_preprocess` / `team_line_extractor`. Needs the live Chrome `:9222`
-      host + authenticated snapshots.
-- [ ] **2d.** Session-expiry detection in ETL: when a fetch returns a
-      login-wall page, fail fast with an actionable message instead of
-      inserting junk into `web_prop_cards`.
+### Workstream 2 — data quality + consensus
+- [x] **2c.** Activated FanDuel, BetRivers, ESPNBet team-line parsers
+      (`scrapers/fanduel.py` extractor + `betrivers.py` / `espnbet.py`
+      following `betmgm.py`/`draftkings.py`). All three registered with
+      `team_line_extractor` set; tested via `test_new_book_scrapers.py`
+      (extractors + 3-book consensus round-trip). FanDuel mirrors its
+      documented format; BetRivers/ESPNBet use committed fixtures —
+      `TODO(real-capture)` in each notes they need a live CDP snapshot to
+      re-validate the token order.
+- [x] **2d.** Login-wall / session-expiry detection in the parse path:
+      `web_text_ingestion.detect_login_wall(text, url)` (book markers +
+      generic fallback). Both parsers skip login-walled snapshots instead of
+      scraping junk into `web_prop_cards` / `web_team_lines`, reporting
+      `snapshots_login_walled`. Tested in `test_login_wall_detection.py`.
 
 ### Workstream 5 — evaluation / data backfill
-- [ ] **5a.** Historical odds backfill — `betting_lines` only spans
-      ~2026-03-14..15, which blocks `--use-market-lines` sweeps and meaningful
-      CLV. **Blocked on real odds data.** Once backfilled, re-run
-      `run_distribution_sweep.py --use-market-lines` and update README
-      "Production defaults".
+- [x] **5a.** Historical odds backfill tooling:
+      `nba_model/data/historical_odds_backfill.py` derives `betting_lines`
+      from scraped `web_prop_cards` (latest line per player/stat/book/day,
+      DFS odds → -110 breakeven; idempotent; name→id via
+      `nba_active_players_ref`→`players`). `run_distribution_sweep
+      --use-market-lines` reads those via `get_market_line` (end-to-end seam
+      tested on a fixture DB in `test_historical_odds_backfill.py`). README
+      "Production defaults" documents the re-run workflow. Coverage is still
+      bounded by how many props the Chrome-host ETL has scraped — re-rank the
+      default distributions once a non-degenerate market-line sweep exists.
 
-### Workstream 6 — multi-sport (NFL first)
-- [ ] `nba_model/data/nfl_results_ingestion.py` via `nfl_data_py` — **blocked**
-      (dep + live data not available here).
-- [ ] NFL scrapers for FanDuel + DraftKings (props first) — **blocked** (need
-      authenticated CDP snapshots).
-- [ ] Keep MLB/NHL/soccer "coming soon".
+### Workstream 6 — multi-sport (**PIVOT 2026-06-30: MLB first, NFL later**)
+MLB is in season RIGHT NOW with live book lines, so it became the first
+non-NBA sport with a real data layer — we validate parsers against real
+captures instead of guessing. NFL scaffolding is kept intact but parked as
+"stub/later" until its season + authenticated snapshots are available.
+
+**LIVE-CAPTURE VALIDATION RUN (2026-06-30, dev-Mac Chrome :9222).** NBA is
+OFFSEASON so NBA lobbies post no games — those books are offseason-empty, not
+parser bugs. Per-book state:
+- **fanduel_mlb (team lines): VALIDATED** — live FanDuel MLB lobby → 18 games /
+  168 rows into web_team_lines (sport='mlb'); fixture refreshed to the real
+  captured tokens (`test_mlb_team_lines.py`), TODO removed for team lines.
+- **MLB Stats API ingestion: VALIDATED** — 3,780 real mlb_game_logs rows.
+- **draftkings_mlb: BLOCKED-ON-RENDER** — MLB lobby fetch returns only the
+  category-nav shell (lazy-loaded JS grid not captured); parser code is the
+  same (validated) shared extractor. Needs interactive scroll / per-game URL.
+- **betrivers (NBA): BLOCKED-ON-AUTH** — login-walled (0/4 auth markers);
+  re-login to BetRivers in the :9222 Chrome.
+- **espnbet (NBA): BLOCKED-FETCH** — `ERR_CERT_COMMON_NAME_INVALID` on
+  espnbet.com; TLS/host issue, not auth/parser.
+- **prizepicks / underdog / pick6 / parlayplay / draftkings / betmgm / caesars
+  / bovada / kalshi / fanduel (all NBA): OFFSEASON-EMPTY** — session live (not
+  walled) but lobbies post no NBA games (Caesars NBA URL even redirects to MLB
+  content). Re-validate their parsers once the NBA preseason posts lines.
+- Detector fix: `detect_login_wall` now distinguishes a SPECIFIC wall phrase
+  (definitive) from a GENERIC nav "Log in" link (only a wall when authenticated
+  content markers are also absent) + is sport-aware — this stopped
+  content-rich sportsbook lobbies from false-flagging as walls.
+- web_team_lines is now sport-tagged; `get_consensus_team_lines(sport='nba')`
+  by default so MLB never leaks into NBA consensus.
+
+**MLB (status: beta — data layer live):**
+- [x] **Baseline data = the OFFICIAL MLB STATS API** (`statsapi.mlb.com/api/v1`,
+      free, no key/auth — the MLB analog to nba_api). Prefer it over scraping
+      for game logs. `nba_model/data/mlb_results_ingestion.py`: `fetch_*` HTTP
+      (via `requests`, certifi-backed) + PURE `transform_*` (schedule,
+      boxscore→long rows) unit-tested on committed JSON fixtures (no live net
+      in CI). Verified end-to-end against live data: 2026-06-28 → 3,780
+      `mlb_game_logs` rows from 15 games.
+- [x] Dedicated long-format `mlb_game_logs` table (one row per player/game/stat,
+      `value` tagged by stat_type, `sport='mlb'`) — MLB box scores diverge too
+      much from NBA `game_logs`, and a separate table keeps MLB rows out of
+      every NBA query by construction. `insert_mlb_game_logs` (idempotent,
+      `UNIQUE(player_id, game_pk, stat_type)`) + `get_mlb_player_game_logs`.
+- [x] Hitter vs pitcher kept separate (`mlb_props.stat_group`); park-factor
+      hook `nba_model/data/mlb_park_factors.py` (light lookup, TODO validate).
+- [x] Scrapers (props first): `scrapers/draftkings_mlb.py` / `fanduel_mlb.py`
+      (`sport='mlb'`) share `scrapers/mlb_props.py` — handles BOTH over/under
+      and yes/no (anytime HR → 0.5-line Bernoulli) shapes. Registered per
+      `(book, sport)`; `BY_NAME`/`BY_DOMAIN` still prefer NBA so default URL
+      resolution is unchanged. `pybaseball` Statcast supplement is optional +
+      guarded. Tested: `test_mlb_ingestion.py`, `test_mlb_props.py`.
+- [x] `sports/mlb.py` flipped `stub → beta`. MLB kept OUT of the NBA
+      cross-book consensus path. Remaining for fully-"live" web status: a
+      sport-filtered Streamlit rendering path (the web view reads NBA-shaped
+      tables only) — web-layer work, out of the data/scrapers agent's scope;
+      `is_live` left NBA-only so the picker won't mislabel NBA data as MLB.
+
+**NFL (parked — later):**
+- [x] Scaffolding built + kept: `nfl_results_ingestion.py` (guarded
+      `nfl_data_py`), `scrapers/fanduel_nfl.py` / `draftkings_nfl.py` +
+      `nfl_props.py`. Status stays "stub/coming soon" until NFL season +
+      authenticated snapshots; do not delete.
+- [ ] Keep NHL/soccer "coming soon".
+
+### SCRAPER BACKLOG — books NOT yet producing rows (fix later)
+Snapshot of the 2026-06-30 live-capture run. Each entry: why it's blocked +
+the concrete next action. NONE of these is a confirmed parser bug — they are
+season/auth/render/env blockers. Re-run the fetch→inspect→parse→fix loop on
+each when its blocker clears.
+
+Blocked-on-AUTH (needs manual re-login in the :9222 Chrome):
+- [ ] **betrivers** (nba team lines) — login-walled (0/4 auth markers, len~1k).
+      Action: log in to BetRivers in the dev-Mac Chrome, re-fetch
+      `https://co.betrivers.com/?page=sportsbook`, then validate
+      `extract_team_lines` against the real token order (parser is fixture-only,
+      still has TODO(real-capture)).
+
+Blocked-on-ENV / fetch:
+- [ ] **espnbet** (nba team lines) — fetch fails with
+      `ERR_CERT_COMMON_NAME_INVALID` on espnbet.com. Action: confirm the real
+      current ESPN BET host/URL (cert CN mismatch suggests a redirect/rebrand),
+      update the URL, then capture + validate. Parser fixture-only (TODO).
+
+Blocked-on-RENDER (JS grid not captured by the snapshot):
+- [ ] **draftkings_mlb** (and draftkings nba) — the lobby fetch returns only the
+      category-nav shell (len 12920, ~24 odds = futures menu); the game grid is
+      lazy-loaded JS that the current fetch doesn't trigger. Action: add a
+      scroll / longer `extra_wait` / per-game URL to the fetch path, or capture
+      a per-game props page. Team-line parser itself is the shared, validated
+      `mlb_team_lines.extract_team_lines` (proven on FanDuel), so this is a
+      capture problem, not a parser problem.
+
+Blocked-on-SEASON (NBA offseason — no games posted; re-check at NBA preseason):
+- [ ] **prizepicks, underdog, pick6, parlayplay** (nba DFS props) — session live,
+      not walled, but boards post no NBA props offseason.
+- [ ] **draftkings, betmgm, caesars, bovada, kalshi, fanduel** (nba team lines) —
+      offseason-empty / shell; caesars' NBA URL even redirects to MLB content.
+      Their parsers (`betmgm`/`caesars`/`draftkings` team-line + the newer
+      `fanduel`/`betrivers`/`espnbet`) still carry TODO(real-capture) and must be
+      validated against live NBA text once the season posts lines.
+
+Parser-only follow-ups (independent of the blockers above):
+- [ ] **MLB player props** (`mlb_props.preprocess_mlb_props`, used by
+      draftkings_mlb/fanduel_mlb) is still fixture-based — sportsbook player
+      props live on per-game pages, not the league lobby that was captured for
+      team lines. Capture a live MLB prop page and validate.
+- [ ] **mlb_team_lines pairing edge case** — the nearest-two-team pairing can
+      mis-pair on very noisy LIVE (in-progress) game blocks (observed a couple
+      of duplicate home teams in an 18-game live capture). Pre-game blocks parse
+      cleanly. Tighten the team↔odds-block association (e.g. bound by the "same
+      game parlay" delimiter) before trusting live in-game MLB lines.
+- [ ] **mlb_park_factors** values are unvalidated placeholders — replace with
+      empirically-derived factors.
 
 ### Workstream 7 — desktop Tk polish (low priority)
-- [ ] Wire the newer matplotlib chart builders into Tk `simple_ui.py`.
-- [ ] Player autocomplete (fuzzy), save-snapshot (PNG + CSV), refresh button,
-      async DB fetch, Enter-to-submit, date-range picker, watchlist parity.
+- [x] Wire the newer matplotlib chart builders into Tk `simple_ui.py`
+      (Box/Quantile, Rolling CI, Trend/Form, vs Defense sub-tabs).
+- [x] Player autocomplete (fuzzy, module-level `fuzzy_match_players`),
+      save-snapshot (`export_chart_snapshot` → PNG + CSV, dated base name),
+      Refresh (async) button (background thread + queue + `root.after` poll
+      via `_charts_async_render`), Enter-to-submit on player/N-games/date
+      entries, date-range picker (`parse_date_range` +
+      `filter_games_by_date_range`), Tk-side watchlist parity persisted to
+      `data/state/tk_watchlist.json` (independent from the web cookie path).
+      Tests in `nba_model/tests/test_simple_ui_helpers.py`.
 
 ### Billing follow-up (only when billing re-enabled)
-- [ ] Add a `created_at` / `trial_start` column to `user_subscriptions` and
-      wire `auth.trial_active` into live tier resolution.
+- [x] Added `created_at` column to `user_subscriptions` (idempotent migration
+      on both SQLite + Postgres backends; back-fills legacy rows from
+      `updated_at`). `auth.tier_for` now branches on `TRIAL_ENABLED`:
+      new emails get `touch_first_seen` + premium for `TRIAL_DAYS`, existing
+      rows resolved via `trial_active(created_at)`. Honors
+      `ENABLE_TRIAL` / `TRIAL_DAYS` env; `BILLING_ENABLED=0` short-circuits
+      first and stays open-access. Tests in
+      `nba_model/tests/test_billing_hardening.py`.
 
 ---
 

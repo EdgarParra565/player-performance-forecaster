@@ -9,17 +9,20 @@ generic ``Player Line Stat Side`` patterns, and writes the results to the
 
 import argparse
 import hashlib
+import logging
 import re
 from typing import Optional
 from urllib.parse import urlparse
 
 from nba_model.data.database.db_manager import DatabaseManager
-from nba_model.model.web_text_ingestion import load_urls_from_file
+from nba_model.model.web_text_ingestion import detect_login_wall, load_urls_from_file
 from nba_model.scrapers import SCRAPERS, get_scraper_for_url
 from nba_model.scrapers.base import NAME_STOP_WORDS
 # Re-exported for backward compatibility — tests import these from this module.
 from nba_model.scrapers.prizepicks import preprocess as _preprocess_prizepicks_text  # noqa: F401
 from nba_model.scrapers.underdog import preprocess as _preprocess_underdog_text  # noqa: F401
+
+logger = logging.getLogger("nba_model.browser_prop_parser")
 
 PARSER_VERSION = "visible_text_v2"
 DEFAULT_MIN_PARSE_CONFIDENCE = 0.45
@@ -449,11 +452,36 @@ def parse_and_store_web_prop_cards(
     total_retained = 0
     retained_active = 0
     retained_non_nba = 0
+    snapshots_login_walled = 0
 
     for snapshot in snapshots:
+        text_content = snapshot.get("text_content", "")
+        source_url = str(snapshot.get("source_url", ""))
+        # Guard: a login/paywall snapshot must not be parsed, or the generic
+        # card regexes scrape UI junk into web_prop_cards. Skip + record it.
+        is_wall, wall_reason = detect_login_wall(text_content, source_url)
+        if is_wall:
+            snapshots_login_walled += 1
+            results.append(
+                {
+                    "snapshot_id": snapshot.get("snapshot_id"),
+                    "source_url": snapshot.get("source_url"),
+                    "book": _infer_book_from_url(source_url),
+                    "extracted_count": 0,
+                    "retained_count": 0,
+                    "skipped_login_wall": wall_reason,
+                }
+            )
+            logger.warning(
+                "Skipping login-walled snapshot %s (%s): %s",
+                snapshot.get("snapshot_id"),
+                source_url,
+                wall_reason,
+            )
+            continue
         parsed = extract_prop_cards_from_text(
-            text_content=snapshot.get("text_content", ""),
-            source_url=str(snapshot.get("source_url", "")),
+            text_content=text_content,
+            source_url=source_url,
             snapshot_id=int(snapshot.get("snapshot_id")),
             observed_at_utc=str(snapshot.get("fetched_at_utc", "")),
             active_name_keys=active_name_keys,
@@ -493,6 +521,7 @@ def parse_and_store_web_prop_cards(
         "status": status,
         "urls_considered": int(len(normalized_urls)),
         "snapshots_considered": int(len(snapshots)),
+        "snapshots_login_walled": int(snapshots_login_walled),
         "cards_extracted": int(total_extracted),
         "cards_retained": int(total_retained),
         "cards_retained_active_nba": int(retained_active),

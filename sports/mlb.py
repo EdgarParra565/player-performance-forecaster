@@ -1,24 +1,31 @@
 """MLB sport config.
 
-Status: STUB.
+Status: BETA — MLB is the first non-NBA sport with a real data layer.
 
-Next steps:
-  1. Ingest: `pybaseball` is the standard wrapper for FanGraphs + Statcast.
-     `pybaseball.statcast_batter`, `statcast_pitcher`, `schedule_and_record`
-     cover most of what we need.
-  2. Schema: same `sport='mlb'` extension to `game_logs`. MLB's box-score
-     diverges enough (PA / AB / BB / SO / HR vs basketball-shaped stats)
-     that a dedicated `mlb_batter_logs` + `mlb_pitcher_logs` pair is
-     probably cleaner long-term, but for an MVP we can squeeze key stats
-     into a generic `value` column tagged by stat_type.
-  3. Two BIG MLB-specific issues:
-     - Pitcher vs batter are entirely separate populations + markets.
-       Two distinct stat-type lists, two distinct rolling-window contexts.
-     - Park factors matter a LOT (Coors Field is +12% runs, Petco is -8%).
-       We'd want a `park_factor` adjustment analogous to NBA's defense
-       adjustment.
-  4. Lines come in BOTH yes/no (hit a HR) and over/under (over 1.5 hits)
-     forms. The probe panel needs both modes.
+Implemented (data/scrapers layer):
+  1. Ingest: the OFFICIAL MLB STATS API (https://statsapi.mlb.com/api/v1) is
+     the primary baseline-data source — free, no key, no auth (the MLB analog
+     to nba_api). See `nba_model/data/mlb_results_ingestion.py`
+     (schedule -> boxscore -> per-player game logs). `pybaseball` is kept as an
+     OPTIONAL, guarded Statcast/park-factor supplement only.
+  2. Schema: MLB box scores diverge too much from the NBA-shaped `game_logs`,
+     so MLB lives in a dedicated long-format `mlb_game_logs` table (one row per
+     player/game/stat, `value` tagged by stat_type, `sport='mlb'`). This keeps
+     MLB rows out of every NBA query by construction.
+  3. MLB-specific realities honored:
+     - Pitcher vs batter are separate populations + markets — see
+       `scrapers/mlb_props.stat_group()` ('hitting' | 'pitching' | 'combined').
+     - Park factors: `nba_model/data/mlb_park_factors.py` (light lookup, TODO
+       to validate against real data).
+  4. Lines come in BOTH yes/no (hit a HR -> anytime_home_run) and over/under
+     (over 1.5 hits) forms — `preprocess_mlb_props` handles both.
+
+Scrapers (props first): `scrapers/draftkings_mlb.py`, `scrapers/fanduel_mlb.py`
+(sport='mlb'), resolvable via `get_scraper_for_book_sport(book, 'mlb')`.
+
+Remaining for fully-"live" status: a sport-filtered Streamlit rendering path
+(the web view currently reads the NBA-shaped tables only) — that's web-layer
+work. MLB is intentionally kept OUT of the NBA cross-book consensus path.
 """
 
 from sports import Sport
@@ -26,7 +33,7 @@ from sports import Sport
 SPORT = Sport(
     key="mlb",
     display_name="MLB",
-    status="stub",
+    status="beta",
     stat_types=(
         # Hitter
         "hits", "total_bases", "home_runs", "rbis", "runs_scored",
@@ -65,7 +72,8 @@ SPORT = Sport(
         "fanatics", "prizepicks", "underdog",
     ),
     notes=(
-        "Use pybaseball for ingest (Statcast + FanGraphs wrapper).",
+        "Primary ingest: official MLB Stats API (statsapi.mlb.com); pybaseball "
+        "is an optional, guarded Statcast/park-factor supplement only.",
         "Pitcher vs batter need separate stat-type lists + separate models.",
         "Park-factor adjustment is the MLB analog to NBA defense rating.",
         "Some markets are yes/no (anytime HR) -- Bernoulli, not normal.",

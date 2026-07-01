@@ -948,8 +948,35 @@ three return zero bets. Asymmetric families therefore dominate the
 `avg_roi` ranking by construction — that's a property of the backtest
 harness, not evidence that they fit player props better than normal in
 production. To re-rank under realistic conditions, the sweep must run
-with `--use-market-lines`, which currently requires backfilling
-`betting_lines` market coverage beyond the 2026-03-14..2026-03-15 window.
+with `--use-market-lines`, which reads settlement lines from `betting_lines`.
+
+### Backfilling `betting_lines` for `--use-market-lines`
+
+Live odds-API history isn't available in this environment, so the market
+lines are derived data-driven from the props we already scrape into
+`web_prop_cards` (latest line per player/stat/book/game-day; DFS over/under
+default to the -110 breakeven). Re-run workflow:
+
+```bash
+# 1. Backfill betting_lines from scraped web_prop_cards (idempotent; re-runnable).
+#    --dry-run first to preview candidate/resolved counts.
+.venv/bin/python3 -m nba_model.data.historical_odds_backfill \
+    --db-path data/database/nba_data.db --dry-run
+.venv/bin/python3 -m nba_model.data.historical_odds_backfill \
+    --db-path data/database/nba_data.db --lookback-hours 168
+
+# 2. Re-run the distribution sweep against those market lines.
+.venv/bin/python3 -m nba_model.evaluation.run_distribution_sweep \
+    --use-market-lines --require-market-line \
+    --stat-types points assists rebounds pra
+```
+
+`historical_odds_backfill` resolves player names via
+`nba_active_players_ref` → `players`, drops unresolved names, and skips exact
+duplicates + implausible lines on insert, so it is safe to run repeatedly as
+the Chrome-host ETL accumulates more `web_prop_cards`. Coverage is still only
+as wide as the scraped props; update the production-default distributions
+above once a market-line sweep produces a non-degenerate ranking.
 
 Note: `SUPPORTED_DISTRIBUTIONS` now includes `negative_binomial`
 (overdispersed counts; method-of-moments parameterization with a
@@ -977,7 +1004,7 @@ Latest results are generated into:
 - Cross-book/model-vs-book and monthly diagnostics depend on having populated `betting_lines` and `predictions` data.
 - The Book Edge Scanner and Line Movement views need scraped `web_prop_cards` / `betting_line_snapshots` rows from the Chrome-host ETL; both show an empty-state until that data is present.
 - 11 of 20 scrapers are still parser-less (need authenticated CDP snapshots from the dev-Mac Chrome host).
-- `betting_lines` market coverage is thin (~2 days), which blocks `--use-market-lines` distribution sweeps and meaningful CLV analysis.
+- `betting_lines` market coverage is thin (~2 days of odds-API data). Use `nba_model.data.historical_odds_backfill` to derive additional market lines from scraped `web_prop_cards` before running `--use-market-lines` sweeps / CLV analysis; coverage is then bounded by how many props the Chrome-host ETL has scraped.
 
 ## Operational Runbook (ETL & Odds Ingestion)
 

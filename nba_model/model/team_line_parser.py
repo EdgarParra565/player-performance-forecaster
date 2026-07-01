@@ -10,10 +10,14 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import logging
 from typing import Optional
 
 from nba_model.data.database.db_manager import DatabaseManager
+from nba_model.model.web_text_ingestion import detect_login_wall
 from nba_model.scrapers import get_scraper_for_url
+
+logger = logging.getLogger("nba_model.team_line_parser")
 
 PARSER_VERSION = "team_lines_v1"
 DEFAULT_MAX_SNAPSHOTS_PER_URL = 1
@@ -61,9 +65,15 @@ def extract_team_lines_from_snapshot(
     source_url: str,
     snapshot_id: int,
     observed_at_utc: str,
+    sport: Optional[str] = None,
 ) -> list[dict]:
-    """Run the matching book's extractor over a single snapshot's text."""
-    scraper = get_scraper_for_url(source_url)
+    """Run the matching book's extractor over a single snapshot's text.
+
+    ``sport`` selects the per-(book, sport) scraper config (default NBA).
+    web_text_snapshots isn't sport-tagged, so the caller passes the sport it
+    is parsing (e.g. 'mlb' for MLB lobby snapshots).
+    """
+    scraper = get_scraper_for_url(source_url, sport=sport)
     if scraper is None or scraper.team_line_extractor is None:
         return []
     try:
@@ -119,6 +129,7 @@ def extract_team_lines_from_snapshot(
                 "raw_text": (rec.get("raw_text") or "")[:300],
                 "parser_version": PARSER_VERSION,
                 "record_sha256": record_sha,
+                "sport": scraper.sport,
             }
         )
     return out
@@ -130,8 +141,13 @@ def parse_and_store_web_team_lines(
     max_snapshots_per_url: int = DEFAULT_MAX_SNAPSHOTS_PER_URL,
     max_total_snapshots: int = DEFAULT_MAX_TOTAL_SNAPSHOTS,
     min_parse_confidence: float = DEFAULT_MIN_PARSE_CONFIDENCE,
+    sport: Optional[str] = None,
 ) -> dict:
-    """Parse stored snapshots into ``web_team_lines`` rows and persist them."""
+    """Parse stored snapshots into ``web_team_lines`` rows and persist them.
+
+    ``sport`` selects the per-(book, sport) scraper config for extraction
+    (default NBA); pass 'mlb' when parsing MLB lobby snapshots.
+    """
     with DatabaseManager(db_path=db_path) as db:
         snapshots = db.get_recent_web_text_snapshots(
             source_urls=list(source_urls) if source_urls else None,
@@ -155,13 +171,35 @@ def parse_and_store_web_team_lines(
     results: list[dict] = []
     total_extracted = 0
     total_retained = 0
+    snapshots_login_walled = 0
 
     for snap in snapshots:
+        text_content = snap.get("text_content", "")
+        source_url = str(snap.get("source_url", ""))
+        # Guard: skip login/paywall snapshots so we don't store junk team lines.
+        is_wall, wall_reason = detect_login_wall(text_content, source_url, sport=sport)
+        if is_wall:
+            snapshots_login_walled += 1
+            results.append(
+                {
+                    "snapshot_id": snap.get("snapshot_id"),
+                    "source_url": snap.get("source_url"),
+                    "extracted_count": 0,
+                    "retained_count": 0,
+                    "skipped_login_wall": wall_reason,
+                }
+            )
+            logger.warning(
+                "Skipping login-walled snapshot %s (%s): %s",
+                snap.get("snapshot_id"), source_url, wall_reason,
+            )
+            continue
         rows = extract_team_lines_from_snapshot(
-            text_content=snap.get("text_content", ""),
-            source_url=str(snap.get("source_url", "")),
+            text_content=text_content,
+            source_url=source_url,
             snapshot_id=int(snap.get("snapshot_id")),
             observed_at_utc=str(snap.get("fetched_at_utc", "")),
+            sport=sport,
         )
         total_extracted += len(rows)
         retained = [
@@ -188,6 +226,7 @@ def parse_and_store_web_team_lines(
     return {
         "status": status,
         "snapshots_considered": len(snapshots),
+        "snapshots_login_walled": int(snapshots_login_walled),
         "lines_extracted": total_extracted,
         "lines_retained": total_retained,
         "min_parse_confidence": threshold,

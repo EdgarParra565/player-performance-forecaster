@@ -608,6 +608,74 @@ def _check_session_content(text: str, url: str, min_content_length: int) -> tupl
     return True, "Session appears active (generic check passed)"
 
 
+# Generic nav phrases that appear on the header of an AUTHENTICATED, content-
+# rich sportsbook page (a persistent "Log In" button next to real lines), so
+# their mere presence must NOT by itself flag a wall — that would false-
+# positive on every logged-out-header-but-public-content lobby (FanDuel/DK/
+# BetMGM show game lines with a "Log In" nav link). A specific wall phrase
+# (e.g. "log in to prizepicks", "verify your identity") is definitive.
+_GENERIC_LOGIN_NAV = frozenset(
+    {"log in", "sign in", "sign up", "create account", "join now", "register"}
+)
+
+
+def detect_login_wall(
+    text: str, url: str = "", sport: Optional[str] = None
+) -> tuple[bool, Optional[str]]:
+    """Classify whether ``text`` is a login / paywall page rather than content.
+
+    Parse-path guard: snapshots that are really a login wall must NOT be fed to
+    the prop/team-line extractors, or the generic card regexes scrape junk
+    (nav labels, "Sign in to continue") into ``web_prop_cards`` /
+    ``web_team_lines``.
+
+    Returns ``(is_login_wall, reason)`` (``reason`` None → real content). Rules,
+    using the matched book's markers (``sport`` selects the per-(book, sport)
+    config):
+      * a SPECIFIC login-wall phrase (one that isn't a generic nav word) →
+        definitive wall;
+      * a GENERIC nav phrase alone ("log in", "sign up", ...) → wall only when
+        the page also lacks enough authenticated-content markers
+        (``min_authenticated_hits``), since a real lobby shows those nav words
+        next to live content;
+      * unknown host → generic "repeated sign-in keywords" fallback.
+    """
+    text_lower = str(text or "").lower()
+    if not text_lower.strip():
+        return True, "Empty snapshot text"
+
+    scraper = get_scraper_for_url(url, sport=sport) if url else None
+    markers = scraper.session_markers if scraper is not None else None
+    if markers and markers.login_wall:
+        specific = [p for p in markers.login_wall if p.lower() not in _GENERIC_LOGIN_NAV]
+        for phrase in specific:
+            if phrase in text_lower:
+                return True, f"Login-wall phrase detected: '{phrase}'"
+
+        generic_present = [
+            p for p in markers.login_wall
+            if p.lower() in _GENERIC_LOGIN_NAV and p in text_lower
+        ]
+        if generic_present:
+            hit_count = sum(1 for p in markers.authenticated if p in text_lower)
+            if hit_count < int(markers.min_authenticated_hits):
+                return True, (
+                    f"Generic login nav '{generic_present[0]}' present and only "
+                    f"{hit_count}/{markers.min_authenticated_hits} authenticated "
+                    "content markers found"
+                )
+        # Known book, no definitive wall signal → treat as content.
+        return False, None
+
+    # Generic fallback for books without configured markers: a real lobby
+    # mentions "sign in" once in a footer, but a login wall repeats it.
+    generic_wall_markers = ("sign in", "log in", "create account", "loading...")
+    for marker in generic_wall_markers:
+        if text_lower.count(marker) > 2:
+            return True, f"Generic login-wall markers detected ('{marker}' >2x)"
+    return False, None
+
+
 def validate_session(
     test_url: str,
     auth_state_file: str,

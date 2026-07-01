@@ -136,8 +136,10 @@ def tier_for(email: Optional[str]) -> str:
         0. BILLING_ENABLED is False (the launch default) -> everyone is premium
         1. anonymous -> free
         2. email in [auth.admins] -> premium (override for the dev/owner)
-        3. subscriptions table entry with active premium -> premium
-        4. otherwise -> free
+        3. ENABLE_TRIAL=1 and the email is within TRIAL_DAYS of first sign-in
+           -> premium (anchors `created_at` on first call when no row exists)
+        4. subscriptions table entry with active premium -> premium
+        5. otherwise -> free
     """
     if not BILLING_ENABLED:
         return TIER_PREMIUM
@@ -146,6 +148,16 @@ def tier_for(email: Optional[str]) -> str:
     email_lower = email.strip().lower()
     if email_lower in _admin_emails():
         return TIER_PREMIUM
+    if TRIAL_ENABLED:
+        row = subscriptions.lookup(email_lower)
+        if row is None:
+            # First sign-in: anchor created_at NOW so the trial clock starts
+            # on this very call. The row is created free-tier; the upgrade
+            # path will overwrite tier=premium when Stripe webhook lands.
+            subscriptions.touch_first_seen(email_lower)
+            return TIER_PREMIUM
+        if trial_active(row.get("created_at")):
+            return TIER_PREMIUM
     return subscriptions.tier_for(email_lower)
 
 

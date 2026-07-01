@@ -79,7 +79,7 @@ class DatabaseManager:
     # current rows + inserts that omit the column working unchanged.
     _SPORT_COLUMN_TABLES = (
         "game_logs", "betting_lines", "betting_line_snapshots",
-        "players", "web_prop_cards", "predictions",
+        "players", "web_prop_cards", "predictions", "web_team_lines",
     )
 
     def _initialize_database(self):
@@ -1210,9 +1210,10 @@ class DatabaseManager:
                 snapshot_id, source_url, book, observed_at_utc,
                 away_team, home_team, market_type, side, team,
                 line_value, odds_american,
-                parse_confidence, raw_text, parser_version, record_sha256
+                parse_confidence, raw_text, parser_version, record_sha256,
+                sport
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """
         payload = []
         skipped_unchanged = 0
@@ -1251,6 +1252,7 @@ class DatabaseManager:
                 (str(rec.get("raw_text", "")).strip() or None),
                 str(rec.get("parser_version", "")).strip(),
                 str(rec.get("record_sha256", "")).strip(),
+                (str(rec.get("sport", "nba")).strip().lower() or "nba"),
             )
             # Required: source_url, book, observed_at_utc, both teams,
             # market_type, side, parser_version, record_sha256.
@@ -1294,6 +1296,7 @@ class DatabaseManager:
         side=None,
         since_hours=None,
         min_books=1,
+        sport="nba",
     ):
         """Return cross-book consensus for game-level markets.
 
@@ -1301,9 +1304,15 @@ class DatabaseManager:
         from each book is selected, then averaged across books.  Returns one
         row per (game, market, side) with mean line, mean odds, and the
         list of contributing books.
+
+        ``sport`` defaults to 'nba' so NBA consensus never sees MLB (or other
+        non-NBA) rows; pass ``sport=None`` to span all sports or 'mlb' for MLB.
         """
         clauses: list[str] = []
         params: list = []
+        if sport is not None:
+            clauses.append("lower(sport) = lower(?)")
+            params.append(str(sport).strip())
         if away_team:
             clauses.append("lower(away_team) = lower(?)")
             params.append(str(away_team).strip())
@@ -1647,6 +1656,84 @@ class DatabaseManager:
             logger.error("Error inserting game logs: %s", e)
             self.conn.rollback()
             raise
+
+    def insert_mlb_game_logs(self, records):
+        """Insert MLB long-format game-log rows, skipping exact duplicates.
+
+        Each record: player_id, player_name, team, opponent, game_pk,
+        game_date, season, player_group ('hitting'|'pitching'), stat_type,
+        value. Dedup is by ``UNIQUE(player_id, game_pk, stat_type)`` via
+        ``INSERT OR IGNORE`` — game-log results are immutable, so re-running
+        the ingest never double-counts.
+        """
+        if not records:
+            return {"inserted": 0, "duplicates_ignored": 0, "attempted": 0}
+
+        query = """
+            INSERT OR IGNORE INTO mlb_game_logs
+                (sport, player_id, player_name, team, opponent, game_pk,
+                 game_date, season, player_group, stat_type, value)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """
+        payload = []
+        for rec in records:
+            try:
+                player_id = int(rec.get("player_id"))
+                game_pk = int(rec.get("game_pk"))
+                value = float(rec.get("value"))
+            except (TypeError, ValueError):
+                continue
+            stat_type = str(rec.get("stat_type", "")).strip().lower()
+            game_date = str(rec.get("game_date", "")).strip()
+            group = str(rec.get("player_group", "")).strip().lower()
+            if not (stat_type and game_date and group):
+                continue
+            season = rec.get("season")
+            payload.append((
+                str(rec.get("sport", "mlb")).strip().lower() or "mlb",
+                player_id,
+                (str(rec.get("player_name")).strip() or None) if rec.get("player_name") else None,
+                (str(rec.get("team")).strip() or None) if rec.get("team") else None,
+                (str(rec.get("opponent")).strip() or None) if rec.get("opponent") else None,
+                game_pk,
+                game_date,
+                int(season) if season is not None else None,
+                group,
+                stat_type,
+                value,
+            ))
+
+        if not payload:
+            return {"inserted": 0, "duplicates_ignored": 0, "attempted": 0}
+
+        before = self.conn.total_changes
+        self.conn.executemany(query, payload)
+        self.conn.commit()
+        inserted = self.conn.total_changes - before
+        logger.info(
+            "Inserted %s mlb_game_logs rows (%s duplicates ignored)",
+            inserted, len(payload) - inserted,
+        )
+        return {
+            "inserted": int(inserted),
+            "duplicates_ignored": int(len(payload) - inserted),
+            "attempted": int(len(payload)),
+        }
+
+    def get_mlb_player_game_logs(self, player_id, stat_type, n_games=50):
+        """Most-recent N MLB game-log values for a player+stat (sport='mlb')."""
+        cur = self.conn.execute(
+            """
+            SELECT game_date, game_pk, team, opponent, value
+            FROM mlb_game_logs
+            WHERE player_id = ? AND lower(stat_type) = lower(?) AND sport = 'mlb'
+            ORDER BY game_date DESC, game_pk DESC
+            LIMIT ?
+            """,
+            (int(player_id), str(stat_type), int(n_games)),
+        )
+        cols = [c[0] for c in cur.description]
+        return [dict(zip(cols, row)) for row in cur.fetchall()]
 
     def get_player_games(self, player_id, n_games=50):
         """Fetch most recent N games for a player."""

@@ -19,9 +19,13 @@ from nba_model.scrapers import (
     caesars,
     dabble,
     draftkings,
+    draftkings_mlb,
+    draftkings_nfl,
     espnbet,
     fanatics,
     fanduel,
+    fanduel_mlb,
+    fanduel_nfl,
     fliff,
     hardrockbet,
     kalshi,
@@ -60,12 +64,26 @@ SCRAPERS: tuple[BookScraper, ...] = (
     oddsshark.SCRAPER,
     vegasinsider.SCRAPER,
     bettingpros.SCRAPER,
+    # ---- Multi-sport (NFL stub + live MLB; same domains as their NBA configs) ----
+    fanduel_nfl.SCRAPER,
+    draftkings_nfl.SCRAPER,
+    fanduel_mlb.SCRAPER,
+    draftkings_mlb.SCRAPER,
 )
 
-BY_DOMAIN: dict[str, BookScraper] = {s.domain: s for s in SCRAPERS}
-BY_NAME: dict[str, BookScraper] = {s.name: s for s in SCRAPERS}
-# (book, sport) -> scraper. A book may have one config per sport once non-NBA
-# scrapers land; today every entry is sport='nba'.
+# BY_DOMAIN / BY_NAME are the NBA-default lookups: a book may now have more
+# than one config (one per sport) sharing a domain/name, so prefer the live
+# NBA entry (listed first) and never let a later non-NBA config clobber it.
+# Use get_scraper_for_book_sport / get_scraper_for_url(..., sport=) for the
+# multi-sport lookups.
+BY_DOMAIN: dict[str, BookScraper] = {}
+BY_NAME: dict[str, BookScraper] = {}
+for _s in SCRAPERS:
+    BY_DOMAIN.setdefault(_s.domain, _s)
+    BY_NAME.setdefault(_s.name, _s)
+del _s
+
+# (book, sport) -> scraper. The canonical multi-sport lookup.
 BY_NAME_SPORT: dict[tuple, BookScraper] = {(s.name, s.sport): s for s in SCRAPERS}
 
 
