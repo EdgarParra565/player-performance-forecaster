@@ -1,359 +1,128 @@
 # NBA Player Performance Forecaster - Working Notes
 
-Last updated: 2026-06-30
+Last updated: 2026-07-04
 
-This file is the active project tracker. It keeps only:
-- current architecture
-- what is already implemented
-- what still needs to be done next
-
-Operational runbooks (CLI flags, the PrizePicks CDP workflow, the
-scraper-adding workflow, deployment) live in README.md and docs/. This file
-does not duplicate them.
+Active tracker only: architecture, what's done, what's next. CLI runbooks,
+deployment, and security live in **README.md** and **docs/** — not duplicated here.
 
 Test baseline: **566 passing** (`.venv/bin/python3 -m pytest nba_model/tests -q`).
 
 ---
 
-## Near-term objective
+## Near-term objectives (NBA)
 
-1. **Book Edge Scanner** — the marquee analysis surface. Pick books, rank the
-   whole slate's props by model edge (fitted-normal μ vs the book line; e.g.
-   Underdog 17.5 vs model μ=19 → P(over) > 50%). Keep expanding it.
-2. **Player Charts** — the per-player deep-dive surface. Charts/splits/
-   decisional tools are broad now; remaining work is mostly Tk parity.
-3. **Cross-book consensus** — activate more of the 11 stub scrapers (9 of 20
-   produce data) so consensus / edge math has more books behind it.
-   **(Blocked on the live-Chrome host — see below.)**
-4. **Team-line priors** feed the player model (pace + implied team total) so
-   the chart book-mean and the model μ share one cross-book signal. (Wired.)
-5. **Multi-sport** — NFL first. Schema + resolution + validation scaffolding
-   is in place; NFL ingestion + scrapers are the next big lift. Do NOT ship
-   non-NBA data yet.
+1. **In-season data loop** — Mac Chrome `:9222` → hourly ETL → `publish_db.sh` → cloud app.
+2. **Book Edge Scanner** — slate-wide model-vs-line ranking (marquee UI; not arbitrage).
+3. **Cross-book + auto-bet path** — Workstreams 8–10 below (not started; do not bet real money yet).
+4. **More scrapers** — 9 of 20 books produce parsed rows; rest blocked on auth/render/season.
+5. **Multi-sport** — MLB data layer is beta (off NBA consensus path). NFL scaffold parked.
+   NBA deploy does not require shipping MLB/NFL web views.
 
 ---
 
-## Current architecture (high level)
+## Architecture (compact)
 
-- **Python 3.11**, SQLite at `data/database/nba_data.db`, pytest suite.
-- **Data ingest**: `nba_model/data/nba_results_ingestion.py` (bulk team-game +
-  player-game-logs from nba_api), `daily_etl.py` (orchestrated daily job),
-  `hourly_update.py` (hourly scrape + recompute on the dev-Mac Chrome host).
-- **Scrapers**: `nba_model/scrapers/` per-book registry (20 books, 9 with
-  parsers). Web fetch via Playwright + CDP through real Chrome on `:9222`
-  (`web_text_ingestion.py`); parsers in `browser_prop_parser.py` (props) and
-  `team_line_parser.py` (team lines).
-- **Model**: `simulation.py` (8 distributions + `blend_team_prior`),
-  `prop_board.py`, `probability.py`, `minutes_projection.py`,
-  `defense_adjustment.py`, `correlation_calibration.py`, `edge_scanner.py`.
-- **Visualization**: `player_charts.py` (matplotlib + pure data helpers, used
-  by Tk) and `plotly_charts.py` (interactive web equivalents).
-- **Web**: Streamlit `nba_model/web/app.py` + auth/billing (`auth.py`,
-  `subscriptions.py`, `stripe_helpers.py`, `webhook_app.py`, `throttle.py`).
-- **Desktop**: Tk `nba_model/simple_ui.py`.
-- **Multi-sport**: `sports/` package (nba live; nfl/mlb/nhl/soccer stubs).
+- **Stack:** Python 3.11, SQLite `data/database/nba_data.db`, Streamlit + Tk, pytest.
+- **Ingest:** `nba_results_ingestion.py`, `daily_etl.py`, `hourly_update.py` (Mac host).
+- **Scrapers:** `nba_model/scrapers/` (20 registered); fetch via CDP + real Chrome `:9222`.
+- **Model:** `simulation.py`, `prop_board.py`, `edge_scanner.py`, `blend_team_prior()`.
+- **Web:** `nba_model/web/app.py` + auth/billing (`BILLING_ENABLED=0` = open access).
 
-Constraints (do not violate):
-- Browser/ETL always via `.venv/bin/python3` (never system python3).
-- PrizePicks/Underdog scraping needs real Chrome on `:9222` (CDP); not CI.
-- Operations panel + manual-lines DB save + Admin dashboard are admin-gated
-  regardless of `BILLING_ENABLED`.
-- All user inputs go through `nba_model/web/input_validation.py`;
-  plausible-line check at DB insert.
-- Tk = matplotlib; web = Plotly (no `st.pyplot` in web views).
-- Do not delete `sports/` scaffolding.
+**Constraints:** `.venv/bin/python3` for ETL/browser; admin-gates on Operations + manual-lines
+save; web = Plotly, Tk = matplotlib; do not delete `sports/` scaffolding.
 
 ---
 
-## Implemented (trust unless a regression is found)
+## Implemented (trust unless regression)
 
-### Book Edge Scanner
-- `nba_model/model/edge_scanner.py` — `fetch_latest_prop_lines` (deduped
-  latest line per player/stat/book from `web_prop_cards`, active_nba only,
-  48h lookback), `score_prop_edges` (fitted-normal μ/σ per player+stat,
-  memoized; P(over), edge vs implied, EV; DFS lines priced at the -110
-  breakeven), `top_edges` (filter + rank by `model_edge`). CLI:
-  `python -m nba_model.model.edge_scanner --books underdog prizepicks ...`.
-- Streamlit **"Line edge scanner"** view: book multiselect, stat / window /
-  min-edge / min-P(over) filters, model-mode toggle (chart_mean | rolling),
-  KPI row, ProgressColumn table, CSV export, "open in Player Charts" jump.
-  Free tier gated to preview players/stats + 8 scans/min/session throttle.
-
-### Model
-- 8 distribution families in `simulation.py`; `negative_binomial` reconciled
-  with chart overlays via `normalize_distribution_name`.
-- `DEFAULT_DISTRIBUTION_BY_STAT` calibrated (rebounds → poisson; others →
-  normal pending market-line backfill).
-- **Team-prior blender** `blend_team_prior()` wired into the live path:
-  `run_single_prop` (`player_team`/`opponent_team`), `prop_board`, and the
-  hourly recompute. DB seam: `get_team_prior_inputs` / `get_team_prior_inputs_map`.
-  Baseline is per-team recent points (`get_team_recent_avg_points`) to match
-  the per-team implied total (NOT the game total — that bug was fixed).
-- `prob_over` (closed-form) handles σ≤0 correctly (1.0/0.5/0.0, not flat 0.0).
-- Backtest computes `prob_over` at the resolved settlement line (decision /
-  EV / Brier are now consistent in market/model-line modes).
-
-### Player Charts (matplotlib for Tk + Plotly for web)
-- Recent games, distribution (+best-EV highlights + line-ladder toggle),
-  hit-rate, rolling-CI, trend/form, defense scatter, multi-player compare.
-- Box/quantile, calendar heatmap (weekday × month), win/loss split,
-  starter/bench split (minutes ≥ 20), **vs-opponent split**, **pace+minutes**,
-  **cumulative line-vs-actual ribbon**, **CLV proxy**, **model-EV vs
-  fitted-EV**, **parlay correlation heatmap**, **Kelly stake** (in the
-  custom-line probe). Web Splits / Line-Movement / Hit-Rate tabs surface them.
-- **Line Movement tab**: open→current drift per book from
-  `betting_line_snapshots` (`fetch_line_movement_snapshots`).
-- **Upcoming-game line selection**: `_fetch_latest_book_lines` prefers the
-  player's next (today/upcoming) game's line, not `max(game_date)` / yesterday.
-- Staleness label uses the real scrape timestamp (`scraped_at_utc`), not the
-  game date.
-
-### Web app / billing
-- Feature parity with desktop `simple_ui.py` (Single Prop, Manual Lines admin
-  save, Operations admin console, All-stats, Parlay, Compare).
-- All NBA web charts on Plotly. URL query-string state, watchlist, ETL status,
-  CSV downloads, Docker + `docker-compose.yml`.
-- **Anonymous watchlist persistence** across sessions via a first-party cookie
-  token (`anon:<token>`, hex-validated against cookie-injection); signed-out-
-  under-billing stays session-only. Cap 25.
-- **Stripe Customer Portal** "Manage subscription" link for premium users
-  (`stripe_helpers.customer_portal_url`, env `STRIPE_PORTAL_RETURN_URL`).
-- **Admin dashboard** ("Admin (dashboard)" view, admin-gated): premium/free/
-  total counts, MRR estimate (`STRIPE_PRICE_MONTHLY_USD`), recent churn —
-  `subscriptions.aggregate_stats`.
-- **STRIPE_MODE=test|live** env toggle with mode-scoped keys.
-- Webhook alert on `invoice.payment_failed` (`webhook_app.alert_payment_failed`,
-  env `BILLING_ALERT_WEBHOOK_URL`).
-- Free-tier app-layer scrape throttle (`web/throttle.py`).
-- 7-day trial: pure `auth.trial_active` helper + `ENABLE_TRIAL`/`TRIAL_DAYS`
-  (wiring into live tier resolution needs a `created_at` column — documented).
-- `BILLING_ENABLED=0` open-access mode; billing dormant behind the flag.
-- Webhook hardening (HMAC + replay tolerance + idempotency + 256 KiB cap +
-  rate limit + slowloris timeout + OWASP headers) per docs/SECURITY.md.
-
-### Data delivery / ops
-- **Nightly DB publish hook**: `nba_model/data/publish_db.py` +
-  `scripts/publish_db.sh` — backs up the DB, refuses to publish a locked DB,
-  logs row counts, `--dry-run`, force-adds the gitignored DB, commits + pushes
-  only on change (DEPLOYMENT.md §14).
-- **ETL alerting**: `nba_model/data/etl_alerts.py` (`build_alert` +
-  `maybe_send_alert`). Daily + hourly ETL embed an `alert` marker in the
-  report JSON and accept `--alert-webhook-url`.
-- **Predictions widened**: hourly recompute persists board lines to
-  `predictions` for points/assists/rebounds/pra, idempotent per slate
-  (`hourly_update._persist_predictions`).
-- Hourly pipeline (`hourly_update.py`, `scripts/scheduler/*`); the fcntl lock
-  has a Windows `msvcrt` fallback so the module imports cross-platform.
-
-### Evaluation
-- `run_distribution_sweep.py` settles each stat at a realistic per-stat line by
-  default (`_resolve_stat_lines` + canonical `DEFAULT_LINES_BY_STAT`, shared
-  with `run_per_stat_sweep`) — no more `line == mean` degeneracy unless
-  `--line` / `--use-market-lines` is passed.
-- `get_backtest_data` joins predictions↔logs with `DATE()` normalization.
-
-### Multi-sport scaffolding
-- `sport TEXT NOT NULL DEFAULT 'nba'` idempotent migration on `game_logs`,
-  `betting_lines`, `betting_line_snapshots`, `players`, `web_prop_cards`,
-  `predictions` (`DatabaseManager._ensure_sport_columns`, runs on init,
-  upgrades legacy DBs in place).
-- Per-`(book, sport)` scraper resolution (`BookScraper.sport`,
-  `get_scraper_for_book_sport`, `get_scraper_for_url(..., sport=)`).
-- `input_validation.validate_stat_type(..., sport=)` reads non-NBA stat lists
-  from the `sports/` registry.
-- `sports/` package: nba (live) + nfl/mlb/nhl/soccer stubs; Streamlit
-  sport-picker shows roadmap cards for non-live sports.
-
-### Scrapers / consensus
-- `data/config/web_text_urls.txt`: 9 active books (PrizePicks, Underdog,
-  Pick6, ParlayPlay, BetMGM, Caesars, DK, Bovada, Kalshi).
-- Shared player-name resolver `scrapers/player_names.py`. CDP browser
-  connections are now closed after each fetch (was leaking per URL).
-- `kalshi._decimal_to_american` guards decimal ≤ 1.0 (no /0 dropping the
-  whole snapshot); `prop_board._fetch_betting_lines_for_game` uses positional
-  `IN (...)` placeholders (the named-tuple binding raised at runtime before).
+- **Edge Scanner** — `edge_scanner.py` + Streamlit view; CLI `--books underdog ...`.
+  Model-vs-line (normal μ/σ from last-N games or rolling toggle); DFS assumes -110.
+- **Full model path** — 8 distributions; team priors in `run_single_prop`, `prop_board`,
+  hourly predictions (points/assists/rebounds/pra). Rebounds default → poisson; others → normal.
+- **Player Charts** — Plotly web + matplotlib Tk; line ladder, movement tab, CLV/Kelly,
+  splits, ribbon, etc. Upcoming-game line selection + scrape staleness timestamps.
+- **Web / billing** — Feature parity with Tk; watchlist (cookie + signed-in JSON); Stripe
+  portal, admin dashboard, trial via `created_at`, Postgres subs via `SUBSCRIPTIONS_DB_URL`.
+- **Ops** — `publish_db.sh`, ETL alerts, hourly scheduler, login-wall detection,
+  `historical_odds_backfill.py`, FanDuel/BetRivers/ESPNBet team-line parsers (fixtures).
+- **Multi-sport** — `sport` column migration; `(book, sport)` scraper resolution; MLB Stats
+  API ingest + `mlb_game_logs`; FanDuel MLB team lines validated live; NFL scaffold only.
 
 ---
 
-## What's next (priority order)
+## Open work (priority)
 
-### Workstream 2 — data quality + consensus
-- [x] **2c.** Activated FanDuel, BetRivers, ESPNBet team-line parsers
-      (`scrapers/fanduel.py` extractor + `betrivers.py` / `espnbet.py`
-      following `betmgm.py`/`draftkings.py`). All three registered with
-      `team_line_extractor` set; tested via `test_new_book_scrapers.py`
-      (extractors + 3-book consensus round-trip). FanDuel mirrors its
-      documented format; BetRivers/ESPNBet use committed fixtures —
-      `TODO(real-capture)` in each notes they need a live CDP snapshot to
-      re-validate the token order.
-- [x] **2d.** Login-wall / session-expiry detection in the parse path:
-      `web_text_ingestion.detect_login_wall(text, url)` (book markers +
-      generic fallback). Both parsers skip login-walled snapshots instead of
-      scraping junk into `web_prop_cards` / `web_team_lines`, reporting
-      `snapshots_login_walled`. Tested in `test_login_wall_detection.py`.
+### WS8 — Cross-book layer `[ ]`
+New `cross_book_arb.py`: per `(player, stat)` → `line_gap`, best over/under book,
+optional two-way arb when `implied_over_A + implied_under_B < 1`. Streamlit tab.
+Reuse `line_comparison.build_book_vs_book` patterns. **Not true arb today.**
 
-### Workstream 5 — evaluation / data backfill
-- [x] **5a.** Historical odds backfill tooling:
-      `nba_model/data/historical_odds_backfill.py` derives `betting_lines`
-      from scraped `web_prop_cards` (latest line per player/stat/book/day,
-      DFS odds → -110 breakeven; idempotent; name→id via
-      `nba_active_players_ref`→`players`). `run_distribution_sweep
-      --use-market-lines` reads those via `get_market_line` (end-to-end seam
-      tested on a fixture DB in `test_historical_odds_backfill.py`). README
-      "Production defaults" documents the re-run workflow. Coverage is still
-      bounded by how many props the Chrome-host ETL has scraped — re-rank the
-      default distributions once a non-degenerate market-line sweep exists.
+### WS9 — Unify scoring `[ ]`
+`score_prop_edges_v2()` via full `prop_board` stack (team priors + per-stat distribution).
+Edge Scanner default → v2; keep "quick normal screen" as toggle. Hourly `predictions`
+must match UI.
 
-### Workstream 6 — multi-sport (**PIVOT 2026-06-30: MLB first, NFL later**)
-MLB is in season RIGHT NOW with live book lines, so it became the first
-non-NBA sport with a real data layer — we validate parsers against real
-captures instead of guessing. NFL scaffolding is kept intact but parked as
-"stub/later" until its season + authenticated snapshots are available.
+### WS10 — Validation before auto-bet `[ ]`
+**Phase 0:** populated `web_prop_cards` / `betting_lines`, backfill, publish DB.
+**Phase 1:** `--use-market-lines` backtests, CLV (`clv_proxy.py`), calibration, gates.
+**Phase 2:** bet-slip export, `bet_log` table, paper-trade 4–8 weeks.
+**Phase 3:** execution layer only if Phase 1–2 pass (APIs, limits, kill switch).
 
-**LIVE-CAPTURE VALIDATION RUN (2026-06-30, dev-Mac Chrome :9222).** NBA is
-OFFSEASON so NBA lobbies post no games — those books are offseason-empty, not
-parser bugs. Per-book state:
-- **fanduel_mlb (team lines): VALIDATED** — live FanDuel MLB lobby → 18 games /
-  168 rows into web_team_lines (sport='mlb'); fixture refreshed to the real
-  captured tokens (`test_mlb_team_lines.py`), TODO removed for team lines.
-- **MLB Stats API ingestion: VALIDATED** — 3,780 real mlb_game_logs rows.
-- **draftkings_mlb: BLOCKED-ON-RENDER** — MLB lobby fetch returns only the
-  category-nav shell (lazy-loaded JS grid not captured); parser code is the
-  same (validated) shared extractor. Needs interactive scroll / per-game URL.
-- **betrivers (NBA): BLOCKED-ON-AUTH** — login-walled (0/4 auth markers);
-  re-login to BetRivers in the :9222 Chrome.
-- **espnbet (NBA): BLOCKED-FETCH** — `ERR_CERT_COMMON_NAME_INVALID` on
-  espnbet.com; TLS/host issue, not auth/parser.
-- **prizepicks / underdog / pick6 / parlayplay / draftkings / betmgm / caesars
-  / bovada / kalshi / fanduel (all NBA): OFFSEASON-EMPTY** — session live (not
-  walled) but lobbies post no NBA games (Caesars NBA URL even redirects to MLB
-  content). Re-validate their parsers once the NBA preseason posts lines.
-- Detector fix: `detect_login_wall` now distinguishes a SPECIFIC wall phrase
-  (definitive) from a GENERIC nav "Log in" link (only a wall when authenticated
-  content markers are also absent) + is sport-aware — this stopped
-  content-rich sportsbook lobbies from false-flagging as walls.
-- web_team_lines is now sport-tagged; `get_consensus_team_lines(sport='nba')`
-  by default so MLB never leaks into NBA consensus.
-
-**MLB (status: beta — data layer live):**
-- [x] **Baseline data = the OFFICIAL MLB STATS API** (`statsapi.mlb.com/api/v1`,
-      free, no key/auth — the MLB analog to nba_api). Prefer it over scraping
-      for game logs. `nba_model/data/mlb_results_ingestion.py`: `fetch_*` HTTP
-      (via `requests`, certifi-backed) + PURE `transform_*` (schedule,
-      boxscore→long rows) unit-tested on committed JSON fixtures (no live net
-      in CI). Verified end-to-end against live data: 2026-06-28 → 3,780
-      `mlb_game_logs` rows from 15 games.
-- [x] Dedicated long-format `mlb_game_logs` table (one row per player/game/stat,
-      `value` tagged by stat_type, `sport='mlb'`) — MLB box scores diverge too
-      much from NBA `game_logs`, and a separate table keeps MLB rows out of
-      every NBA query by construction. `insert_mlb_game_logs` (idempotent,
-      `UNIQUE(player_id, game_pk, stat_type)`) + `get_mlb_player_game_logs`.
-- [x] Hitter vs pitcher kept separate (`mlb_props.stat_group`); park-factor
-      hook `nba_model/data/mlb_park_factors.py` (light lookup, TODO validate).
-- [x] Scrapers (props first): `scrapers/draftkings_mlb.py` / `fanduel_mlb.py`
-      (`sport='mlb'`) share `scrapers/mlb_props.py` — handles BOTH over/under
-      and yes/no (anytime HR → 0.5-line Bernoulli) shapes. Registered per
-      `(book, sport)`; `BY_NAME`/`BY_DOMAIN` still prefer NBA so default URL
-      resolution is unchanged. `pybaseball` Statcast supplement is optional +
-      guarded. Tested: `test_mlb_ingestion.py`, `test_mlb_props.py`.
-- [x] `sports/mlb.py` flipped `stub → beta`. MLB kept OUT of the NBA
-      cross-book consensus path. Remaining for fully-"live" web status: a
-      sport-filtered Streamlit rendering path (the web view reads NBA-shaped
-      tables only) — web-layer work, out of the data/scrapers agent's scope;
-      `is_live` left NBA-only so the picker won't mislabel NBA data as MLB.
-
-**NFL (parked — later):**
-- [x] Scaffolding built + kept: `nfl_results_ingestion.py` (guarded
-      `nfl_data_py`), `scrapers/fanduel_nfl.py` / `draftkings_nfl.py` +
-      `nfl_props.py`. Status stays "stub/coming soon" until NFL season +
-      authenticated snapshots; do not delete.
-- [ ] Keep NHL/soccer "coming soon".
-
-### SCRAPER BACKLOG — books NOT yet producing rows (fix later)
-Snapshot of the 2026-06-30 live-capture run. Each entry: why it's blocked +
-the concrete next action. NONE of these is a confirmed parser bug — they are
-season/auth/render/env blockers. Re-run the fetch→inspect→parse→fix loop on
-each when its blocker clears.
-
-Blocked-on-AUTH (needs manual re-login in the :9222 Chrome):
-- [ ] **betrivers** (nba team lines) — login-walled (0/4 auth markers, len~1k).
-      Action: log in to BetRivers in the dev-Mac Chrome, re-fetch
-      `https://co.betrivers.com/?page=sportsbook`, then validate
-      `extract_team_lines` against the real token order (parser is fixture-only,
-      still has TODO(real-capture)).
-
-Blocked-on-ENV / fetch:
-- [ ] **espnbet** (nba team lines) — fetch fails with
-      `ERR_CERT_COMMON_NAME_INVALID` on espnbet.com. Action: confirm the real
-      current ESPN BET host/URL (cert CN mismatch suggests a redirect/rebrand),
-      update the URL, then capture + validate. Parser fixture-only (TODO).
-
-Blocked-on-RENDER (JS grid not captured by the snapshot):
-- [ ] **draftkings_mlb** (and draftkings nba) — the lobby fetch returns only the
-      category-nav shell (len 12920, ~24 odds = futures menu); the game grid is
-      lazy-loaded JS that the current fetch doesn't trigger. Action: add a
-      scroll / longer `extra_wait` / per-game URL to the fetch path, or capture
-      a per-game props page. Team-line parser itself is the shared, validated
-      `mlb_team_lines.extract_team_lines` (proven on FanDuel), so this is a
-      capture problem, not a parser problem.
-
-Blocked-on-SEASON (NBA offseason — no games posted; re-check at NBA preseason):
-- [ ] **prizepicks, underdog, pick6, parlayplay** (nba DFS props) — session live,
-      not walled, but boards post no NBA props offseason.
-- [ ] **draftkings, betmgm, caesars, bovada, kalshi, fanduel** (nba team lines) —
-      offseason-empty / shell; caesars' NBA URL even redirects to MLB content.
-      Their parsers (`betmgm`/`caesars`/`draftkings` team-line + the newer
-      `fanduel`/`betrivers`/`espnbet`) still carry TODO(real-capture) and must be
-      validated against live NBA text once the season posts lines.
-
-Parser-only follow-ups (independent of the blockers above):
-- [ ] **MLB player props** (`mlb_props.preprocess_mlb_props`, used by
-      draftkings_mlb/fanduel_mlb) is still fixture-based — sportsbook player
-      props live on per-game pages, not the league lobby that was captured for
-      team lines. Capture a live MLB prop page and validate.
-- [ ] **mlb_team_lines pairing edge case** — the nearest-two-team pairing can
-      mis-pair on very noisy LIVE (in-progress) game blocks (observed a couple
-      of duplicate home teams in an 18-game live capture). Pre-game blocks parse
-      cleanly. Tighten the team↔odds-block association (e.g. bound by the "same
-      game parlay" delimiter) before trusting live in-game MLB lines.
-- [ ] **mlb_park_factors** values are unvalidated placeholders — replace with
-      empirically-derived factors.
-
-### Workstream 7 — desktop Tk polish (low priority)
-- [x] Wire the newer matplotlib chart builders into Tk `simple_ui.py`
-      (Box/Quantile, Rolling CI, Trend/Form, vs Defense sub-tabs).
-- [x] Player autocomplete (fuzzy, module-level `fuzzy_match_players`),
-      save-snapshot (`export_chart_snapshot` → PNG + CSV, dated base name),
-      Refresh (async) button (background thread + queue + `root.after` poll
-      via `_charts_async_render`), Enter-to-submit on player/N-games/date
-      entries, date-range picker (`parse_date_range` +
-      `filter_games_by_date_range`), Tk-side watchlist parity persisted to
-      `data/state/tk_watchlist.json` (independent from the web cookie path).
-      Tests in `nba_model/tests/test_simple_ui_helpers.py`.
-
-### Billing follow-up (only when billing re-enabled)
-- [x] Added `created_at` column to `user_subscriptions` (idempotent migration
-      on both SQLite + Postgres backends; back-fills legacy rows from
-      `updated_at`). `auth.tier_for` now branches on `TRIAL_ENABLED`:
-      new emails get `touch_first_seen` + premium for `TRIAL_DAYS`, existing
-      rows resolved via `trial_active(created_at)`. Honors
-      `ENABLE_TRIAL` / `TRIAL_DAYS` env; `BILLING_ENABLED=0` short-circuits
-      first and stays open-access. Tests in
-      `nba_model/tests/test_billing_hardening.py`.
+**3-week sprint when ready:** Week 1 = WS9, Week 2 = WS8, Week 3 = WS10 Phase 1.
 
 ---
 
-## Known limitations / carry-forward
-- 11 of 20 scrapers still parser-less (open authenticated-snapshot work).
-- `web_prop_cards` / `betting_lines` / `betting_line_snapshots` are sparse in
-  the current DB, so the Edge Scanner, Line Movement, ribbon, and CLV views
-  show empty-states until the Chrome-host ETL populates them.
-- Team-chart book reference is `points`-only (no team_total markets at lobby).
-- `betting_lines` market coverage is ~2 days — blocks `--use-market-lines`.
-- `players.team` is sparse; chart code falls back to `nba_active_players_ref`
-  + `game_logs.matchup`.
-- This dev box is Windows; the production scraping host is the dev Mac. Some
-  tests use Windows-safe teardowns (`ignore_cleanup_errors`, explicit sqlite
-  `close()`); `DataLoader` leaks its sqlite connection (pre-existing) which
-  only matters for temp-dir cleanup on Windows.
-- Tk `simple_ui.py` has not been updated with the newest chart builders.
+## Scraper / season blockers (2026-06-30 snapshot)
+
+Re-run fetch→parse when blocker clears. NBA **offseason** = empty lobbies, not parser bugs.
+
+| Blocker | Books / action |
+|---------|----------------|
+| **AUTH** | BetRivers NBA — re-login in `:9222` Chrome; validate parser on live capture. |
+| **ENV** | ESPNBet — cert/URL mismatch; fix host then capture. |
+| **RENDER** | DraftKings (NBA + MLB) — lazy JS grid; scroll/wait/per-game URL. |
+| **SEASON** | PrizePicks, Underdog, Pick6, ParlayPlay, DK/BetMGM/Caesars/Bovada/Kalshi/FanDuel NBA — re-check at preseason. |
+| **Parser TODO** | MLB player props (per-game pages); MLB team-line live pairing edge case; park factors. |
+
+11 of 20 scrapers still stub-only (no parser).
+
+---
+
+## Model accuracy & Edge Scanner (honest baseline)
+
+**Edge Scanner ≠ arbitrage.** It ranks **model edge** (forecast vs line), not locked profit.
+
+| Term | Meaning | Built? |
+|------|---------|--------|
+| Model edge | P(side) vs book implied | Yes (Edge Scanner) |
+| Line shopping | Best over/under line across books | Partial (`line_comparison`) |
+| True arb | Total implied prob < 1 across legs | No |
+| Middle | Over low line + under high line | Detectable via `line_gap`; not arb |
+
+**Distributions:** Engineering solid; **validated market edge weak.** Only rebounds→poisson
+showed positive sweep ROI (+8.8%, n=482, **not significant**). Points/assists/pra stayed normal
+(sweep inconclusive / negative ROI when bets placed). `--use-market-lines` needs more
+`betting_lines` volume. High win rates in old real-data benchmarks used rolling mean as line
+(model vs itself) — not book CLV.
+
+**Edge Scanner vs full model (auto-bet gap):**
+
+| | Scanner today | Auto-bet should use |
+|--|---------------|---------------------|
+| μ | Last-N mean | Rolling + defense + minutes + team priors |
+| Dist | Always normal | `get_default_distribution(stat)` |
+| σ | Sample std | Adjusted σ |
+| Proof | None | `predictions` + CLV + backtest |
+
+**Reuse:** `edge_scanner.py`, `line_comparison.py`, `compute_market_consensus`,
+`clv_proxy.py`, hourly `_persist_predictions`.
+
+---
+
+## Known limitations
+
+- Sparse scraped lines → Edge Scanner / Line Movement / CLV empty until Mac ETL runs.
+- `betting_lines` thin → market-line validation blocked (backfill tooling exists).
+- Team charts: lobby `points` only. `players.team` sparse (fallback: `matchup`).
+- Scraping host = dev Mac; dev box may be Windows (`DataLoader` sqlite leak on temp DB teardown).
+- **Do not use Edge Scanner for real-money bets** until WS9 + WS10 Phase 1 complete.
