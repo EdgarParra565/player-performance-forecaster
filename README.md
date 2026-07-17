@@ -16,20 +16,23 @@ The current baseline is designed to be reproducible offline (synthetic benchmark
 - Streamlit + Tk UIs both expose Player charts, Team charts, Game Results, and Player Stats Browse. All graphing inputs go through `nba_model/web/input_validation.py` (stat type / team code / season / rolling window).
 - Streamlit web app is at full feature parity with the desktop Tk UI: Single prop (full model tuning), Manual lines import (admin-only DB save), and an admin-only Operations console join the Player/Team chart, Compare, browse, and Parlay views. Every web chart renders via Plotly (zoom / hover / legend-toggle); the line board highlights the best-EV side and offers a compact "line ladder" layout.
 - Hourly self-update path (`nba_model/data/hourly_update.py` + `scripts/scheduler/`): a real Chrome (`:9222`) host re-scrapes books, refreshes game logs, and recomputes predictions every hour via launchd (cron fallback). Scraped lines are stored change-only (a new `web_prop_cards` / `web_team_lines` row lands only when the book actually moves the line/odds).
-- **Book Edge Scanner** (`nba_model/model/edge_scanner.py` + the "Line edge scanner" Streamlit view): pick one or more books and rank the whole slate's props by *model-vs-line edge* (not cross-book arbitrage). Each line is scored against a fitted-normal projection (μ = last-N mean, σ = sample std). DFS books without a posted price use the -110 breakeven (52.4%). The full model path (`run_single_prop`, `prop_board`, team priors) is richer but not yet wired as the scanner default — see `notes.txt` Workstreams 8–10.
+- **Book Edge Scanner** (`nba_model/model/edge_scanner.py` + the "Line edge scanner" Streamlit view): pick one or more books and rank the whole slate's props by *model-vs-line edge* (not cross-book arbitrage). Three model modes: `chart_mean` (default quick screen — fitted normal, μ = last-N mean, σ = sample std), `rolling`, and `full` (`--model-mode full` — the complete prop_board projection: rolling μ/σ + team priors + per-stat default distribution, sharing the exact helpers the hourly `predictions` recompute uses so the two can't drift). DFS books without a posted price use the -110 breakeven (52.4%). Not validated for real-money betting — see `notes.txt` WS10.
+- **Cross-book layer + paper-trading tooling**: `nba_model/model/cross_book_arb.py` + the "Cross-book" Streamlit view separate three signals — line shopping (best over/under book), middle candidates (wide line gaps), and TRUE two-way arb (flagged only from real posted odds in `betting_lines` whose raw implied probabilities sum < 1; never from assumed -110). The WS10 measurement stack — `bet_log` table, `bet_slip` export CLI, `calibration_report`, `hourly_update --settle-bet-log` — is built and waiting on in-season market data (see "Paper trading / bet_log" below).
 - **Team-line priors wired into the live model**: `blend_team_prior()` (pace + implied team total from the cross-book `team_priors` table) now nudges `run_single_prop`, `prop_board`, and the hourly recompute so the model μ and the chart book-mean share one signal.
 - Production-ready auth + billing scaffold: native Streamlit OIDC (Google + Microsoft) sign-in, Stripe-powered Free vs Premium tiers (with a **Customer Portal "Manage subscription"** link for premium users), FastAPI webhook handler with HMAC verification, replay tolerance, idempotency, body-size cap (256 KiB), per-IP rate limiting (120/60s), slowloris timeout, and the OWASP-recommended HTTP security headers. The subscription store is env-selectable (SQLite for local/self-host, managed Postgres via `SUBSCRIPTIONS_DB_URL`). Full threat model + 4-layer hardening pass + adversarial / data-poisoning input validation in [docs/SECURITY.md](docs/SECURITY.md).
 - Expanded Player Charts: box/quantile, calendar heatmap, win/loss + starter/bench + vs-opponent splits, pace+minutes, cumulative line-vs-actual ribbon, CLV proxy, model-EV-vs-fitted-EV, parlay correlation heatmap, and a Kelly-stake suggestion. The player view also surfaces a per-book "line movement (last 48h)" summary from `web_prop_cards` history.
 - Admin dashboard (subscribers / MRR estimate / churn) gated to `is_admin()`; Stripe `STRIPE_MODE=test|live` env toggle; webhook alert on `invoice.payment_failed`; free-tier app-layer scan throttle; optional first-sign-in trial (`ENABLE_TRIAL`).
 - ETL alerting: daily + hourly reports embed an `alert` marker and accept `--alert-webhook-url`. The hourly recompute persists predictions for points/assists/rebounds/pra. The distribution sweep settles each stat at a realistic per-stat line by default (no more `line == mean` degeneracy).
 - **Multi-sport scaffolding:** idempotent `sport` column on core tables, per-`(book, sport)` scraper resolution, registry-driven stat validation. `sports/` package: NBA live; MLB data layer beta (ingest + FanDuel team lines); NFL/NHL/soccer stubs. Streamlit sport-picker shows roadmap cards for non-live sports. Rollout plan: [docs/MULTI_SPORT_PLAN.md](docs/MULTI_SPORT_PLAN.md). Active tracker: `notes.txt`.
-- **566 tests passing** (regression + stress + adversarial + edge-scanner + billing + multi-sport). `bandit` MEDIUM/HIGH = 0; `pip-audit` clean.
+- **626 tests passing** (regression + stress + adversarial + edge-scanner + cross-book + bet-log/paper-trading + billing + multi-sport). `bandit` MEDIUM/HIGH = 0; `pip-audit` clean.
 
 ## Repository Layout
 
 - `nba_model/data/` - API loading, caching, and database utilities
   - `nba_results_ingestion.py` - bulk team-game + player-game-log ingest from `nba_api`
 - `nba_model/model/` - feature engineering, probability, simulation, EV, parlay modeling
+  - `edge_scanner.py` - slate-wide model-vs-line ranking (3 model modes; see "Edge Scanner model modes")
+  - `cross_book_arb.py` - line shopping / middle candidates / TRUE two-way arb detection across books
   - `browser_prop_parser.py` / `team_line_parser.py` - orchestrators that run each scraper's preprocessor over stored web snapshots
   - `web_text_ingestion.py` - generic fetch path (Playwright + CDP via Chrome :9222)
 - `nba_model/scrapers/` - per-book scraper registry
@@ -37,6 +40,7 @@ The current baseline is designed to be reproducible offline (synthetic benchmark
   - `team_names.py` - canonical NBA team-name normalizer (cross-book joining)
   - one module per book: `prizepicks.py`, `underdog.py`, `pick6.py`, `parlayplay.py`, `betmgm.py`, `caesars.py`, `draftkings.py`, `bovada.py`, `kalshi.py`, plus 11 stub configs
 - `nba_model/evaluation/` - backtesting and benchmark runners
+  - `bet_slip.py` / `calibration_report.py` - paper-trading slip export (`bet_log`) + reliability/Brier reporting (WS10)
 - `nba_model/tests/` - smoke and integration-style tests
 - `nba_model/visualization/` - distribution plotting + Player/Team chart builders (`player_charts.py` powers both UIs; also exposes `fetch_recent_games` / `fetch_player_recent_results` / `list_seasons` for the browse views)
 - `nba_model/web/` - Streamlit web frontend + auth + Stripe membership glue
@@ -47,6 +51,7 @@ The current baseline is designed to be reproducible offline (synthetic benchmark
   - `stripe_helpers.py` - Checkout URL builder + signature helpers
   - `webhook_app.py` - FastAPI app that handles Stripe webhooks
   - `parlay_compare.py` - cross-comparison helpers for the Parlay analysis view
+  - `cross_book_view.py` - Streamlit-free helpers for the Cross-book view (KPI math, table shaping, model-mode fallback)
 - `sports/` - **multi-sport registry** (top-level, sibling to `nba_model`)
   - `__init__.py` - `Sport` dataclass + `SPORTS` registry + `get_sport(key)` lookup
   - `nba.py` - NBA config (live)
@@ -238,6 +243,7 @@ Quick summary of what's wired:
 | Game Results browser             | yes                                   | yes     |
 | Player Stats Browse              | yes                                   | yes     |
 | Line edge scanner                | preview players/stats (8 scans/min)   | full slate, unthrottled |
+| Cross-book (line shop / arb)     | preview players/stats (8 scans/min)   | full slate, unthrottled |
 | All-stats overview               | locked                                | yes     |
 | Parlay analysis (single + multi) | locked                                | yes     |
 | Admin dashboard                  | n/a                                   | admin-only (subscribers / MRR / churn) |
@@ -256,7 +262,7 @@ Then open http://localhost:8501. Layout:
 
 - **Sidebar**: DB path, team filter, player dropdown, **view mode** radio
   (`Player charts | Team charts | Compare players | Line edge scanner |
-  Game Results | Player Stats Browse` for free; premium adds `All stats
+  Cross-book | Game Results | Player Stats Browse` for free; premium adds `All stats
   overview | Single prop (model) | Parlay analysis | Manual lines import`;
   admins also get `Operations (admin)` + `Admin (dashboard)`), stat, last-N
   games, rolling window, distribution overlay checkboxes (normal / poisson /
@@ -300,7 +306,36 @@ The others:
   a sortable table with progress-bar columns for `p_over` and `model_edge`,
   CSV export, and an "open in Player Charts" jump. Free tier is limited to the
   preview players/stats; premium scans the full slate. CLI equivalent:
-  `python3 -m nba_model.model.edge_scanner --books underdog prizepicks --min-edge 0.05`.
+  `python3 -m nba_model.model.edge_scanner --books underdog prizepicks --min-edge 0.05`
+  (add `--model-mode full` for the full prop_board projection — see
+  "Edge Scanner model modes" below).
+- **Cross-book** (free preview + premium): the WS8 layer that compares **books
+  against each other** for the same prop (`nba_model/model/cross_book_arb.py`).
+  Three distinct signals, kept separate on purpose:
+  - **Line shopping** — best over line (the lowest) / best under line (the
+    highest) across the books quoting a prop.
+  - **Middle candidate** — the low/high gap is wide enough (≥ 1.0 stat unit by
+    default) that a result could land between the legs and win both. A
+    *candidate*, never guaranteed.
+  - **TRUE arb** — over @ book A + under @ book B whose **real posted** American
+    odds sum to < 1.0 (raw implied) in an executable direction (`over_line ≤
+    under_line`) → locked profit. **This is NOT guaranteed arbitrage unless both
+    legs carry real posted odds.** DFS books (PrizePicks / Underdog / Pick6 /
+    ParlayPlay) post no American odds, so the scanner assumes -110; a -110/-110
+    pair implies 1.0476 > 1 and can **never** be arb. DFS-only rows are therefore
+    line shopping / middle candidates, never arb flags — arb rows come only from
+    `betting_lines` (real odds). Controls mirror the Edge Scanner (books / stats /
+    history window / freshness) plus a min-line-gap slider and a "2+ books"
+    toggle; the model-mode selector adds a **Full model (beta)** option
+    (the WS9 `full` mode — team priors + per-stat distribution — with a
+    graceful fallback to last-N mean if the mode is ever unavailable).
+    KPI row: pairs scanned / max gap / count ≥ threshold / **true arb
+    count (real odds only)** / freshness. Sortable table (progress-bar
+    `line_gap` + P(over) at each end), a visually distinct true-arb section, CSV
+    export, and an "open in Player Charts" jump. CLI equivalents:
+    `python3 -m nba_model.model.cross_book_arb --books underdog prizepicks --min-gap 0.5`
+    (line shopping / middles) and `... --arb-only` (true two-way arb from
+    `betting_lines`).
 - **Compare players** (free + premium): overlay 2–3 players' distributions
   for the same stat to find the strongest fit for a parlay leg.
 - **Game Results** (free): recent NBA matchups with final scores + winner.
@@ -984,6 +1019,65 @@ in `player_charts.py` / `plotly_charts.py` (normal / poisson /
 negative_binomial) is a visual subset of the model vocabulary — both
 share the same canonical names via `normalize_distribution_name`.
 
+### Edge Scanner model modes (WS9 — unify scoring)
+
+`edge_scanner.score_prop_edges(..., model_mode=...)` accepts three modes:
+
+| Mode | μ / σ | Distribution |
+|---|---|---|
+| `chart_mean` (default) | last-N game mean / sample std | normal |
+| `rolling` | rolling μ/σ from the prop_board stack (DataLoader) | normal |
+| `full` | rolling μ/σ **+ `blend_team_prior`** (pace + implied team total when the player's team has a prior) | **`get_default_distribution(stat)`** (rebounds → poisson, others → normal) |
+
+`full` mode runs the same projection stack as the hourly `predictions`
+recompute — the shared helpers live in `prop_board`
+(`build_history_from_games` → `project_stat_moments` / `project_prop_line`),
+so the scanner and the stored predictions can't drift. The scored frame keeps
+`SCORED_COLUMNS` as its ordered prefix and appends `distribution` + `model_mode`.
+
+```bash
+python -m nba_model.model.edge_scanner --model-mode full \
+    --books underdog prizepicks --min-edge 0.05
+```
+
+## Paper trading / bet_log (WS10 — validation before auto-bet)
+
+Measurement tooling that gates any future auto-betting. **No execution layer.**
+
+- **`bet_log` table** — one row per staked paper pick (line, side, model prob,
+  edge, Kelly fraction, stake units, `status` ∈ pending/won/lost/push/void,
+  `clv_delta`). `DatabaseManager.insert_bet_log_rows` / `settle_bet_log()` grade
+  pending rows against `game_logs` (same stat definitions as
+  `backfill_predictions_outcomes`) and fill `clv_delta` from the closing
+  `betting_line_snapshots` row when present.
+- **Bet-slip export** — `nba_model.evaluation.bet_slip` pulls the slate's edges
+  through Edge Scanner **full** mode, applies gates (min edge, min prob, max
+  picks, capped fractional Kelly), writes a timestamped CSV + JSON under
+  `nba_model/evaluation/artifacts/`, and inserts the picks into `bet_log` as
+  `pending`. This is the paper-trading entry point.
+
+  ```bash
+  # Preview (no DB writes, no artifacts):
+  python -m nba_model.evaluation.bet_slip --books underdog prizepicks \
+      --min-edge 0.03 --min-p 0.55 --max-picks 10 --dry-run
+  # Commit the slip to bet_log + artifacts (drop --dry-run):
+  python -m nba_model.evaluation.bet_slip --books underdog prizepicks \
+      --min-edge 0.03 --min-p 0.55 --max-picks 10
+  ```
+- **Calibration report** — `nba_model.evaluation.calibration_report` builds a
+  per-stat reliability table (predicted-prob buckets vs realized rate) + Brier
+  score from settled `predictions` or `bet_log`, writing CSV + md artifacts (no
+  plotting dependency).
+
+  ```bash
+  python -m nba_model.evaluation.calibration_report --source bet_log
+  ```
+- **Optional hourly maintenance** — `hourly_update --settle-bet-log` (default
+  OFF) settles pending `bet_log` rows and refreshes the calibration artifact.
+
+Phase 1 backtests over these tools stay data-starved until real in-season market
+data lands in `betting_lines` / `betting_line_snapshots` (a Mac-host ETL task).
+
 ## Baseline Benchmark Results
 
 Baseline benchmark now runs with the same template across:
@@ -999,10 +1093,11 @@ Latest results are generated into:
 ## Known Limitations
 
 - Benchmark metrics are synthetic and validate pipeline behavior, not live betting edge.
-- The Book Edge Scanner ranks **model edge**, not guaranteed arbitrage; it uses a simpler normal fit than the full `run_single_prop` pipeline and is **not validated for auto-betting** (see `notes.txt`).
+- The Book Edge Scanner ranks **model edge**, not guaranteed arbitrage. Its default `chart_mean` mode uses a simpler normal fit; `--model-mode full` now runs the full prop_board projection (rolling μ/σ + team priors + per-stat distribution) matching the stored predictions, but the scanner is still **not validated for auto-betting** until WS10 paper-trading (`bet_log`) accumulates settled market data (see `notes.txt`).
 - Live NBA API calls require network access when cache/database does not already contain player games.
 - Cross-book/model-vs-book and monthly diagnostics depend on having populated `betting_lines` and `predictions` data.
 - The Book Edge Scanner and Line Movement views need scraped `web_prop_cards` / `betting_line_snapshots` rows from the Chrome-host ETL; both show an empty-state until that data is present.
+- The Cross-book view's **line shopping / middle** signals work off the DFS board (`web_prop_cards`), but its **TRUE arb** detection is data-starved until real sportsbook odds are scraped into `betting_lines` in-season — DFS -110 defaults can never be arb, so the arb count stays 0 in the offseason (expected; the view shows a clean empty-state).
 - 11 of 20 scrapers are still parser-less (need authenticated CDP snapshots from the dev-Mac Chrome host).
 - `betting_lines` market coverage is thin. Use `nba_model.data.historical_odds_backfill` to derive additional market lines from scraped `web_prop_cards` before running `--use-market-lines` sweeps / CLV analysis; coverage is then bounded by how many props the Chrome-host ETL has scraped.
 
@@ -1031,9 +1126,8 @@ Latest results are generated into:
 Open-access NBA deploy is shippable today. Full detail + model/auto-bet plan in **`notes.txt`**.
 
 **Near-term (NBA):**
-1. **In-season scraping** — Mac hourly ETL + `scripts/publish_db.sh` so the cloud DB stays fresh.
-2. **Stub scrapers** — add parsers for the 11 books that only store snapshots today.
-3. **Unify + validate** — wire Edge Scanner to the full model (`score_prop_edges_v2`), then market-line backtests + CLV before any auto-bet (`notes.txt` WS8–10).
-4. **Cross-book layer** — line shopping / optional two-way arb detector (`cross_book_arb.py`).
+1. **In-season scraping** — Mac hourly ETL + `scripts/publish_db.sh` so the cloud DB stays fresh. This also unblocks everything below: real market data is the missing input.
+2. **Stub scrapers** — add parsers for the 11 books that only store snapshots today; sportsbook odds feeds are what make TRUE-arb detection and CLV meaningful.
+3. **Validate before any auto-bet** — the tooling shipped (Edge Scanner `full` mode, `cross_book_arb.py`, `bet_log` / `bet_slip` / `calibration_report`); what's left is running it: market-line backtests, a 4–8 week paper-trade, and calibration review (`notes.txt` WS10 Phases 1–2).
 
 **Later:** multi-sport web views (MLB beta data exists off NBA path), team-chart stats beyond lobby `points`, structured logging. Multi-sport rollout: [docs/MULTI_SPORT_PLAN.md](docs/MULTI_SPORT_PLAN.md).

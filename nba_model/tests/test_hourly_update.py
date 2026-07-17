@@ -198,6 +198,52 @@ class RunHourlyUpdateReportTests(unittest.TestCase):
         self.assertIn("traceback", report["steps"]["web_text"])
 
 
+class BetLogSettlementStepTests(unittest.TestCase):
+    """The optional bet_log settlement step is flag-gated (default OFF)."""
+
+    def _core_patches(self):
+        return [
+            patch.object(hourly_update, "_run_preflight",
+                         return_value={"playwright_available": True,
+                                       "chrome": {"ok": True}}),
+            patch.object(hourly_update, "_run_web_text", return_value={"urls": 0}),
+            patch.object(hourly_update, "_run_browser_prop_parser", return_value={}),
+            patch.object(hourly_update, "_run_team_line_parser", return_value={}),
+            patch.object(hourly_update, "_run_game_log_refresh",
+                         return_value={"players_refreshed": 0, "failures": []}),
+            patch.object(hourly_update, "_run_players_table_sync", return_value={}),
+            patch.object(hourly_update, "_run_reverse_engineering", return_value={}),
+            patch.object(hourly_update, "_run_outcome_settlement", return_value={}),
+            patch.object(hourly_update, "_run_prediction_recompute",
+                         return_value={"scored": 0}),
+        ]
+
+    def _run(self, tmp, **kwargs):
+        patches = self._core_patches()
+        patches.append(patch.object(
+            hourly_update, "_run_bet_log_settlement",
+            return_value={"settle": {"settled": 1}, "calibration": {"settled_rows": 1}}))
+        for p in patches:
+            p.start()
+        try:
+            return hourly_update.run_hourly_update(
+                report_dir=tmp, require_playwright=False, **kwargs)
+        finally:
+            for p in patches:
+                p.stop()
+
+    def test_step_absent_by_default(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report = self._run(tmp)
+        self.assertNotIn("bet_log_settlement", report["steps"])
+
+    def test_step_present_when_flagged(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report = self._run(tmp, settle_bet_log=True)
+        self.assertIn("bet_log_settlement", report["steps"])
+        self.assertTrue(report["steps"]["bet_log_settlement"]["ok"])
+
+
 class PersistPredictionsTests(unittest.TestCase):
     """_persist_predictions widens the predictions table and is idempotent."""
 

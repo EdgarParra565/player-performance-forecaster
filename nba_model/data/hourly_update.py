@@ -397,6 +397,22 @@ def _run_prediction_recompute(db_path: str) -> dict:
     }
 
 
+def _run_bet_log_settlement(db_path: str, calibration_source: str = "bet_log") -> dict:
+    """Settle pending ``bet_log`` rows and refresh the calibration artifact.
+
+    Flag-gated (default OFF) paper-trading maintenance: grade any bet_log picks
+    whose games have landed (filling ``clv_delta`` from line snapshots when
+    present), then regenerate the reliability/Brier report so the calibration
+    artifact stays current. No execution — measurement only."""
+    from nba_model.data.database.db_manager import DatabaseManager
+    from nba_model.evaluation.calibration_report import run_calibration_report
+
+    with DatabaseManager(db_path=db_path) as db:
+        settle = db.settle_bet_log()
+    calibration = run_calibration_report(db_path=db_path, source=calibration_source)
+    return {"settle": settle, "calibration": calibration}
+
+
 def _persist_predictions(db_path, board_lines, name_to_id, target_date) -> int:
     """Write board lines into the predictions table (idempotent per slate)."""
     if not board_lines:
@@ -439,6 +455,7 @@ def run_hourly_update(
     max_players: int = 25,
     require_playwright: bool = True,
     skip_recompute: bool = False,
+    settle_bet_log: bool = False,
     alert_webhook_url: Optional[str] = None,
 ) -> dict:
     """Execute the hourly pipeline and return the JSON report dict."""
@@ -483,6 +500,11 @@ def run_hourly_update(
     _record_step(report, "outcome_settlement", _run_outcome_settlement, db_path)
     if not skip_recompute:
         _record_step(report, "prediction_recompute", _run_prediction_recompute, db_path)
+    # Optional paper-trading maintenance (default OFF): settle bet_log +
+    # refresh the calibration artifact. Kept out of the default hourly path so
+    # it can't slow or destabilize the core ETL until explicitly enabled.
+    if settle_bet_log:
+        _record_step(report, "bet_log_settlement", _run_bet_log_settlement, db_path)
 
     report["ended_at"] = _utc_now_iso()
     report["ok"] = not report["failed_steps"]
@@ -511,6 +533,11 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--skip-recompute", action="store_true")
     parser.add_argument(
+        "--settle-bet-log", action="store_true",
+        help="Also settle pending bet_log rows + refresh the calibration "
+             "artifact (paper-trading maintenance; default OFF).",
+    )
+    parser.add_argument(
         "--alert-webhook-url", default=None,
         help="POST a JSON alert here when the run fails or partially fails.",
     )
@@ -536,6 +563,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             max_players=args.max_players,
             require_playwright=not args.no_require_playwright,
             skip_recompute=args.skip_recompute,
+            settle_bet_log=args.settle_bet_log,
             alert_webhook_url=args.alert_webhook_url,
         )
 

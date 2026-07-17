@@ -185,7 +185,10 @@ class ScorePropEdgesTests(EdgeScannerTestBase):
             pd.DataFrame(columns=es.LINE_COLUMNS), db_path=self.db_path,
         )
         self.assertTrue(out.empty)
-        self.assertEqual(list(out.columns), es.SCORED_COLUMNS)
+        self.assertEqual(list(out.columns), es.SCORED_COLUMNS_FULL)
+        # SCORED_COLUMNS stays the canonical ordered prefix (Agent B contract).
+        self.assertEqual(
+            list(out.columns)[: len(es.SCORED_COLUMNS)], es.SCORED_COLUMNS)
 
 
 class TopEdgesTests(EdgeScannerTestBase):
@@ -212,9 +215,9 @@ class TopEdgesTests(EdgeScannerTestBase):
         self.assertEqual(len(top), 1)
 
     def test_empty_scored_returns_shaped_empty(self):
-        out = es.top_edges(pd.DataFrame(columns=es.SCORED_COLUMNS))
+        out = es.top_edges(pd.DataFrame(columns=es.SCORED_COLUMNS_FULL))
         self.assertTrue(out.empty)
-        self.assertEqual(list(out.columns), es.SCORED_COLUMNS)
+        self.assertEqual(list(out.columns), es.SCORED_COLUMNS_FULL)
 
 
 if __name__ == "__main__":

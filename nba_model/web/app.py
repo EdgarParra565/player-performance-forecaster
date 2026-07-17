@@ -986,6 +986,34 @@ def _cached_scanner_books(db_path: str) -> list[str]:
     return sorted(found, key=str.lower)
 
 
+@st.cache_data(show_spinner=False)
+def _cached_cross_book_books(db_path: str) -> list[str]:
+    """Books offered in the Cross-book view: the DFS board books (web_prop_cards)
+    unioned with the real-odds books (betting_lines).
+
+    The Edge Scanner only needs DFS-board books, but the Cross-book view also
+    surfaces TRUE two-way arbs from ``betting_lines``. A book that posts real
+    odds there but has no DFS card must still be selectable, or its arbs would
+    never show. Falls back to the DFS-only set on any error.
+    """
+    from nba_model.data.database.db_manager import DatabaseManager
+    books = list(_cached_scanner_books(db_path))
+    seen = {b.lower() for b in books}
+    try:
+        with DatabaseManager(db_path=db_path) as db:
+            rows = db.conn.execute(
+                "SELECT DISTINCT book FROM betting_lines WHERE book IS NOT NULL"
+            ).fetchall()
+        for r in rows:
+            b = str(r[0]).strip() if r and r[0] else ""
+            if b and b.lower() not in seen:
+                books.append(b)
+                seen.add(b.lower())
+    except Exception:
+        pass
+    return sorted(books, key=str.lower)
+
+
 def _admin_dashboard_view() -> None:
     """Admin-only: subscriber counts, MRR estimate, recent churn."""
     from nba_model.web import subscriptions
@@ -1196,6 +1224,305 @@ def _edge_scanner_view(db_path: str, user) -> None:
     if jump and jump != "(pick a player)":
         if st.button(f"Go to {jump}", key="es_jump_go"):
             row = ranked[ranked["player_name"] == jump].iloc[0]
+            _qp_set(player=jump, stat=str(row["stat_type"]),
+                    view="Player charts")
+            st.rerun()
+
+
+def _cross_book_view(db_path: str, user) -> None:
+    """Cross-book layer (WS8): line shopping, middle candidates, and TRUE arb.
+
+    Distinct from the Book Edge Scanner (model-vs-line edge). Here we compare
+    **books against each other** for the same prop:
+      * best over line (lowest) / best under line (highest) — line shopping
+      * a wide gap where a result could land between the legs — middle candidate
+      * over @ A + under @ B with real posted odds summing to < 1.0 — TRUE arb
+    DFS books post no American odds, so the scanner assumes -110; a -110/-110
+    pair can never be arb. So DFS-only rows are line shopping / middle candidates,
+    NEVER arb flags. Arb rows come only from ``betting_lines`` (real odds).
+    """
+    from nba_model.model import cross_book_arb as cba
+    from nba_model.web import cross_book_view as cbv
+
+    st.subheader(":handshake: Cross-book line shopping & arb")
+    st.caption(
+        "Compares **books against each other** for the same prop. **Line "
+        "shopping** = best over line (lowest) / best under line (highest). "
+        "**Middle candidate** = the gap is wide enough that a result could land "
+        "between the legs and win both (not guaranteed). **TRUE arb** = over @ "
+        "book A + under @ book B whose *real* posted odds sum to < 1.0 — locked "
+        "profit. DFS books (assumed -110) can **never** be arb, so their rows "
+        "are line shopping / middle candidates only."
+    )
+
+    all_books = _cached_cross_book_books(db_path)
+    if not all_books:
+        st.warning(
+            "No scraped prop cards in the DB yet (normal in the NBA offseason). "
+            "Run the web-text ETL (`nba_model.data.daily_etl` / hourly update) "
+            "on the Chrome host to populate `web_prop_cards`."
+        )
+        return
+
+    is_premium = bool(getattr(user, "is_premium", False))
+    stat_options = (STAT_CHOICES if is_premium
+                    else tuple(web_auth.PREVIEW_STATS))
+    n_games_max = 200 if is_premium else web_auth.PREVIEW_MAX_GAMES
+
+    with st.sidebar:
+        st.markdown("### Cross-book")
+        books = st.multiselect(
+            "Books", all_books,
+            default=all_books[: min(4, len(all_books))],
+            help="Only props from these books are compared against each other.",
+            key="cb_books",
+        )
+        stats = st.multiselect(
+            "Stat types", stat_options, default=list(stat_options),
+            key="cb_stats",
+        )
+        n_games = st.slider(
+            "History window (games for μ/σ)", min_value=2,
+            max_value=int(n_games_max),
+            value=min(25, int(n_games_max)), key="cb_ngames",
+        )
+        since_hours = st.slider(
+            "Line freshness (hours)", min_value=6, max_value=168,
+            value=int(es.DEFAULT_SINCE_HOURS), step=6, key="cb_since",
+            help="Only lines observed within this trailing window are compared.",
+        )
+        model_mode_label = st.selectbox(
+            "Model", ["Last-N mean (charts)", "Rolling window (prop board)",
+                      "Full model (beta)"],
+            index=0, key="cb_model_mode",
+        )
+        requested_mode = (
+            "chart_mean" if model_mode_label.startswith("Last-N")
+            else "rolling" if model_mode_label.startswith("Rolling")
+            else "full"
+        )
+        rolling_window = 10
+        if requested_mode == "rolling":
+            rolling_window = st.slider(
+                "Rolling window", min_value=3, max_value=30, value=10,
+                key="cb_rolling",
+            )
+        only_two_plus = st.checkbox(
+            "Only players on 2+ books", value=True, key="cb_only2",
+            help="Cross-book shopping needs at least two books quoting the same "
+                 "prop; leave on for the standard view.",
+        )
+        min_gap = st.slider(
+            "Min line gap", 0.0, 5.0, 0.5, step=0.5, key="cb_mingap",
+            help="Hide props whose books all agree within this many stat units.",
+        )
+        if st.button("Refresh scan", key="cb_refresh"):
+            _cached_scanner_books.clear()
+            _cached_cross_book_books.clear()
+            st.rerun()
+
+    if not books:
+        st.info("Select at least one book in the sidebar to compare.")
+        return
+
+    # Free-tier throttle (same budget shape as the Edge Scanner).
+    if not is_premium:
+        from nba_model.web import throttle
+        if not throttle.session_rate_limit("cross_book_scan", max_calls=8,
+                                           window_seconds=60.0):
+            st.warning(
+                "Scan rate limit reached for the free tier (8 / minute). "
+                "Wait a moment or upgrade for unthrottled scans."
+            )
+            return
+
+    # Model-mode capability check + graceful fallback (shared contract).
+    effective_mode, notice = cbv.resolve_model_mode(requested_mode, es)
+    try:
+        lines = es.fetch_latest_prop_lines(
+            db_path, books=books, stat_types=stats or None,
+            since_hours=float(since_hours),
+        )
+        scored = es.score_prop_edges(
+            lines, db_path=db_path, n_games=int(n_games),
+            model_mode=effective_mode, rolling_window=int(rolling_window),
+        )
+    except (ValueError, TypeError) as exc:
+        # Backstop: model layer rejected the mode -> retry on chart_mean.
+        effective_mode = "chart_mean"
+        notice = (
+            f"Requested model mode unavailable ({exc}); fell back to last-N "
+            "mean (charts)."
+        )
+        try:
+            scored = es.score_prop_edges(
+                lines, db_path=db_path, n_games=int(n_games),
+                model_mode="chart_mean", rolling_window=int(rolling_window),
+            )
+        except Exception as exc2:  # noqa: BLE001
+            st.error(f"Cross-book scan failed: {exc2}")
+            return
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"Cross-book scan failed: {exc}")
+        return
+    if notice:
+        st.caption(f":information_source: {notice}")
+
+    # Free tier: restrict to the preview player set (same gate as the scanner).
+    if not is_premium and not scored.empty:
+        preview = {p.casefold() for p in web_auth.PREVIEW_PLAYERS}
+        scored = scored[
+            scored["player_name"].str.casefold().isin(preview)
+        ].reset_index(drop=True)
+
+    # Keep the unfiltered frame for KPIs ("Pairs scanned" = the true scan size,
+    # "Gap ≥ X" = a meaningful subset count); the min-gap slider filters only the
+    # frame we display / export.
+    cross_all = cba.find_cross_book_opportunities(scored)
+    cross = cross_all
+    if not cross_all.empty and min_gap:
+        cross = cross_all[cross_all["line_gap"] >= float(min_gap)].reset_index(drop=True)
+
+    # A cross-book comparison inherently needs 2+ books. When the user unchecks
+    # "Only players on 2+ books" we surface how many props were on a single book
+    # (no comparison possible) rather than pretending the toggle filters the
+    # already-≥2-book table.
+    single_book_count = 0
+    if not scored.empty:
+        per_prop_books = scored.groupby(["player_name", "stat_type"])["book"].nunique()
+        single_book_count = int((per_prop_books < 2).sum())
+
+    # TRUE arb only ever comes from betting_lines (real posted odds). DFS -110
+    # data can never surface here.
+    try:
+        odds_lines = cba.fetch_two_way_lines(
+            db_path, books=books, stat_types=stats or None,
+            since_hours=float(since_hours),
+        )
+        arbs = cba.detect_two_way_arb(odds_lines)
+    except Exception:  # noqa: BLE001
+        arbs = pd.DataFrame(columns=cba.ARB_COLUMNS)
+
+    # Free tier: the arb path reads betting_lines directly, so it must be gated to
+    # the same preview players as the line-shopping table — otherwise the free
+    # tier would leak the full-slate arb feature and contradict the banner below.
+    if not is_premium and not arbs.empty:
+        preview = {p.casefold() for p in web_auth.PREVIEW_PLAYERS}
+        arbs = arbs[
+            arbs["player_name"].str.casefold().isin(preview)
+        ].reset_index(drop=True)
+
+    # ---- KPI row ----
+    kpis = cbv.compute_kpis(scored, cross_all, arbs, min_gap)
+    k1, k2, k3, k4, k5 = st.columns(5)
+    k1.metric("Pairs scanned", kpis["pairs"])
+    k2.metric("Max line gap", f"{kpis['max_gap']:.1f}")
+    k3.metric(f"Gap ≥ {min_gap:.1f}", kpis["over_threshold"])
+    k4.metric("True arbs", kpis["arb_count"],
+              help="Only from real posted odds on both legs. DFS -110 rows can "
+                   "never be arb.")
+    if kpis["freshest_hours"] is not None:
+        k5.metric("Freshest line", pc._format_staleness(kpis["freshest_hours"]))
+    else:
+        k5.metric("Freshest line", "—")
+
+    if not is_premium:
+        st.info(
+            "Free preview: cross-book limited to "
+            f"{', '.join(web_auth.PREVIEW_PLAYERS)} "
+            f"({', '.join(web_auth.PREVIEW_STATS)}, last "
+            f"{web_auth.PREVIEW_MAX_GAMES} games). Upgrade for the full slate."
+        )
+
+    if not only_two_plus and single_book_count:
+        st.caption(
+            f":information_source: {single_book_count} prop(s) are quoted on "
+            "only one book — no cross-book comparison is possible for those, so "
+            "they are omitted from the table below."
+        )
+
+    # ---- TRUE arb section (visually distinct — this is locked profit) ----
+    if not arbs.empty:
+        st.success(
+            f":rotating_light: {len(arbs)} TRUE two-way arbitrage "
+            f"opportunit{'y' if len(arbs) == 1 else 'ies'} found "
+            "(real posted odds, raw implied sum < 1.0)."
+        )
+        st.dataframe(
+            arbs[["player_name", "stat_type", "game_date", "legs",
+                  "combined_implied", "guaranteed_margin"]],
+            use_container_width=True, hide_index=True,
+            column_config={
+                "combined_implied": st.column_config.NumberColumn(
+                    "Σ implied", format="%.4f"),
+                "guaranteed_margin": st.column_config.NumberColumn(
+                    "Locked margin", format="%.4f"),
+            },
+        )
+        _csv_download_button(
+            arbs, label="Download arbs as CSV",
+            filename="cross_book_arbs.csv", key="csv_cross_arbs",
+        )
+        st.markdown("---")
+
+    # ---- Line shopping / middle table ----
+    if cross.empty:
+        st.warning(
+            "No cross-book opportunities cleared the current filters. In the "
+            "NBA offseason most books post no lines, so this is expected."
+            if all_books else "No cross-book opportunities found."
+        )
+        return
+
+    display = cbv.prepare_display_table(cross)
+    max_gap_axis = max(3.0, float(cross["line_gap"].max()))
+    st.dataframe(
+        display,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "player_name": st.column_config.TextColumn("Player"),
+            "stat_type": st.column_config.TextColumn("Stat"),
+            "n_books": st.column_config.NumberColumn("# books", format="%d"),
+            "line_min": st.column_config.NumberColumn(
+                "Low line (over)", format="%.1f"),
+            "line_max": st.column_config.NumberColumn(
+                "High line (under)", format="%.1f"),
+            "line_gap": st.column_config.ProgressColumn(
+                "Line gap", min_value=0.0, max_value=max_gap_axis,
+                format="%.1f"),
+            "best_over_book": st.column_config.TextColumn("Best over book"),
+            "best_under_book": st.column_config.TextColumn("Best under book"),
+            "consensus_mean": st.column_config.NumberColumn(
+                "Consensus", format="%.1f"),
+            "p_over_at_line_min": st.column_config.ProgressColumn(
+                "P(over) @ low", min_value=0.0, max_value=1.0, format="%.2f"),
+            "p_over_at_line_max": st.column_config.ProgressColumn(
+                "P(over) @ high", min_value=0.0, max_value=1.0, format="%.2f"),
+            "opportunity_type": st.column_config.TextColumn("Type"),
+        },
+    )
+    st.caption(
+        "DFS -110 rows are **line shopping / middle candidates**, not "
+        "guaranteed arbitrage. Bet the over at the *low* line and the under at "
+        "the *high* line; both win only if the result lands in the gap. See the "
+        "True-arb section above for locked-profit opportunities."
+    )
+
+    _csv_download_button(
+        cross, label="Download cross-book scan as CSV",
+        filename="cross_book_scan.csv", key="csv_cross_book",
+    )
+
+    # ---- Jump into Player Charts for a row ----
+    players_in_scan = list(dict.fromkeys(cross["player_name"].tolist()))
+    jump = st.selectbox(
+        "Open a player in Player Charts", ["(pick a player)"] + players_in_scan,
+        index=0, key="cb_jump",
+    )
+    if jump and jump != "(pick a player)":
+        if st.button(f"Go to {jump}", key="cb_jump_go"):
+            row = cross[cross["player_name"] == jump].iloc[0]
             _qp_set(player=jump, stat=str(row["stat_type"]),
                     view="Player charts")
             st.rerun()
@@ -2117,12 +2444,12 @@ def main() -> None:
     # ---- Primary nav (View mode = top-level pills) ----
     free_views = [
         "Player charts", "Team charts", "Compare players",
-        "Line edge scanner",
+        "Line edge scanner", "Cross-book",
         "Game Results", "Player Stats Browse",
     ]
     premium_views = [
         "Player charts", "Team charts", "Compare players",
-        "Line edge scanner",
+        "Line edge scanner", "Cross-book",
         "All stats (overview)", "Single prop (model)",
         "Parlay analysis", "Manual lines import",
         "Game Results", "Player Stats Browse",
@@ -2156,6 +2483,7 @@ def main() -> None:
     is_operations    = view_mode.startswith("Operations")
     is_admin_dash    = view_mode.startswith("Admin")
     is_edge_scanner  = view_mode.startswith("Line edge")
+    is_cross_book    = view_mode.startswith("Cross-book")
 
     # ---- Views with their own controls (no shared selection row) ----
     if is_game_results:
@@ -2169,6 +2497,10 @@ def main() -> None:
     if is_edge_scanner:
         st.markdown("<hr class='section-divider'/>", unsafe_allow_html=True)
         _edge_scanner_view(db_path, user)
+        return
+    if is_cross_book:
+        st.markdown("<hr class='section-divider'/>", unsafe_allow_html=True)
+        _cross_book_view(db_path, user)
         return
     if is_single_model:
         st.markdown("<hr class='section-divider'/>", unsafe_allow_html=True)

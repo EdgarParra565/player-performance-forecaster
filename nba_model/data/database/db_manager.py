@@ -64,6 +64,47 @@ def _implied_prob_to_american(prob):
     return int(round(-100.0 * p / (1.0 - p)))
 
 
+# Map a canonical ``stat_type`` → the SQL expression that recovers the realized
+# value from a ``game_logs`` row. PRA / RA are derived from raw columns. Shared
+# by ``backfill_predictions_outcomes`` (predictions) and ``settle_bet_log``
+# (bet_log) so both grade against the exact same stat definitions.
+_GAMELOG_STAT_EXPR = {
+    "points":              "g.points",
+    "assists":             "g.assists",
+    "rebounds":            "g.rebounds",
+    "three_pointers_made": "g.fg3m",
+    "field_goals_made":    "g.fgm",
+    "minutes":             "g.minutes",
+    "pra":                 ("COALESCE(g.points, 0) + "
+                            "COALESCE(g.rebounds, 0) + "
+                            "COALESCE(g.assists, 0)"),
+    "ra":                  ("COALESCE(g.rebounds, 0) + "
+                            "COALESCE(g.assists, 0)"),
+    "steals":              "g.steals",
+    "blocks":              "g.blocks",
+    "turnovers":           "g.turnovers",
+}
+
+
+def _grade_bet_side(side, actual, line):
+    """Grade a paper bet given the realized value and the line it was staked at.
+
+    Returns 'won' / 'lost' / 'push'. A push (actual == line) is a push for
+    either side; otherwise an over wins when actual > line and an under wins
+    when actual < line.
+    """
+    a = _safe_float(actual)
+    line_v = _safe_float(line)
+    if a is None or line_v is None:
+        return None
+    if a == line_v:
+        return "push"
+    over_hit = a > line_v
+    if str(side or "").strip().lower() == "over":
+        return "won" if over_hit else "lost"
+    return "lost" if over_hit else "won"
+
+
 class DatabaseManager:
     """Manages all database operations for NBA data."""
 
@@ -307,24 +348,9 @@ class DatabaseManager:
         Idempotent — re-running just settles any new games that landed
         since the last call.
         """
-        # Map stat_type → SQL expression against game_logs columns. PRA / RA
-        # are computed from the raw columns, others are direct.
-        stat_expr = {
-            "points":              "g.points",
-            "assists":             "g.assists",
-            "rebounds":            "g.rebounds",
-            "three_pointers_made": "g.fg3m",
-            "field_goals_made":    "g.fgm",
-            "minutes":             "g.minutes",
-            "pra":                 ("COALESCE(g.points, 0) + "
-                                    "COALESCE(g.rebounds, 0) + "
-                                    "COALESCE(g.assists, 0)"),
-            "ra":                  ("COALESCE(g.rebounds, 0) + "
-                                    "COALESCE(g.assists, 0)"),
-            "steals":              "g.steals",
-            "blocks":              "g.blocks",
-            "turnovers":           "g.turnovers",
-        }
+        # Map stat_type → SQL expression against game_logs columns (shared with
+        # settle_bet_log). PRA / RA are computed from raw columns, others direct.
+        stat_expr = _GAMELOG_STAT_EXPR
 
         update_stmt = """
             UPDATE predictions
@@ -391,6 +417,181 @@ class DatabaseManager:
             "Backfilled predictions outcomes: %s settled, %s still pending "
             "(scanned %s)",
             settled, result["remaining_pending"], scanned,
+        )
+        return result
+
+    # ------------------------------------------------------------------
+    # Paper-trading bet log (WS10 — measurement layer, NOT execution)
+    # ------------------------------------------------------------------
+
+    def insert_bet_log_rows(self, rows):
+        """Insert paper-trade ``bet_log`` rows. Returns ``{inserted, attempted}``.
+
+        Each row is a dict of the bet-slip fields. Missing optional keys default
+        to NULL; ``created_at_utc`` defaults to now, ``status`` to 'pending',
+        ``sport`` to 'nba'. Rows missing a required field (game_date,
+        player_name, stat_type, line) or with an invalid side are skipped."""
+        rows = list(rows or [])
+        if not rows:
+            return {"inserted": 0, "attempted": 0}
+
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        query = """
+            INSERT INTO bet_log (
+                created_at_utc, game_date, player_id, player_name, stat_type,
+                book, line, side, model_prob, implied_prob, edge, model_mode,
+                distribution, kelly_fraction, stake_units, status, sport
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """
+        payload = []
+        for r in rows:
+            game_date = r.get("game_date")
+            player_name = str(r.get("player_name", "")).strip()
+            stat_type = str(r.get("stat_type", "")).strip().lower()
+            line = _safe_float(r.get("line"))
+            side = str(r.get("side", "")).strip().lower()
+            if (not game_date or not player_name or not stat_type
+                    or line is None or side not in ("over", "under")):
+                continue
+            payload.append((
+                str(r.get("created_at_utc") or now),
+                str(game_date)[:10],
+                _safe_int(r.get("player_id")),
+                player_name,
+                stat_type,
+                (str(r.get("book")).strip() if r.get("book") else None),
+                line,
+                side,
+                _safe_float(r.get("model_prob")),
+                _safe_float(r.get("implied_prob")),
+                _safe_float(r.get("edge")),
+                (str(r.get("model_mode")) if r.get("model_mode") else None),
+                (str(r.get("distribution")) if r.get("distribution") else None),
+                _safe_float(r.get("kelly_fraction")),
+                _safe_float(r.get("stake_units")),
+                str(r.get("status") or "pending"),
+                str(r.get("sport") or "nba"),
+            ))
+        if not payload:
+            return {"inserted": 0, "attempted": 0}
+
+        before = self.conn.total_changes
+        self.conn.executemany(query, payload)
+        self.conn.commit()
+        inserted = self.conn.total_changes - before
+        logger.info("Inserted %s bet_log rows", inserted)
+        return {"inserted": int(inserted), "attempted": int(len(payload))}
+
+    def _closing_clv_delta(self, player_id, game_date, stat_type, side,
+                           entry_implied):
+        """CLV delta for one pick from the latest line snapshot, or ``None``.
+
+        Reuses ``clv_proxy`` odds→implied conversion. Returns
+        ``closing_side_implied − entry_implied`` (positive = the market closed
+        toward the bet's side vs the entry price). ``None`` when there's no
+        snapshot, no odds on that side, or no entry implied prob."""
+        entry = _safe_float(entry_implied)
+        if entry is None or player_id is None:
+            return None
+        row = self.conn.execute(
+            """
+            SELECT over_odds, under_odds
+            FROM betting_line_snapshots
+            WHERE player_id = ?
+              AND DATE(game_date) = DATE(?)
+              AND lower(stat_type) = lower(?)
+            ORDER BY snapshot_ts_utc DESC
+            LIMIT 1
+            """,
+            (int(player_id), str(game_date), str(stat_type)),
+        ).fetchone()
+        if not row:
+            return None
+        from nba_model.evaluation.clv_proxy import _safe_implied_prob
+        close_odds = row[0] if str(side).strip().lower() == "over" else row[1]
+        close_implied = _safe_implied_prob(close_odds)
+        if close_implied is None:
+            return None
+        return float(close_implied - entry)
+
+    def settle_bet_log(self, fill_clv=True):
+        """Grade every pending ``bet_log`` row whose game now has logs.
+
+        Mirrors ``backfill_predictions_outcomes``: look up the pick's realized
+        stat in ``game_logs`` (via the shared ``_GAMELOG_STAT_EXPR``), set
+        ``status`` ∈ {won, lost, push} for the staked side, and stamp
+        ``settled_at_utc`` + ``actual_value``. When ``fill_clv`` and a closing
+        ``betting_line_snapshots`` row exists, fill ``clv_delta`` too.
+
+        Idempotent — only touches ``status = 'pending'`` rows, so re-running
+        just settles games that have since landed. Returns settle counts."""
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        pending = self.conn.execute(
+            """
+            SELECT log_id, player_id, game_date, stat_type, line, side, implied_prob
+            FROM bet_log
+            WHERE status = 'pending'
+            """
+        ).fetchall()
+
+        update_stmt = """
+            UPDATE bet_log
+               SET status = ?,
+                   settled_at_utc = ?,
+                   actual_value = ?,
+                   clv_delta = COALESCE(?, clv_delta)
+             WHERE log_id = ?
+        """
+
+        settled = 0
+        scanned = 0
+        clv_filled = 0
+        unsupported_stats: set[str] = set()
+
+        for log_id, player_id, game_date, stat_type, line, side, implied_prob in pending:
+            scanned += 1
+            stat = (stat_type or "").strip().lower()
+            expr = _GAMELOG_STAT_EXPR.get(stat)
+            if expr is None or player_id is None:
+                unsupported_stats.add(stat or "<empty>")
+                continue
+            row = self.conn.execute(
+                f"""
+                SELECT {expr} AS actual
+                FROM game_logs g
+                WHERE g.player_id = ?
+                  AND DATE(g.game_date) = DATE(?)
+                LIMIT 1
+                """,
+                (int(player_id), str(game_date)),
+            ).fetchone()
+            if not row or row[0] is None:
+                continue
+            actual = float(row[0])
+            status = _grade_bet_side(side, actual, line)
+            if status is None:
+                continue
+            clv = self._closing_clv_delta(
+                player_id, game_date, stat, side, implied_prob
+            ) if fill_clv else None
+            if clv is not None:
+                clv_filled += 1
+            self.conn.execute(
+                update_stmt, (status, now, actual, clv, int(log_id)))
+            settled += 1
+
+        self.conn.commit()
+        result = {
+            "scanned": int(scanned),
+            "settled": int(settled),
+            "remaining_pending": int(scanned - settled),
+            "clv_filled": int(clv_filled),
+        }
+        if unsupported_stats:
+            result["unsupported_stats"] = sorted(unsupported_stats)
+        logger.info(
+            "Settled bet_log: %s settled, %s pending, %s clv filled (scanned %s)",
+            settled, result["remaining_pending"], clv_filled, scanned,
         )
         return result
 

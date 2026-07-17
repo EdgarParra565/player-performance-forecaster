@@ -1,21 +1,25 @@
 # NBA Player Performance Forecaster - Working Notes
 
-Last updated: 2026-07-04
+Last updated: 2026-07-16
 
 Active tracker only: architecture, what's done, what's next. CLI runbooks,
 deployment, and security live in **README.md** and **docs/** — not duplicated here.
 
-Test baseline: **566 passing** (`.venv/bin/python3 -m pytest nba_model/tests -q`).
+Test baseline: **626 passing** (`.venv/bin/python3 -m pytest nba_model/tests -q`;
+Windows: `.venv\Scripts\python.exe -m pytest nba_model/tests -q`).
 
 ---
 
 ## Near-term objectives (NBA)
 
 1. **In-season data loop** — Mac Chrome `:9222` → hourly ETL → `publish_db.sh` → cloud app.
-2. **Book Edge Scanner** — slate-wide model-vs-line ranking (marquee UI; not arbitrage).
-3. **Cross-book + auto-bet path** — Workstreams 8–10 below (not started; do not bet real money yet).
-4. **More scrapers** — 9 of 20 books produce parsed rows; rest blocked on auth/render/season.
-5. **Multi-sport** — MLB data layer is beta (off NBA consensus path). NFL scaffold parked.
+   This is the gating item: WS10 validation and TRUE-arb detection are data-starved without it.
+2. **Run WS10 validation** — market-line backtests, 4–8 week paper trade
+   (`bet_slip` → `bet_log` → `calibration_report`), CLV review. Tooling is built;
+   only live data is missing. **Do not bet real money until this passes.**
+3. **More scrapers** — 9 of 20 books produce parsed rows; rest blocked on auth/render/season.
+   Sportsbook odds feeds also unlock TRUE-arb + CLV.
+4. **Multi-sport** — MLB data layer is beta (off NBA consensus path). NFL scaffold parked.
    NBA deploy does not require shipping MLB/NFL web views.
 
 ---
@@ -25,8 +29,12 @@ Test baseline: **566 passing** (`.venv/bin/python3 -m pytest nba_model/tests -q`
 - **Stack:** Python 3.11, SQLite `data/database/nba_data.db`, Streamlit + Tk, pytest.
 - **Ingest:** `nba_results_ingestion.py`, `daily_etl.py`, `hourly_update.py` (Mac host).
 - **Scrapers:** `nba_model/scrapers/` (20 registered); fetch via CDP + real Chrome `:9222`.
-- **Model:** `simulation.py`, `prop_board.py`, `edge_scanner.py`, `blend_team_prior()`.
-- **Web:** `nba_model/web/app.py` + auth/billing (`BILLING_ENABLED=0` = open access).
+- **Model:** `simulation.py`, `prop_board.py` (shared projection helpers),
+  `edge_scanner.py`, `cross_book_arb.py`, `blend_team_prior()`.
+- **Validation:** `evaluation/bet_slip.py`, `calibration_report.py`, `clv_proxy.py`,
+  `bet_log` table.
+- **Web:** `nba_model/web/app.py` (+ `cross_book_view.py` helpers) + auth/billing
+  (`BILLING_ENABLED=0` = open access).
 
 **Constraints:** `.venv/bin/python3` for ETL/browser; admin-gates on Operations + manual-lines
 save; web = Plotly, Tk = matplotlib; do not delete `sports/` scaffolding.
@@ -35,8 +43,33 @@ save; web = Plotly, Tk = matplotlib; do not delete `sports/` scaffolding.
 
 ## Implemented (trust unless regression)
 
-- **Edge Scanner** — `edge_scanner.py` + Streamlit view; CLI `--books underdog ...`.
-  Model-vs-line (normal μ/σ from last-N games or rolling toggle); DFS assumes -110.
+- **Edge Scanner** — `edge_scanner.py` + "Line edge scanner" Streamlit view; CLI
+  `--books underdog ...`. Three modes (`MODEL_MODES`): `chart_mean` (default quick
+  screen: last-N normal), `rolling`, and **`full`**. Output keeps `SCORED_COLUMNS`
+  as ordered prefix + appends `distribution`/`model_mode` (`SCORED_COLUMNS_FULL`).
+  DFS books assume -110. Unfittable rows are dropped, never raised.
+- **WS9 unify scoring (2026-07-16)** — `full` mode runs the prop_board stack
+  (rolling μ/σ + `blend_team_prior` + `get_default_distribution(stat)`), DB-direct
+  (no DataLoader/network). Scanner full mode and hourly `predictions` share
+  `prop_board.build_history_from_games` / `project_stat_moments` /
+  `project_prop_line`, so they can't drift (parity pinned by test).
+- **WS8 cross-book layer (2026-07-16)** — `cross_book_arb.py`:
+  `find_cross_book_opportunities` (per (player, stat) with ≥2 books: line_gap,
+  best over/under book, middle candidates), `fetch_two_way_lines` +
+  `detect_two_way_arb` (TRUE-arb flag only when RAW
+  `implied_over_A + implied_under_B < 1` in an executable direction, from REAL
+  `betting_lines` odds — never from assumed -110). CLI `--min-gap` / `--arb-only`.
+  Streamlit **"Cross-book"** view (KPIs incl. arb count, distinct true-arb section,
+  CSV export, Player Charts jump, offseason empty-state); its book list unions
+  `web_prop_cards` + `betting_lines` so real-odds-only books stay selectable.
+- **WS10 tooling (2026-07-16; measurement only, no execution layer)** —
+  `bet_log` table + `insert_bet_log_rows` / `settle_bet_log(fill_clv=)` (grades
+  pending picks vs `game_logs`, fills `clv_delta` from closing
+  `betting_line_snapshots`); `bet_slip.py` CLI = the paper-trade entry point
+  (full-mode edges → min_edge/min_p/max_picks/capped-Kelly gates → CSV+JSON
+  artifacts + `bet_log` insert; `--dry-run` = no side effects);
+  `calibration_report.py` (per-stat reliability buckets + Brier from settled
+  `predictions` or `bet_log`); `hourly_update --settle-bet-log` (default OFF).
 - **Full model path** — 8 distributions; team priors in `run_single_prop`, `prop_board`,
   hourly predictions (points/assists/rebounds/pra). Rebounds default → poisson; others → normal.
 - **Player Charts** — Plotly web + matplotlib Tk; line ladder, movement tab, CLV/Kelly,
@@ -52,23 +85,25 @@ save; web = Plotly, Tk = matplotlib; do not delete `sports/` scaffolding.
 
 ## Open work (priority)
 
-### WS8 — Cross-book layer `[ ]`
-New `cross_book_arb.py`: per `(player, stat)` → `line_gap`, best over/under book,
-optional two-way arb when `implied_over_A + implied_under_B < 1`. Streamlit tab.
-Reuse `line_comparison.build_book_vs_book` patterns. **Not true arb today.**
+### WS10 — Validation before auto-bet (tooling built; the runs are what's left)
 
-### WS9 — Unify scoring `[ ]`
-`score_prop_edges_v2()` via full `prop_board` stack (team priors + per-stat distribution).
-Edge Scanner default → v2; keep "quick normal screen" as toggle. Hourly `predictions`
-must match UI.
+- [ ] **Phase 0** — populate `web_prop_cards` / `betting_lines` in-season (Mac ETL),
+      `historical_odds_backfill`, nightly `publish_db.sh` cadence.
+- [ ] **Phase 1** — `--use-market-lines` sweeps/backtests, CLV vs close, calibration
+      review, promotion gates. Tools exist; runs blocked on Phase 0 data.
+- [ ] **Phase 2** — paper-trade 4–8 weeks: `bet_slip` (drop `--dry-run`) → settle →
+      `calibration_report --source bet_log`; weekly review.
+- [ ] **Phase 3** — execution layer ONLY if Phases 1–2 pass (book APIs, limits, kill switch).
 
-### WS10 — Validation before auto-bet `[ ]`
-**Phase 0:** populated `web_prop_cards` / `betting_lines`, backfill, publish DB.
-**Phase 1:** `--use-market-lines` backtests, CLV (`clv_proxy.py`), calibration, gates.
-**Phase 2:** bet-slip export, `bet_log` table, paper-trade 4–8 weeks.
-**Phase 3:** execution layer only if Phase 1–2 pass (APIs, limits, kill switch).
+### Smaller follow-ups
 
-**3-week sprint when ready:** Week 1 = WS9, Week 2 = WS8, Week 3 = WS10 Phase 1.
+- [ ] Expose `full` mode in the **Line edge scanner** view's model toggle (today the
+      view offers chart_mean | rolling; `full` is CLI + Cross-book view only).
+- [ ] Root-fix NaN moments: `_project_stat_from_history` returns NaN μ/σ when a NULL
+      stat value lands inside the rolling window → hourly `predictions` can persist a
+      NaN row (rare, pre-existing; scanner `full` mode already drops such rows).
+- [ ] Team charts beyond lobby `points`; structured logging; MLB per-game player-props
+      parser + park factors.
 
 ---
 
@@ -94,35 +129,34 @@ Re-run fetch→parse when blocker clears. NBA **offseason** = empty lobbies, not
 
 | Term | Meaning | Built? |
 |------|---------|--------|
-| Model edge | P(side) vs book implied | Yes (Edge Scanner) |
-| Line shopping | Best over/under line across books | Partial (`line_comparison`) |
-| True arb | Total implied prob < 1 across legs | No |
-| Middle | Over low line + under high line | Detectable via `line_gap`; not arb |
+| Model edge | P(side) vs book implied | Yes (Edge Scanner, 3 modes) |
+| Line shopping | Best over/under line across books | Yes (`cross_book_arb` + Cross-book view) |
+| Middle | Over low line + under high line | Candidates flagged via `line_gap` — never "guaranteed" |
+| True arb | Σ implied < 1 across legs (real odds both sides) | Detector built (`detect_two_way_arb`); **data-starved** until sportsbook odds land in `betting_lines` |
 
-**Distributions:** Engineering solid; **validated market edge weak.** Only rebounds→poisson
-showed positive sweep ROI (+8.8%, n=482, **not significant**). Points/assists/pra stayed normal
-(sweep inconclusive / negative ROI when bets placed). `--use-market-lines` needs more
-`betting_lines` volume. High win rates in old real-data benchmarks used rolling mean as line
-(model vs itself) — not book CLV.
+**Distributions:** engineering solid; **validated market edge still unproven.** Only
+rebounds→poisson showed positive sweep ROI (+8.8%, n=482, **not significant**).
+Points/assists/pra stay normal (sweep inconclusive / negative ROI when bets placed).
+`--use-market-lines` needs more `betting_lines` volume. High win rates in old
+real-data benchmarks used rolling mean as the line (model vs itself) — not book CLV.
 
-**Edge Scanner vs full model (auto-bet gap):**
+**WS9 closed the modeling gap; the remaining gap is proof:**
 
-| | Scanner today | Auto-bet should use |
-|--|---------------|---------------------|
-| μ | Last-N mean | Rolling + defense + minutes + team priors |
-| Dist | Always normal | `get_default_distribution(stat)` |
-| σ | Sample std | Adjusted σ |
-| Proof | None | `predictions` + CLV + backtest |
-
-**Reuse:** `edge_scanner.py`, `line_comparison.py`, `compute_market_consensus`,
-`clv_proxy.py`, hourly `_persist_predictions`.
+| | `chart_mean` (quick screen) | `full` (WS9) | Still missing |
+|--|--|--|--|
+| μ / σ | Last-N mean / sample std | Rolling + team priors | Defense/minutes adjustments in scanner path |
+| Dist | Always normal | `get_default_distribution(stat)` | Per-stat σ tuning |
+| Proof | None | None yet | Settled `bet_log` + CLV + market-line backtests (WS10) |
 
 ---
 
 ## Known limitations
 
-- Sparse scraped lines → Edge Scanner / Line Movement / CLV empty until Mac ETL runs.
-- `betting_lines` thin → market-line validation blocked (backfill tooling exists).
+- Sparse scraped lines → Edge Scanner / Cross-book / Line Movement / CLV mostly empty
+  until the Mac ETL runs in-season (offseason arb count 0 = expected).
+- `betting_lines` thin → market-line validation + TRUE-arb blocked (backfill tooling exists).
 - Team charts: lobby `points` only. `players.team` sparse (fallback: `matchup`).
-- Scraping host = dev Mac; dev box may be Windows (`DataLoader` sqlite leak on temp DB teardown).
-- **Do not use Edge Scanner for real-money bets** until WS9 + WS10 Phase 1 complete.
+- Scraping host = dev Mac; dev box may be Windows (`DataLoader` sqlite leak on temp DB
+  teardown — scanner `full` mode is DB-direct and unaffected).
+- Hourly `predictions` can persist NaN rows for NULL-in-window stats (see follow-ups).
+- **Do not use Edge Scanner / bet_slip picks for real money** until WS10 Phases 1–2 pass.

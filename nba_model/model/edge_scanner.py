@@ -25,6 +25,7 @@ real price is present.
 from __future__ import annotations
 
 import argparse
+import math
 from typing import Optional, Sequence
 
 import pandas as pd
@@ -32,6 +33,7 @@ from scipy.stats import norm
 
 from nba_model.data.database.db_manager import DatabaseManager
 from nba_model.model.odds import american_to_implied_prob
+from nba_model.model.probability import prob_over_distribution
 from nba_model.visualization import player_charts as pc
 
 DEFAULT_DB_PATH = "data/database/nba_data.db"
@@ -53,6 +55,17 @@ SCORED_COLUMNS = [
     "consensus_mean", "pct_from_consensus",
     "observed_hours_ago", "observed_at_utc", "n_games_used",
 ]
+
+# Columns appended (never inserted/reordered) so a scored frame always carries
+# the fit provenance. ``SCORED_COLUMNS`` stays the canonical prefix that the
+# UI (Agent B) relies on; ``SCORED_COLUMNS_FULL`` is the actual output shape.
+APPENDED_COLUMNS = ["distribution", "model_mode"]
+SCORED_COLUMNS_FULL = SCORED_COLUMNS + APPENDED_COLUMNS
+
+# Accepted model modes. ``full`` runs the prop_board stack (rolling μ/σ +
+# team-prior blend + per-stat distribution); the other two keep the legacy
+# plain-normal fit.
+MODEL_MODES = ("chart_mean", "rolling", "full")
 
 
 # ---------------------------------------------------------------------------
@@ -140,6 +153,75 @@ def _resolve_player_id(db: DatabaseManager, name: str) -> Optional[int]:
     return None
 
 
+def _resolve_player_team(db: DatabaseManager, player_id: int) -> Optional[str]:
+    """Player's team abbrev from the ``players`` table (or ``None`` if unknown).
+
+    Mirrors the ``players.team`` source the hourly recompute uses (its rows come
+    from ``betting_lines JOIN players``), so full-mode team-prior lookups line
+    up with the hourly path."""
+    row = db.conn.execute(
+        "SELECT team FROM players WHERE player_id = ?", (int(player_id),)
+    ).fetchone()
+    if row and row[0] and str(row[0]).strip():
+        return str(row[0]).strip()
+    return None
+
+
+def _fit_player_stat_full(
+    db: DatabaseManager,
+    name_to_id: dict,
+    player_name: str,
+    canonical_stat: str,
+    n_games: int,
+    rolling_window: int,
+    team_prior_map: dict,
+) -> Optional[dict]:
+    """Full-model fit: rolling μ/σ + team-prior blend + per-stat distribution.
+
+    Uses the shared ``prop_board`` projection helpers off the DB directly (no
+    DataLoader / network), so it produces the same μ/σ/distribution the hourly
+    ``_persist_predictions`` path stores for the same inputs. Returns ``None``
+    (row dropped) for unprojectable stats or insufficient history."""
+    from nba_model.model import prop_board
+
+    if canonical_stat not in prop_board.PROJECTABLE_STATS:
+        return None
+    key = player_name.lower()
+    if key not in name_to_id:
+        name_to_id[key] = _resolve_player_id(db, player_name)
+    pid = name_to_id[key]
+    if pid is None:
+        return None
+    games = db.get_player_games(pid, n_games=max(1, int(n_games)))
+    latest = prop_board.build_history_from_games(
+        games, rolling_window=int(rolling_window))
+    if latest is None:
+        return None
+
+    prior_inputs = None
+    team = _resolve_player_team(db, pid)
+    if team:
+        prior_inputs = team_prior_map.get(team.upper())
+
+    moments = prop_board.project_stat_moments(
+        latest, canonical_stat, prior_inputs=prior_inputs)
+    mu = float(moments["mu"])
+    sigma = float(moments["sigma"])
+    # A NULL stat value inside the rolling window makes the rolling mean NaN
+    # (chart_mean avoids this by fillna(0)-ing the series). Drop rather than
+    # persist a nonsensical NaN row that would otherwise sort to the top of the
+    # edge ranking.
+    if not (math.isfinite(mu) and math.isfinite(sigma)):
+        return None
+    return {
+        "mu": mu,
+        "sigma": sigma,
+        "distribution": moments["distribution"],
+        # The newest ``rolling_window`` games informed the projection.
+        "n": int(rolling_window),
+    }
+
+
 def _fit_player_stat(
     db: DatabaseManager,
     name_to_id: dict,
@@ -149,8 +231,22 @@ def _fit_player_stat(
     model_mode: str,
     rolling_window: int,
     db_path: str,
+    team_prior_map: Optional[dict] = None,
 ) -> Optional[dict]:
-    """Return ``{"mu","sigma","n"}`` for a player+stat, or None when un-fittable."""
+    """Return ``{"mu","sigma","n"[,"distribution"]}`` for a player+stat, or None
+    when un-fittable."""
+    if model_mode == "full":
+        # Mirror the 'rolling' branch's swallow-and-drop: a single un-fittable
+        # player (e.g. rolling_window < 2 → add_rolling_stats raises) must drop
+        # that row, never abort the whole slate scan.
+        try:
+            return _fit_player_stat_full(
+                db, name_to_id, player_name, canonical_stat,
+                n_games, rolling_window, team_prior_map or {},
+            )
+        except Exception:
+            return None
+
     if model_mode == "rolling":
         try:
             from nba_model.model import prop_board
@@ -203,9 +299,20 @@ def score_prop_edges(
 ) -> pd.DataFrame:
     """Score each book line against the fitted model. One row per (book,
     player, stat). μ/σ are memoized per (player, stat) so a 200-prop slate
-    triggers one game-log fetch per unique player+stat, not per row."""
+    triggers one game-log fetch per unique player+stat, not per row.
+
+    ``model_mode``:
+      * ``chart_mean`` (default) — plain normal on the last-N mean/std.
+      * ``rolling`` — rolling μ/σ from the prop_board stack (DataLoader-backed).
+      * ``full`` — the full prop_board projection: rolling μ/σ + team-prior
+        blend (when the player's team has a prior) + the per-stat default
+        distribution via ``get_default_distribution``. Matches the numbers the
+        hourly ``predictions`` recompute stores.
+
+    Output keeps ``SCORED_COLUMNS`` as its ordered prefix and appends
+    ``distribution`` + ``model_mode`` (see ``SCORED_COLUMNS_FULL``)."""
     if lines_df is None or lines_df.empty:
-        return pd.DataFrame(columns=SCORED_COLUMNS)
+        return pd.DataFrame(columns=SCORED_COLUMNS_FULL)
 
     work = lines_df.copy()
     work["canonical_stat"] = work["stat_type"].map(pc._canonical_stat_type)
@@ -237,6 +344,11 @@ def score_prop_edges(
     name_to_id: dict = {}
     rows: list[dict] = []
     with DatabaseManager(db_path=db_path) as db:
+        # Full mode pulls the whole slate's team priors once (pace + implied
+        # team total per team) — the same map the hourly recompute blends.
+        team_prior_map = (
+            db.get_team_prior_inputs_map() if model_mode == "full" else {}
+        )
         for r in per_book.itertuples(index=False):
             canonical_stat = r.canonical_stat
             fit_key = (r.player_key, canonical_stat)
@@ -244,14 +356,24 @@ def score_prop_edges(
                 memo[fit_key] = _fit_player_stat(
                     db, name_to_id, r.player_name, canonical_stat,
                     n_games, model_mode, rolling_window, db_path,
+                    team_prior_map=team_prior_map,
                 )
             fit = memo[fit_key]
             if fit is None:
                 continue
 
             mu, sigma = fit["mu"], fit["sigma"]
+            distribution = fit.get("distribution", "normal")
             line = float(r.book_line)
-            p_over = _normal_p_over(mu, sigma, line)
+            if model_mode == "full":
+                # Per-stat distribution (rebounds → poisson, etc.), not a
+                # hardcoded normal.
+                p_over = float(prob_over_distribution(
+                    line=line, mu=mu, sigma=sigma,
+                    distribution=distribution, sample_size=int(rolling_window),
+                ))
+            else:
+                p_over = _normal_p_over(mu, sigma, line)
             p_under = 1.0 - p_over
             best_side = "over" if p_over >= p_under else "under"
             p_best = max(p_over, p_under)
@@ -289,11 +411,13 @@ def score_prop_edges(
                 ),
                 "observed_at_utc": r.observed_at_utc,
                 "n_games_used": fit["n"],
+                "distribution": distribution,
+                "model_mode": model_mode,
             })
 
     if not rows:
-        return pd.DataFrame(columns=SCORED_COLUMNS)
-    return pd.DataFrame(rows, columns=SCORED_COLUMNS)
+        return pd.DataFrame(columns=SCORED_COLUMNS_FULL)
+    return pd.DataFrame(rows, columns=SCORED_COLUMNS_FULL)
 
 
 # ---------------------------------------------------------------------------
@@ -311,7 +435,7 @@ def top_edges(
     """Filter and rank scored props. Default sort: ``model_edge`` desc, then
     ``p_over`` desc as a tiebreaker."""
     if scored_df is None or scored_df.empty:
-        return pd.DataFrame(columns=SCORED_COLUMNS)
+        return pd.DataFrame(columns=SCORED_COLUMNS_FULL)
 
     df = scored_df.copy()
     if min_p_over is not None:
@@ -344,7 +468,7 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                    help="stat types to include (default: all)")
     p.add_argument("--n-games", type=int, default=DEFAULT_N_GAMES)
     p.add_argument("--since-hours", type=float, default=DEFAULT_SINCE_HOURS)
-    p.add_argument("--model-mode", choices=["chart_mean", "rolling"],
+    p.add_argument("--model-mode", choices=list(MODEL_MODES),
                    default="chart_mean")
     p.add_argument("--rolling-window", type=int, default=10)
     p.add_argument("--min-edge", type=float, default=None)

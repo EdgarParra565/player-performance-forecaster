@@ -232,6 +232,36 @@ CREATE TABLE IF NOT EXISTS predictions (
     FOREIGN KEY (player_id) REFERENCES players(player_id)
 );
 
+-- Paper-trading bet log (WS10 measurement layer — NOT an execution layer).
+-- One row per staked pick emitted by the bet-slip exporter. `status` starts
+-- 'pending' and is graded against game_logs by settle_bet_log(); `clv_delta`
+-- is backfilled from betting_line_snapshots when a closing snapshot exists.
+CREATE TABLE IF NOT EXISTS bet_log (
+    log_id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at_utc  TIMESTAMP NOT NULL,
+    game_date       DATE NOT NULL,
+    player_id       INTEGER,
+    player_name     TEXT NOT NULL,
+    stat_type       TEXT NOT NULL,
+    book            TEXT,
+    line            REAL NOT NULL,
+    side            TEXT NOT NULL,                 -- 'over' | 'under'
+    model_prob      REAL,
+    implied_prob    REAL,
+    edge            REAL,
+    model_mode      TEXT,
+    distribution    TEXT,
+    kelly_fraction  REAL,
+    stake_units     REAL,                          -- nullable
+    status          TEXT NOT NULL DEFAULT 'pending', -- pending|won|lost|push|void
+    settled_at_utc  TIMESTAMP,
+    actual_value    REAL,
+    clv_delta       REAL,                          -- nullable
+    sport           TEXT NOT NULL DEFAULT 'nba',
+    created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (player_id) REFERENCES players(player_id)
+);
+
 -- Prediction model configuration metadata (for reproducibility/auditing)
 CREATE TABLE IF NOT EXISTS prediction_configs (
     config_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -267,6 +297,8 @@ CREATE INDEX IF NOT EXISTS idx_mlb_game_logs_player_stat ON mlb_game_logs(player
 CREATE INDEX IF NOT EXISTS idx_mlb_game_logs_date ON mlb_game_logs(game_date DESC, game_pk);
 CREATE INDEX IF NOT EXISTS idx_game_logs_player_date ON game_logs(player_id, game_date DESC);
 CREATE INDEX IF NOT EXISTS idx_predictions_date ON predictions(game_date DESC);
+CREATE INDEX IF NOT EXISTS idx_bet_log_status ON bet_log(status, game_date);
+CREATE INDEX IF NOT EXISTS idx_bet_log_player_date ON bet_log(player_id, game_date, stat_type);
 CREATE INDEX IF NOT EXISTS idx_betting_lines_player_date ON betting_lines(player_id, game_date);
 CREATE INDEX IF NOT EXISTS idx_prediction_configs_prediction_id ON prediction_configs(prediction_id);
 CREATE INDEX IF NOT EXISTS idx_snapshots_game_book_stat ON betting_line_snapshots(game_date, book, stat_type);

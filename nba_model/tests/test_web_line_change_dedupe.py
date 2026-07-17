@@ -9,6 +9,7 @@ reflects real movement instead of one row per hourly scrape.
 import os
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 
 from nba_model.data.database.db_manager import DatabaseManager
 
@@ -142,6 +143,16 @@ class TeamLineChangeOnlyTests(unittest.TestCase):
         self.assertEqual(res["skipped_unchanged"], 1)
 
 
+def _hours_ago(hours: float) -> str:
+    """UTC timestamp N hours ago, matching the scraped ``observed_at_utc`` format.
+
+    ``_fetch_line_movement`` filters on ``datetime('now', '-48 hours')``, so
+    fixtures must be date-relative — hardcoded dates rot out of the window.
+    """
+    ts = datetime.now(timezone.utc) - timedelta(hours=hours)
+    return ts.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 class LineMovementSummaryTests(unittest.TestCase):
     def setUp(self):
         from nba_model.visualization import player_charts as pc
@@ -151,7 +162,7 @@ class LineMovementSummaryTests(unittest.TestCase):
         self.db = DatabaseManager(self.db_path)
         for sid in range(1, 6):
             _seed_snapshot(
-                self.db, sid, f"2026-06-30T0{sid}:00:00Z", "https://prizepicks.com"
+                self.db, sid, _hours_ago(6 - sid), "https://prizepicks.com"
             )
 
     def _ins(self, snapshot_id, line, sha, ts, book="prizepicks"):
@@ -169,9 +180,9 @@ class LineMovementSummaryTests(unittest.TestCase):
         self.db.conn.commit()
 
     def test_up_move_reports_from_lowest(self):
-        self._ins(1, 25.5, "a", "2026-06-30T01:00:00Z")
-        self._ins(2, 26.5, "b", "2026-06-30T02:00:00Z")
-        self._ins(3, 27.0, "c", "2026-06-30T03:00:00Z")
+        self._ins(1, 25.5, "a", _hours_ago(5))
+        self._ins(2, 26.5, "b", _hours_ago(4))
+        self._ins(3, 27.0, "c", _hours_ago(3))
         mv = self.pc._fetch_line_movement(self.db, "points", "LeBron James")
         self.assertEqual(len(mv), 1)
         self.assertEqual(mv[0]["direction"], "up")
@@ -180,16 +191,16 @@ class LineMovementSummaryTests(unittest.TestCase):
         self.assertIn("(low)", mv[0]["text"])
 
     def test_down_move_reports_from_highest(self):
-        self._ins(1, 30.0, "a", "2026-06-30T01:00:00Z")
-        self._ins(2, 28.5, "b", "2026-06-30T02:00:00Z")
+        self._ins(1, 30.0, "a", _hours_ago(5))
+        self._ins(2, 28.5, "b", _hours_ago(4))
         mv = self.pc._fetch_line_movement(self.db, "points", "LeBron James")
         self.assertEqual(mv[0]["direction"], "down")
         self.assertEqual(mv[0]["previous"], 30.0)
         self.assertIn("(high)", mv[0]["text"])
 
     def test_flat_line_is_omitted(self):
-        self._ins(1, 22.0, "a", "2026-06-30T01:00:00Z")
-        self._ins(2, 22.0, "b", "2026-06-30T02:00:00Z")
+        self._ins(1, 22.0, "a", _hours_ago(5))
+        self._ins(2, 22.0, "b", _hours_ago(4))
         mv = self.pc._fetch_line_movement(self.db, "points", "LeBron James")
         self.assertEqual(mv, [])
 

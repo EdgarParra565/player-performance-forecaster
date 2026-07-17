@@ -36,6 +36,13 @@ DEFAULT_DB_PATH = "data/database/nba_data.db"
 DEFAULT_STAT_TYPES = ["points", "assists", "rebounds", "pra"]
 DEFAULT_ROLLING_WINDOW = 10
 DEFAULT_N_GAMES = 120
+DEFAULT_TEAM_PRIOR_ALPHA = 0.3
+
+# Stats the rolling-history projection can model (``add_rolling_stats`` only
+# emits rolling means for these). For anything else ``_project_stat_from_history``
+# falls back to a degenerate mu=0, so callers that need a trustworthy full-model
+# projection (Edge Scanner "full" mode) should treat other stats as unfittable.
+PROJECTABLE_STATS = ("points", "assists", "rebounds", "pra")
 
 
 @dataclass
@@ -134,15 +141,94 @@ def _build_player_history(
     rolling_window: int = DEFAULT_ROLLING_WINDOW,
     db_path: str = DEFAULT_DB_PATH,
 ) -> pd.Series:
-    """Return latest rolling stat row for a player."""
+    """Return latest rolling stat row for a player (DataLoader-backed path)."""
     loader = DataLoader(db_path=db_path)
     df = loader.load_player_data(player_name=player_name, n_games=n_games)
-    df = add_rolling_stats(df, window=rolling_window)
-
-    latest = df.dropna(subset=["rolling_mean_minutes"])
-    if latest.empty:
+    latest = build_history_from_games(df, rolling_window=rolling_window)
+    if latest is None:
         raise ValueError(f"Insufficient data for {player_name}; no rolling window rows available.")
+    return latest
+
+
+def build_history_from_games(
+    games: pd.DataFrame,
+    rolling_window: int = DEFAULT_ROLLING_WINDOW,
+) -> Optional[pd.Series]:
+    """Latest rolling-stat row from a raw ``game_logs`` frame, or ``None``.
+
+    This is the tail of :func:`_build_player_history` factored out so the
+    DataLoader-backed CLI/hourly path and the DB-direct Edge Scanner "full"
+    path compute μ/σ from *identical* code. ``add_rolling_stats`` re-sorts by
+    date internally, so the input order (DESC from ``get_player_games`` or ASC)
+    yields the same newest-``window`` projection. Returns ``None`` when there
+    aren't enough games to fill the rolling window (mirrors the ``ValueError``
+    the CLI path raises)."""
+    if games is None or getattr(games, "empty", True):
+        return None
+    enriched = add_rolling_stats(games, window=rolling_window)
+    latest = enriched.dropna(subset=["rolling_mean_minutes"])
+    if latest.empty:
+        return None
     return latest.iloc[-1]
+
+
+def project_stat_moments(
+    latest: pd.Series,
+    stat_type: str,
+    *,
+    prior_inputs: Optional[dict] = None,
+    team_prior_alpha: float = DEFAULT_TEAM_PRIOR_ALPHA,
+) -> dict:
+    """Line-independent ``{mu, sigma, distribution}`` for one player+stat.
+
+    Single source of truth for the full-model projection: rolling μ/σ →
+    optional ``blend_team_prior`` (pace + implied team total) → per-stat default
+    distribution. Shared by the prop board, the hourly recompute, and Edge
+    Scanner "full" mode so the three paths can't drift. ``prior_inputs`` is the
+    dict returned by ``db.get_team_prior_inputs`` /
+    ``db.get_team_prior_inputs_map`` (or ``None`` to skip the blend)."""
+    stat_key = _normalize_stat_type(stat_type)
+    mu, sigma = _project_stat_from_history(latest, stat_type=stat_key)
+    if prior_inputs:
+        mu, sigma = blend_team_prior(
+            mu, sigma,
+            pace_factor=prior_inputs.get("pace_factor"),
+            implied_team_total=prior_inputs.get("implied_team_total"),
+            team_recent_avg_total=prior_inputs.get("team_recent_avg_total"),
+            alpha=float(team_prior_alpha),
+        )
+    return {
+        "mu": float(mu),
+        "sigma": float(sigma),
+        "distribution": get_default_distribution(stat_key),
+    }
+
+
+def project_prop_line(
+    latest: pd.Series,
+    stat_type: str,
+    line_value: float,
+    *,
+    prior_inputs: Optional[dict] = None,
+    rolling_window: int = DEFAULT_ROLLING_WINDOW,
+    team_prior_alpha: float = DEFAULT_TEAM_PRIOR_ALPHA,
+) -> dict:
+    """``project_stat_moments`` plus the over-probability at ``line_value``.
+
+    The distribution's ``sample_size`` is ``rolling_window`` (matches the prop
+    board's original ``prob_over_distribution`` call)."""
+    moments = project_stat_moments(
+        latest, stat_type,
+        prior_inputs=prior_inputs, team_prior_alpha=team_prior_alpha,
+    )
+    prob_over = prob_over_distribution(
+        line=float(line_value),
+        mu=moments["mu"],
+        sigma=moments["sigma"],
+        distribution=moments["distribution"],
+        sample_size=int(rolling_window),
+    )
+    return {**moments, "prob_over": float(prob_over)}
 
 
 def _project_stat_from_history(latest: pd.Series, stat_type: str) -> tuple[float, float]:
@@ -184,27 +270,20 @@ def _build_board_lines(
         if latest is None:
             continue
 
-        mu, sigma = _project_stat_from_history(latest, stat_type=stat_type)
         team_abbrev = str(row.get("team") or "").upper()
         prior_inputs = team_priors.get(team_abbrev)
-        if prior_inputs:
-            mu, sigma = blend_team_prior(
-                mu, sigma,
-                pace_factor=prior_inputs.get("pace_factor"),
-                implied_team_total=prior_inputs.get("implied_team_total"),
-                team_recent_avg_total=prior_inputs.get("team_recent_avg_total"),
-                alpha=float(team_prior_alpha),
-            )
         line_value = float(row["line_value"])
-        distribution = get_default_distribution(stat_type)
 
-        prob_over = prob_over_distribution(
-            line=line_value,
-            mu=mu,
-            sigma=sigma,
-            distribution=distribution,
-            sample_size=int(rolling_window),
+        projection = project_prop_line(
+            latest, stat_type, line_value,
+            prior_inputs=prior_inputs,
+            rolling_window=rolling_window,
+            team_prior_alpha=team_prior_alpha,
         )
+        mu = projection["mu"]
+        sigma = projection["sigma"]
+        distribution = projection["distribution"]
+        prob_over = projection["prob_over"]
 
         over_odds = int(row["over_odds"]) if pd.notna(row["over_odds"]) else None
         under_odds = int(row["under_odds"]) if pd.notna(row["under_odds"]) else None
