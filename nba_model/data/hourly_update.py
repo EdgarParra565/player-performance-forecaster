@@ -27,7 +27,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import logging
 import math
 import os
 import sys
@@ -44,7 +43,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-logger = logging.getLogger("nba_model.hourly_update")
+from nba_model.logging_utils import configure_logging as _configure_logging_shared
+from nba_model.logging_utils import get_logger
+
+logger = get_logger("nba_model.hourly_update")
 
 DEFAULT_DB_PATH = "data/database/nba_data.db"
 DEFAULT_URLS_FILE = "data/config/web_text_urls.txt"
@@ -123,17 +125,13 @@ def _acquire_lock(lockfile: str):
 
 
 def _configure_logging(log_dir: str) -> str:
-    Path(log_dir).mkdir(parents=True, exist_ok=True)
-    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    log_path = Path(log_dir) / f"hourly_update_{ts}.log"
-    handlers = [logging.FileHandler(log_path), logging.StreamHandler(sys.stdout)]
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-        handlers=handlers,
-        force=True,
+    """Human console + JSON-lines file under ``log_dir`` as
+    ``hourly_update_<UTC ts>.log``. ``force=True`` because the hourly runner
+    owns its process and re-runs must not stack handlers."""
+    log_path = _configure_logging_shared(
+        file_prefix="hourly_update", log_dir=log_dir, force=True,
     )
-    return str(log_path)
+    return str(log_path or "")
 
 
 def _write_report(report: dict, report_dir: str) -> str:
@@ -150,20 +148,29 @@ def _record_step(report: dict, name: str, fn, *args, **kwargs) -> bool:
     started = time.monotonic()
     try:
         result = fn(*args, **kwargs)
+        duration_ms = int((time.monotonic() - started) * 1000)
         report["steps"][name] = {
             "ok": True,
-            "duration_s": round(time.monotonic() - started, 2),
+            "duration_s": round(duration_ms / 1000, 2),
             "result": result,
         }
+        logger.info(
+            "step complete",
+            extra={"step": name, "status": "ok", "duration_ms": duration_ms},
+        )
         return True
     except Exception as exc:  # noqa: BLE001 — surfacing every step failure
+        duration_ms = int((time.monotonic() - started) * 1000)
         report["steps"][name] = {
             "ok": False,
-            "duration_s": round(time.monotonic() - started, 2),
+            "duration_s": round(duration_ms / 1000, 2),
             "error": str(exc),
             "traceback": traceback.format_exc(),
         }
-        logger.error("step '%s' failed: %s", name, exc)
+        logger.error(
+            "step '%s' failed: %s", name, exc,
+            extra={"step": name, "status": "failed", "duration_ms": duration_ms},
+        )
         report["failed_steps"].append(name)
         return False
 

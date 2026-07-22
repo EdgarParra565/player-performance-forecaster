@@ -18,7 +18,6 @@ CLI:
 from __future__ import annotations
 
 import argparse
-import logging
 import time
 from datetime import datetime, timezone
 from typing import Iterable, Optional
@@ -27,8 +26,9 @@ import pandas as pd
 from nba_api.stats.endpoints import leaguegamefinder, playergamelogs
 
 from nba_model.data.database.db_manager import DatabaseManager
+from nba_model.logging_utils import configure_logging, get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 DEFAULT_SEASONS = ("2025-26", "2024-25", "2023-24")
 DEFAULT_SEASON_TYPES = ("Regular Season", "Playoffs")
@@ -294,11 +294,18 @@ def main():
         help="Only ingest games (faster; useful for quick refreshes).",
     )
     args = parser.parse_args()
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    configure_logging()
     summary = ingest_all(
         seasons=args.seasons,
         db_path=args.db_path,
         skip_player_logs=args.skip_player_logs,
+    )
+    logger.info(
+        "ingest complete",
+        extra={"seasons": list(args.seasons),
+               "games_seasons": len(summary.get("games", {}).get("seasons", [])),
+               "player_logs_skipped": bool(
+                   summary.get("player_logs", {}).get("skipped"))},
     )
     print("Ingest summary:")
     print(f"  games:")

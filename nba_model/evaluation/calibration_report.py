@@ -23,6 +23,9 @@ import numpy as np
 import pandas as pd
 
 from nba_model.data.database.db_manager import DatabaseManager
+from nba_model.logging_utils import configure_logging, get_logger
+
+logger = get_logger(__name__)
 
 ARTIFACT_DIR = Path("nba_model/evaluation/artifacts")
 
@@ -234,9 +237,15 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Optional[list[str]] = None) -> int:
     args = _build_parser().parse_args(argv)
+    configure_logging()
     result = run_calibration_report(
         db_path=args.db_path, source=args.source, n_buckets=args.n_buckets,
         output_prefix=args.output_prefix, artifact_dir=args.artifact_dir,
+    )
+    logger.info(
+        "calibration report complete",
+        extra={"source": args.source, "n_buckets": int(args.n_buckets),
+               "result_keys": sorted(result.keys())},
     )
     print("Calibration report:")
     for key, value in result.items():

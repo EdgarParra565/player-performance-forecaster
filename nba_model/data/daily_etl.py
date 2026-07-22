@@ -46,8 +46,10 @@ from nba_model.model.web_text_ingestion import (
     login_and_save_session,
     validate_session,
 )
+from nba_model.logging_utils import configure_logging as _configure_logging
+from nba_model.logging_utils import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 DEFAULT_DB_PATH = "data/database/nba_data.db"
 DEFAULT_REPORT_DIR = "nba_model/data/artifacts"
@@ -189,29 +191,22 @@ def _record_odds_poll_run(
 
 def configure_logging(log_dir: str = DEFAULT_LOG_DIR, level: int = logging.INFO) -> str:
     """
-    Configure basic ETL logging to console + file and return log file path.
-    Safe to call multiple times; only the first call configures handlers.
+    Configure ETL logging (human console + JSON-lines file) and return the log
+    file path. Safe to call multiple times; only the first call configures
+    handlers (returns ``""`` thereafter, unchanged from the pre-migration
+    contract). The JSON-lines file still lands under ``log_dir`` as
+    ``daily_etl_<UTC ts>.log``.
     """
     if logging.getLogger().handlers:
         # Assume logging already configured by caller (tests or application).
         return ""
 
-    output_dir = Path(log_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    log_path = output_dir / f"daily_etl_{ts}.log"
-
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
-        handlers=[
-            logging.StreamHandler(),
-            logging.FileHandler(log_path, encoding="utf-8"),
-        ],
+    log_path = _configure_logging(
+        file_prefix="daily_etl", log_dir=log_dir, level=level,
     )
     logger.info("Daily ETL logging initialized",
                 extra={"log_path": str(log_path)})
-    return str(log_path)
+    return str(log_path or "")
 
 
 def _default_nba_season(reference_time: Optional[datetime] = None) -> str:
@@ -254,6 +249,11 @@ def run_with_retry(
         try:
             result = func() or {}
             elapsed_ms = int((time.perf_counter() - started) * 1000)
+            logger.info(
+                "step complete",
+                extra={"step": step_name, "status": "success",
+                       "attempts": attempt, "duration_ms": elapsed_ms},
+            )
             return {
                 "status": "success",
                 "step": step_name,
@@ -278,6 +278,11 @@ def run_with_retry(
                 time.sleep(delay)
 
     elapsed_ms = int((time.perf_counter() - started) * 1000)
+    logger.error(
+        "step failed",
+        extra={"step": step_name, "status": "failed",
+               "attempts": attempt, "duration_ms": elapsed_ms},
+    )
     return {
         "status": "failed",
         "step": step_name,
@@ -1161,6 +1166,19 @@ def run_daily_etl(
     if write_report:
         report["report_path"] = _write_report(report, report_dir=report_dir)
 
+    logger.info(
+        "daily ETL finished",
+        extra={
+            "status": overall_status,
+            "duration_ms": total_elapsed_ms,
+            "season": season,
+            "players_selected": len(selected_players),
+            "step_statuses": {
+                name: payload.get("status") for name, payload in steps.items()
+            },
+            "alert_severity": report["alert"].get("severity"),
+        },
+    )
     return report
 
 

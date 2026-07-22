@@ -235,6 +235,12 @@ class DailyETLTests(unittest.TestCase):
         self.assertEqual(report["player_selection_summary"]["explicit_count"], 1)
         self.assertEqual(report["player_selection_summary"]["db_count"], 0)
 
+        # Report/alert contract must survive the structured-logging migration:
+        # the embedded `alert` marker is still present and well-shaped.
+        self.assertIn("alert", report)
+        self.assertFalse(report["alert"]["alert"])  # clean run → no alert
+        self.assertEqual(report["alert"]["severity"], "ok")
+
         loader.load_player_data.assert_called_once_with(
             player_name="LeBron James",
             n_games=120,

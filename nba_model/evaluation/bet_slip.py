@@ -29,9 +29,12 @@ from typing import Optional, Sequence
 import pandas as pd
 
 from nba_model.data.database.db_manager import DatabaseManager
+from nba_model.logging_utils import configure_logging, get_logger
 from nba_model.model import edge_scanner as es
 from nba_model.model.odds import american_to_implied_prob
 from nba_model.visualization.player_charts import kelly_stake
+
+logger = get_logger(__name__)
 
 ARTIFACT_DIR = Path("nba_model/evaluation/artifacts")
 
@@ -258,6 +261,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = _build_parser().parse_args(argv)
+    configure_logging()
     summary = generate_bet_slip(
         db_path=args.db_path, books=args.books, stat_types=args.stat_types,
         since_hours=args.since_hours, n_games=args.n_games,
@@ -268,6 +272,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         dry_run=args.dry_run,
     )
     slip = summary["slip"]
+    logger.info(
+        "bet slip generated",
+        extra={"game_date": summary["game_date"], "picks": int(len(slip)),
+               "dry_run": bool(summary["dry_run"]),
+               "bet_log_inserted": int(summary.get("bet_log_inserted") or 0)},
+    )
     if slip.empty:
         print(f"No picks cleared the gates for {summary['game_date']}.")
         return 0

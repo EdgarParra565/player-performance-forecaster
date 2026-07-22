@@ -30,6 +30,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Optional, Sequence
 
+from nba_model.logging_utils import configure_logging, get_logger
+
+logger = get_logger(__name__)
+
 DEFAULT_DB_PATH = "data/database/nba_data.db"
 DEFAULT_BACKUP_DIR = "data/database/backups"
 DEFAULT_BRANCH = "main"
@@ -245,6 +249,11 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = _parse_args(argv)
+    configure_logging()
+    # Route the human progress lines (row counts, commit/push status — what the
+    # launchd log greps) through the structured logger so they also land as
+    # JSON when a file handler is configured, while ``run_publish`` keeps its
+    # injectable ``log`` contract for direct callers/tests.
     report = run_publish(
         db_path=args.db,
         branch=args.branch,
@@ -253,6 +262,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         repo_root=args.repo_root,
         dry_run=args.dry_run,
         message=args.message,
+        log=logger.info,
+    )
+    logger.info(
+        "publish complete",
+        extra={"exit_code": int(report["exit_code"]),
+               "committed": bool(report.get("committed")),
+               "pushed": bool(report.get("pushed")),
+               "dry_run": bool(report.get("dry_run")),
+               "row_counts": report.get("row_counts", {})},
     )
     return int(report["exit_code"])
 
