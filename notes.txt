@@ -5,7 +5,7 @@ Last updated: 2026-07-21
 Active tracker only: architecture, what's done, what's next. CLI runbooks,
 deployment, and security live in **README.md** and **docs/** — not duplicated here.
 
-Test baseline: **672 passing** (`.venv/bin/python3 -m pytest nba_model/tests -q`;
+Test baseline: **697 passing** (`.venv/bin/python3 -m pytest nba_model/tests -q`;
 Windows: `.venv\Scripts\python.exe -m pytest nba_model/tests -q`).
 
 ---
