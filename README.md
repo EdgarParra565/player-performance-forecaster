@@ -614,6 +614,15 @@ authenticated content), and optional parser hooks.
 
 **Stub-only (config without parser yet):** fliff, sleeper, dabble, fanduel, betrivers, fanatics, espnbet, hardrockbet, oddsshark, bettingpros. Their fetch path runs and stores snapshots; add a parser by implementing `prop_preprocess` (DFS shape) or `team_line_extractor` (sportsbook shape) in their `nba_model/scrapers/<book>.py` once an authenticated NBA-page sample is on disk.
 
+**Fetch-path / blocker status (2026-07-21 live probe, NBA offseason):**
+- **espnbet → theScore Bet** — ESPN BET rebranded; scraper now targets `sportsbook.thescore.bet` (`espnbet.com` alias). Loads cleanly over CDP (old ENV/cert blocker cleared); offseason shows NBA *futures* only, so the `team_line_extractor` awaits an in-season game capture.
+- **DraftKings** — CLI now forwards `--chrome-debug-port` and DK opts into the generic `scroll_page` flag; NBA board is offseason-empty (0 game lines) so the extractor still awaits an in-season capture.
+- **Fliff** — board renders in an emulator iframe; a `js_extractor` (`scrapers/fliff.py:extract_iframe_text`) now reaches it (parent frame is marketing only). Domain updated to `getfliff.com` (+`fliff.com` alias). NBA offseason-empty ⇒ `prop_preprocess` pending an in-season capture.
+- **Fanatics** — marketing-only on the web (real board is app-gated); blocked-with-proof.
+- **BettingPros** — NBA odds/props pages are Premium/JS-gated and server-side-thin; blocked-with-proof.
+- **OddsShark** — `/nba/computer-picks` is model projections, not real book odds; out of scope for the odds tables.
+- **sleeper / dabble / hardrockbet** — mobile-app-only (hardrockbet also 21+ account-gated); marked blocked, stub configs kept.
+
 **End-to-end flow (single book):**
 ```bash
 # 1. Snapshot via real Chrome on :9222 (after manual login in that Chrome window)

@@ -29,6 +29,10 @@ https://pick6.draftkings.com/?sport=NBA
 # ParlayPlay NBA player props
 https://parlayplay.io/
 
+# Fliff social sportsbook — board renders in an emulator iframe reached by the
+# fliff js_extractor (NBA empty in the offseason; parser pending in-season).
+https://sports.getfliff.com/#/sports?channelId=-333
+
 # --- Team lines (sportsbooks / markets) ---
 
 # BetMGM NBA (state subdomain may vary; this is the canonical landing)

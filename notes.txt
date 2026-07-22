@@ -134,11 +134,15 @@ Re-run fetch→parse when blocker clears. NBA **offseason** = empty lobbies, not
 | **AUTH** | BetRivers NBA — re-login in `:9222` Chrome; validate parser on live capture. |
 | ~~**ENV** ESPNBet~~ **CLEARED (2026-07-21)** | Rebranded **theScore Bet** (`sportsbook.thescore.bet`; `espnbet.com` kept as alias, book name stays `espnbet`). Loads cleanly over CDP — no cert/ENV error. NBA offseason renders FUTURES only (no game lines); team_line_extractor awaits in-season game capture. |
 | **RENDER** DraftKings | Fetch path fixed (2026-07-21): CLI now forwards `--chrome-debug-port`; generic `scroll_page` flag enabled on DK. NBA board offseason-empty (popular = MLB/WNBA/UFC), so 0 game lines — real capture stored as proof; extractor awaits in-season capture. |
-| **SEASON** | PrizePicks, Underdog, Pick6, ParlayPlay, DK/BetMGM/Caesars/Bovada/Kalshi/FanDuel NBA — re-check at preseason. |
+| **IFRAME** Fliff | Fetch path fixed (2026-07-21): board renders in an emulator iframe — `scrapers/fliff.py:extract_iframe_text` js_extractor reaches it (parent = marketing only); domain now `getfliff.com` (+`fliff.com` alias). Live capture = 5942 chars of real board (In Play/MLB slate). NBA offseason-empty ⇒ `prop_preprocess` (PP-style More/Less) pending an in-season NBA capture. |
+| **MOBILE-ONLY** Fanatics | betfanatics.com/sportsbook is marketing-only on the web (Download-App / promo banners, 0 line tokens) — real board is app-gated. Live-probed 2026-07-21. Blocked-with-proof; stub kept. |
+| **GATED/THIN** BettingPros | `/nba/odds/` + `/nba/odds/player-props/` render nav + a Premium/"Upgrade" wall; the grid is JS/subscription-gated and server-side-thin (2.5KB, stale cached date). Blocked-with-proof; stub kept. |
+| **PROJECTIONS** OddsShark | `/nba/computer-picks` is model predictions (computer picks / predicted scores), not real book line/odds — out of scope for `betting_lines`/`web_*`. Stub kept, documented. |
+| **MOBILE-ONLY (target-7)** | Sleeper (picks are app-only, not on web), Dabble (app-only), HardRockBet (account requires 21+). Marked blocked; stub configs kept. Revisit HardRockBet later. |
 | **Parser TODO** | MLB player props (per-game pages); MLB team-line live pairing edge case; park factors. |
 | **DONE (2026-07-21)** | **VegasInsider** — cross-book odds grid parser (`scrapers/vegasinsider.py:extract_odds_rows`) + `data/vegasinsider_odds_ingestion.py` → **real 11-book American odds into `betting_lines`** (`source='vegasinsider'`, over-only). 462 rows landed from the stored 2026-05-08 snapshot. First real-odds feed for `--use-market-lines` / cross-book line shopping. |
 
-10 of 20 scrapers still stub-only (no parser).
+10 of 20 scrapers still stub-only (VegasInsider now parses real odds; theScore/DK/Fliff fetch paths fixed but NBA-offseason-empty).
 
 ---
 
