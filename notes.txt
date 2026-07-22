@@ -1,11 +1,11 @@
 # NBA Player Performance Forecaster - Working Notes
 
-Last updated: 2026-07-21
+Last updated: 2026-07-22
 
 Active tracker only: architecture, what's done, what's next. CLI runbooks,
 deployment, and security live in **README.md** and **docs/** — not duplicated here.
 
-Test baseline: **697 passing** (`.venv/bin/python3 -m pytest nba_model/tests -q`;
+Test baseline: **702 passing** (`.venv/bin/python3 -m pytest nba_model/tests -q`;
 Windows: `.venv\Scripts\python.exe -m pytest nba_model/tests -q`).
 
 ---
@@ -192,8 +192,8 @@ Re-run fetch→parse when blocker clears. NBA **offseason** = empty lobbies, not
 |---------|----------------|
 | **AUTH** | BetRivers NBA — re-login in `:9222` Chrome; validate parser on live capture. |
 | ~~**ENV** ESPNBet~~ **CLEARED (2026-07-21)** | Rebranded **theScore Bet** (`sportsbook.thescore.bet`; `espnbet.com` kept as alias, book name stays `espnbet`). Loads cleanly over CDP — no cert/ENV error. NBA offseason renders FUTURES only (no game lines); team_line_extractor awaits in-season game capture. |
-| **RENDER** DraftKings | Fetch path fixed (2026-07-21): CLI now forwards `--chrome-debug-port`; generic `scroll_page` flag enabled on DK. NBA board offseason-empty (popular = MLB/WNBA/UFC), so 0 game lines — real capture stored as proof; extractor awaits in-season capture. |
-| **IFRAME** Fliff | Fetch path fixed (2026-07-21): board renders in an emulator iframe — `scrapers/fliff.py:extract_iframe_text` js_extractor reaches it (parent = marketing only); domain now `getfliff.com` (+`fliff.com` alias). Live capture = 5942 chars of real board (In Play/MLB slate). NBA offseason-empty ⇒ `prop_preprocess` (PP-style More/Less) pending an in-season NBA capture. |
+| ~~**RENDER** DraftKings~~ **MLB LIVE-VERIFIED (2026-07-22)** | DK migrated its lobby grid to `event-cell` nodes — stale `sportsbook-outcome` selectors matched nothing so the fetcher skipped its content wait (nav-shell-only captures). Fixed: `event-cell` wait selector + `body.innerText` `js_extractor` (generic HTML-parse drops DK's virtualized grid). DK **MLB team lines now land 84 rows / 11 games** into `web_team_lines` (sport='mlb') via a new DK-order block regex (`extract_team_lines_dk`). DK NBA board is offseason-empty (futures only); its NBA extractor still awaits an in-season capture but its fetch is now robust (24.9KB fresh capture). |
+| **IFRAME** Fliff | Fetch path iframe-aware (`scrapers/fliff.py:extract_iframe_text`); domain `getfliff.com` (+`fliff.com` alias). Re-verified 2026-07-22: live capture = 3.3KB real board with a full **MLB/WNBA/MLS slate** — but the `channelId=-333` board shows **game moneylines**, not PP-style More/Less **player** props, so `prop_preprocess` still cannot be authored against real content. MECH-VERIFIED fetch only; parser deferred until a More/Less player board renders. |
 | **MOBILE-ONLY** Fanatics | betfanatics.com/sportsbook is marketing-only on the web (Download-App / promo banners, 0 line tokens) — real board is app-gated. Live-probed 2026-07-21. Blocked-with-proof; stub kept. |
 | **GATED/THIN** BettingPros | `/nba/odds/` + `/nba/odds/player-props/` render nav + a Premium/"Upgrade" wall; the grid is JS/subscription-gated and server-side-thin (2.5KB, stale cached date). Blocked-with-proof; stub kept. |
 | **PROJECTIONS** OddsShark | `/nba/computer-picks` is model predictions (computer picks / predicted scores), not real book line/odds — out of scope for `betting_lines`/`web_*`. Stub kept, documented. |
@@ -201,7 +201,50 @@ Re-run fetch→parse when blocker clears. NBA **offseason** = empty lobbies, not
 | **Parser TODO** | MLB player props (per-game pages); MLB team-line live pairing edge case; park factors. |
 | **DONE (2026-07-21)** | **VegasInsider** — cross-book odds grid parser (`scrapers/vegasinsider.py:extract_odds_rows`) + `data/vegasinsider_odds_ingestion.py` → **real 11-book American odds into `betting_lines`** (`source='vegasinsider'`, over-only). 462 rows landed from the stored 2026-05-08 snapshot. First real-odds feed for `--use-market-lines` / cross-book line shopping. |
 
-10 of 20 scrapers still stub-only (VegasInsider now parses real odds; theScore/DK/Fliff fetch paths fixed but NBA-offseason-empty).
+10 of 20 scrapers still stub-only (VegasInsider parses real odds; DK MLB team
+lines now LIVE; theScore/Fliff/DK-NBA fetch paths fixed but NBA-offseason-empty).
+
+---
+
+## Parser verification matrix (2026-07-22)
+
+Full end-to-end sweep of every parser-bearing scraper: fresh CDP fetch today →
+snapshot stored → parser → rows in the right table. NBA is offseason (empty
+boards ⇒ MECH not a bug); MLB is in-season (live rows). Verdicts:
+**LIVE** = fresh fetch parsed >0 rows into the live DB today;
+**MECH** = fresh fetch OK + session classified correctly + parser proven on the
+best stored snapshot/fixture (only live NBA content missing);
+**BLOCKED** = external blocker, recorded with proof.
+
+| Book (sport) | Verdict | Fresh fetch today (chars / session) | Parser proof | DB insert proof | Fixed this pass |
+|---|---|---|---|---|---|
+| fanduel (mlb) | **LIVE** | 9,899 / content (not walled) | 84 rows / 14 games from today's snapshot | +84 → `web_team_lines` sport='mlb' (168→252); re-parse +0 (dedupe) | — |
+| draftkings (mlb) | **LIVE** | 12,881 / content (grid rendered) | 84 rows / 11 games from today's snapshot | +84 → `web_team_lines` sport='mlb' (0→84); re-parse +0 (dedupe) | **YES** — `event-cell` wait selector + `body.innerText` js_extractor (grid render) + DK-order block regex `extract_team_lines_dk` + adjacency-collapse team pairing |
+| vegasinsider | **MECH** | 15,317 / real page, grid offseason-empty (0 parsed) | 495 parsed → 462 resolved from 2026-05-08 snapshot | 462 rows `betting_lines` source='vegasinsider', 11 books ×42, plausibility 0-rejected, re-ingest 0-inserted / 462-dup | — |
+| prizepicks | **MECH** | 801 / sign-in page, session expired (2/4 markers) — classified correctly | 20 cards (best stored board snapshots) | live `web_prop_cards` has 93 pp rows | — |
+| underdog | **MECH** | 2,632 / lobby, offseason-empty (2/3 markers) | 105 cards (best stored snapshots; 2 filter snaps login-walled + skipped) | live `web_prop_cards` has 351 ud rows | — |
+| pick6 | **MECH** | 988 / login-wall (correctly detected) | 23 cards each from sid 74 & 91 | live `web_prop_cards` has 46 p6 rows | — |
+| parlayplay | **MECH** | 5,959 / lobby, offseason-empty (3/4 markers) | 12 cards (stored snapshot) | live `web_prop_cards` has 12 pp rows | — |
+| betmgm | **MECH** | 6,997 / board nav, 0 games (offseason) | 24 rows from sid 37 (ma.betmgm.com) | live `web_team_lines` has 180 betmgm rows | — |
+| caesars | **MECH** | 11,286 / board nav, 0 games | 24 rows from sid 31 | live `web_team_lines` has 192 caesars rows | — |
+| draftkings (nba) | **MECH** | 24,891 / board nav, 0 games (fetch now robust) | 24 rows from sid 39 | live `web_team_lines` has 168 dk rows | (benefits from DK fetch fix above) |
+| bovada | **MECH** | 3,105 / casino redirect (geo), 0 auth markers — classified correctly | 24 rows from sid 84 | live `web_team_lines` has 24 bovada rows | — |
+| kalshi | **MECH** | 5,228 / login-wall (detected) | 18 moneyline rows from sid 41 | live `web_team_lines` has 74 kalshi rows | — |
+| fanduel (nba) | **MECH** | 5,913 / futures only (2027 champ odds), 0 games | 6 rows from committed fixture | fixture-only (TODO real-capture stands) | — |
+| espnbet/theScore | **MECH** | 13,879 / loads clean, futures only, 0 games | 6 rows from committed fixture | fixture-only (TODO real-capture stands) | — |
+| betrivers | **BLOCKED (AUTH)** | 4,346 / **login-wall correctly detected** (1/4 markers) | 6 rows from committed fixture | login-walled — not counted as fetch proof | — (classification verified) |
+| fliff | **MECH (fetch only)** | 3,310 / real board, live MLB/WNBA/MLS slate (moneylines, no More/Less props) | n/a — no player-prop content to author `prop_preprocess` against | — | — |
+
+Full hourly-style pass (all 16 `web_text_urls.txt` URLs): **16/16 fetched, 0
+failed**; both parsers ran clean, 4 login-walled snapshots skipped, 0 new inserts
+(offseason ⇒ no line movement, change-only dedupe working). Loop verified
+unattended.
+
+Follow-ups surfaced (unchanged scope, recorded only): VegasInsider publishes an
+MLB player-props page (60KB, has MLB markets) but the NBA over-cell grid parser
+reads 0 rows there — different layout, not wired. DK NBA / theScore / FanDuel-NBA
+game-line extractors still await an in-season NBA capture. Fliff `prop_preprocess`
+awaits a More/Less player board.
 
 ---
 
@@ -250,3 +293,62 @@ real-data benchmarks used rolling mean as the line (model vs itself) — not boo
   `build_history_from_games` + `_persist_predictions` guard + `delete_nonfinite_predictions`
   cleanup). Below the valid-games floor a row is intentionally skipped, not projected.
 - **Do not use Edge Scanner / bet_slip picks for real money** until WS10 Phases 1–2 pass.
+
+---
+
+## New UI (flagship) — trading-terminal frontend
+
+A brand-new, standalone frontend that will become the flagship surface. It is
+**parallel** to Streamlit + Tk (both untouched, both still work). Backend work is
+**additive**: a new read-only `api/` package only — no changes to `nba_model/`.
+
+**Stack:** FastAPI (read-only) in `api/` + React/TypeScript/Vite/Tailwind v4 in
+`frontend/`, charts via Apache ECharts, data via TanStack Query through Vite's
+`/api` proxy. Run: `.venv/bin/python3 -m uvicorn api.main:app --port 8000` and
+(in `frontend/`) `npm run dev` → http://localhost:5173. See `frontend/README.md`.
+
+### Phase 1 — shipped (2026-07-22)
+
+- **`api/` read-only service** — wraps the SAME functions Streamlit uses
+  (`player_charts` fetchers, `edge_scanner.score_prop_edges`, `DatabaseManager`
+  consensus/KPI queries). No writes, no duplicated model logic. Inputs validated
+  through `nba_model/web/input_validation.py` (stat/team/season/n_games/
+  rolling/since_hours). Pydantic response models, `/api/health`, `Cache-Control`
+  headers (short max-age on data, no-store on health), `NBA_DB_PATH` override.
+  Endpoints: `/api/health`, `/api/meta`, `/api/slate/{kpis,recent-games,edges}`,
+  `/api/players/search`, `/api/players/{id}`. Any aggregate the data layer
+  didn't already expose (KPI counts, freshest-scrape ts, player search) is a
+  thin read-only helper in `api/services.py`, not a change to `nba_model`.
+- **Tests** — `api/tests/test_api.py`, 11 cases, httpx TestClient against a temp
+  DB seeded like the existing harnesses (active-players ref + game logs +
+  web_prop_cards + a games matchup). Kept OUT of `nba_model/tests` so the 697
+  baseline is untouched; run with `.venv/bin/python3 -m pytest api/tests -q`.
+- **`frontend/` design system** — tokens (near-black surfaces, electric-green
+  +EV / red -EV, mono tabular numerals) + components: StatCard, DataTable
+  (sticky header + click-sort), ProbabilityBar (break-even tick), OddsBadge,
+  LineSparkline, EmptyState, Delta, shared ECharts styling.
+- **3 views, verified rendering vs the live DB (screenshotted):**
+  1. Slate Dashboard — KPI row + top model edges (full mode) + recent-games strip.
+  2. Player Detail (flagship) — searchable picker, recent-N chart w/ rolling
+     mean + book-mean overlay, distribution + fitted normal + book-line markers,
+     per-book P(over)/edge/EV table, hit-rate bars.
+  3. Edge Scanner — dense sortable/filterable table, chart_mean|rolling|full
+     model modes matching the CLI.
+- Every view has a deliberate offseason empty-state showing "last data / last
+  scrape" instead of a blank pane (LeBron detail renders fully from historical
+  logs; live-line surfaces are correctly empty until October).
+
+### Phase 2 / 3 backlog
+
+- [ ] **Cross-book view** — wire `cross_book_arb` (line shopping / middles /
+      true-arb) into a dedicated view, mirroring the Streamlit Cross-book layer.
+- [ ] **Parlay builder** — multi-leg SGP with correlation, on top of the
+      existing parlay model helpers.
+- [ ] **Line-movement animations** — animate `betting_line_snapshots` drift per
+      book (the data + Streamlit "Line Movement" tab already exist).
+- [ ] **Code-split ECharts** — bundle is ~1.4 MB; lazy-load charts / manualChunks.
+- [ ] **Auth + deploy story** — Phase 1 is local-only, no auth. Phase 3: reuse
+      the existing OIDC/Stripe tier model, add a deploy target (the API is
+      stateless + read-only, so it fronts the same published DB the cloud app uses).
+- [ ] **Frontend tests** — component/e2e once the surface stabilizes (not required
+      in Phase 1).
