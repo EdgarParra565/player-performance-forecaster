@@ -45,3 +45,10 @@ https://www.bovada.lv/sports/basketball/nba
 
 # Kalshi NBA markets
 https://kalshi.com/markets/nba
+
+# --- Public aggregators (real cross-book odds → betting_lines) ---
+
+# VegasInsider NBA player-prop odds grid (~11 books' real American odds).
+# Parsed by scrapers/vegasinsider.py + data/vegasinsider_odds_ingestion.py.
+# In-season only; the board is empty in the offseason.
+https://www.vegasinsider.com/nba/odds/player-props/

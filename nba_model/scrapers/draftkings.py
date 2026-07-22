@@ -115,4 +115,8 @@ SCRAPER = BookScraper(
         min_authenticated_hits=4,
     ),
     team_line_extractor=extract_team_lines,
+    # DK renders its odds grid lazily as rows scroll into view — scroll to the
+    # bottom after load so the snapshot captures the full slate, not just the
+    # first viewport.
+    scroll_page=True,
 )

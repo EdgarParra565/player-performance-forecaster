@@ -887,6 +887,22 @@ def _scroll_page_for_lazy_content(page) -> None:
         pass
 
 
+# Domains whose SPA has always been scrolled for lazy content, kept so the
+# behavior is unchanged for them even though they don't set ``scroll_page``.
+_ALWAYS_SCROLL_DOMAINS = frozenset({"prizepicks.com", "underdogfantasy.com"})
+
+
+def _should_scroll_for_lazy_content(scraper, book_domain: Optional[str]) -> bool:
+    """Whether to scroll the page to trigger lazy-loaded content.
+
+    True when the matched book opts in via ``scroll_page`` OR its domain is one
+    of the legacy always-scroll SPAs. Pure/testable so the per-book scroll
+    contract can be verified without a browser."""
+    if scraper is not None and getattr(scraper, "scroll_page", False):
+        return True
+    return book_domain in _ALWAYS_SCROLL_DOMAINS
+
+
 def _detect_login_wall_early(page, url: str) -> bool:
     """
     Quick check whether the page already shows a login wall.
@@ -948,8 +964,9 @@ def _wait_for_dynamic_content(page, url: str, base_wait_seconds: float) -> None:
     if total_wait > 0:
         page.wait_for_timeout(int(total_wait * 1000))
 
-    # Scroll to trigger lazy-loaded content (SPAs like PrizePicks render cards on scroll).
-    if book_domain in {"prizepicks.com", "underdogfantasy.com"}:
+    # Scroll to trigger lazy-loaded content (SPAs like PrizePicks render cards
+    # on scroll; sportsbook grids like DraftKings opt in via ``scroll_page``).
+    if _should_scroll_for_lazy_content(scraper, book_domain):
         _scroll_page_for_lazy_content(page)
         try:
             page.wait_for_timeout(1500)
@@ -1635,6 +1652,7 @@ def main():
             user_agent=args.user_agent,
             browser_auth_state_file=args.browser_auth_state_file,
             browser_user_data_dir=args.browser_user_data_dir,
+            chrome_debug_port=args.chrome_debug_port,
         )
 
         print("Web text ingestion summary:")

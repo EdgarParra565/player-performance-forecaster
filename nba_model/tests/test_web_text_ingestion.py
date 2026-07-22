@@ -7,14 +7,18 @@ from unittest.mock import MagicMock, patch
 
 from nba_model.data.database.db_manager import DatabaseManager
 from nba_model.model.web_text_ingestion import (
+    _build_parser,
     _check_session_content,
     _detect_login_wall_early,
     _match_book_domain,
+    _should_scroll_for_lazy_content,
     fetch_and_store_web_text,
     load_urls_from_file,
     sync_active_nba_players_reference,
     validate_session,
 )
+from nba_model.scrapers import get_scraper_for_url
+from nba_model.scrapers.base import BookScraper
 
 
 class WebTextIngestionTests(unittest.TestCase):
@@ -146,6 +150,59 @@ class WebTextIngestionTests(unittest.TestCase):
         self.assertEqual(rows, [("https://example.com/browser-page", "Rendered browser text")])
         mock_browser_fetch.assert_called_once()
         mock_get.assert_not_called()
+
+
+class ScrollAndCdpPlumbingTests(unittest.TestCase):
+    """Per-book scroll contract + CLI chrome_debug_port → CDP routing."""
+
+    def test_scroll_opt_in_flag_defaults_false(self):
+        s = BookScraper(name="x", domain="x.com")
+        self.assertFalse(s.scroll_page)
+
+    def test_scroll_honored_when_book_opts_in(self):
+        s = BookScraper(name="x", domain="x.com", scroll_page=True)
+        self.assertTrue(_should_scroll_for_lazy_content(s, "x.com"))
+
+    def test_scroll_skipped_for_non_opted_book(self):
+        s = BookScraper(name="x", domain="x.com")
+        self.assertFalse(_should_scroll_for_lazy_content(s, "x.com"))
+
+    def test_legacy_domains_still_scroll_without_flag(self):
+        self.assertTrue(_should_scroll_for_lazy_content(None, "prizepicks.com"))
+        self.assertTrue(_should_scroll_for_lazy_content(None, "underdogfantasy.com"))
+
+    def test_draftkings_config_opts_into_scroll(self):
+        dk = get_scraper_for_url("https://sportsbook.draftkings.com/leagues/basketball/nba")
+        self.assertIsNotNone(dk)
+        self.assertTrue(dk.scroll_page)
+
+    @patch("nba_model.model.web_text_ingestion.requests.get")
+    @patch("nba_model.model.web_text_ingestion._fetch_url_text_via_cdp")
+    def test_chrome_debug_port_routes_through_cdp(self, mock_cdp, mock_get):
+        # Passing chrome_debug_port must select the CDP fetch path (real Chrome),
+        # NOT the plain requests path — the whole point of --chrome-debug-port.
+        mock_cdp.return_value = {
+            "source_url": "https://sportsbook.draftkings.com/leagues/basketball/nba",
+            "fetched_at_utc": "2026-07-21T00:00:00+00:00",
+            "http_status": 200, "content_type": None,
+            "text_content": "grid", "text_length": 4, "content_sha256": "z",
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = str(Path(tmpdir) / "nba_data.db")
+            summary = fetch_and_store_web_text(
+                urls=["https://sportsbook.draftkings.com/leagues/basketball/nba"],
+                db_path=db_path, min_hours_between_polls=None, force_poll=True,
+                request_retries=0, chrome_debug_port=9222,
+            )
+        self.assertEqual(summary["fetch_mode"], "browser")
+        self.assertEqual(summary["fetched_count"], 1)
+        mock_cdp.assert_called_once()
+        mock_get.assert_not_called()
+
+    def test_cli_parser_exposes_chrome_debug_port(self):
+        args = _build_parser().parse_args(
+            ["--urls", "https://x.com", "--chrome-debug-port", "9222"])
+        self.assertEqual(args.chrome_debug_port, 9222)
 
     def test_load_urls_from_file_ignores_comments_and_blanks(self):
         with tempfile.TemporaryDirectory() as tmpdir:

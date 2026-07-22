@@ -74,6 +74,11 @@ class BookScraper:
     team_line_extractor: Optional[TeamLineExtractor] = None
     # Extra domains that resolve to this book (rebrands, regional variants).
     aliases: tuple[str, ...] = ()
+    # Opt-in: scroll the page to the bottom after load to trigger lazy-rendered
+    # content (sportsbook grids like DraftKings render rows only as they scroll
+    # into view). Generic — the fetcher honors it for any book, so enabling it
+    # here never affects other books' capture.
+    scroll_page: bool = False
 
     def matches_host(self, host: str) -> bool:
         """Return True when ``host`` equals or is a subdomain of any known domain."""
