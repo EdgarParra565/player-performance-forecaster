@@ -1,7 +1,10 @@
-"""ESPN BET sportsbook scraper config + team-line extractor.
+"""theScore Bet (formerly ESPN BET) sportsbook scraper config + team-line extractor.
 
-Penn-owned sportsbook with ESPN branding; the NBA lobby groups spread /
-total / moneyline per game much like BetMGM. Teams render as
+Penn-owned sportsbook. ESPN BET rebranded to **theScore Bet** in 2025; the
+book lives at ``sportsbook.thescore.bet`` now (``espnbet.com`` kept as an alias
+so old snapshots/URLs still resolve). The canonical book name stays
+``espnbet`` so cross-book consensus keys don't churn. The NBA lobby groups
+spread / total / moneyline per game much like BetMGM. Teams render as
 "<abbrev> <Team>" (e.g. "NY Knicks"). Representative visible-text shape:
 
     "NY Knicks at PHI 76ers +1.5 -110 -1.5 -110 O 213.5 -110 "
@@ -13,10 +16,13 @@ Token order per game:
     O <total> <over_odds> U <total> <under_odds>
     <away_ml> <home_ml>
 
-TODO(real-capture): this parser + its test fixture were authored WITHOUT a
-live authenticated ESPN BET snapshot. Capture one via the Chrome :9222 CDP
-host (`espnbet.com` basketball lobby) and re-validate the token order before
-trusting these rows in consensus.
+Blocker status (2026-07-21): the old "ESPNBet ENV/cert mismatch" blocker is
+CLEARED — ``https://sportsbook.thescore.bet/sport/basketball/organization/united-states/competition/nba``
+loads cleanly over the Chrome :9222 CDP path (no login, no cert error). But in
+the NBA offseason the page renders FUTURES only (championship/award odds), no
+game spread/total/moneyline, so the game-line token order below still awaits an
+in-season capture to pin against real games; the fixture test remains the
+baseline until then.
 """
 
 from __future__ import annotations
@@ -91,7 +97,9 @@ def extract_team_lines(text: str) -> list[dict]:
 
 SCRAPER = BookScraper(
     name="espnbet",
-    domain="espnbet.com",
+    domain="thescore.bet",
+    # Old ESPN BET domain kept so pre-rebrand snapshots/URLs still resolve.
+    aliases=("espnbet.com",),
     wait_selectors=(
         "[class*='market']",
         "[class*='outcome']",

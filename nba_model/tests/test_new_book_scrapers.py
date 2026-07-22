@@ -139,5 +139,25 @@ class NewBooksRoundTripTests(unittest.TestCase):
             self.assertIn(book, row["books"])
 
 
+class ThescoreRebrandResolutionTests(unittest.TestCase):
+    """ESPN BET → theScore Bet rebrand: new domain resolves, old still works."""
+
+    def test_thescore_domain_resolves_to_espnbet(self):
+        from nba_model.scrapers import get_scraper_for_url
+        s = get_scraper_for_url(
+            "https://sportsbook.thescore.bet/sport/basketball/"
+            "organization/united-states/competition/nba")
+        self.assertIsNotNone(s)
+        self.assertEqual(s.name, "espnbet")
+
+    def test_old_espnbet_domain_still_resolves(self):
+        from nba_model.scrapers import get_scraper_for_url
+        s = get_scraper_for_url(
+            "https://espnbet.com/sport/basketball/organization/"
+            "united-states/competition/nba")
+        self.assertIsNotNone(s)
+        self.assertEqual(s.name, "espnbet")
+
+
 if __name__ == "__main__":
     unittest.main()
