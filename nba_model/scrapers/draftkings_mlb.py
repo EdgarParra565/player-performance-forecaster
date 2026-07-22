@@ -23,7 +23,7 @@ from __future__ import annotations
 
 from nba_model.scrapers.base import BookScraper, SessionMarkers
 from nba_model.scrapers.mlb_props import preprocess_mlb_props
-from nba_model.scrapers.mlb_team_lines import extract_team_lines
+from nba_model.scrapers.mlb_team_lines import extract_team_lines_dk
 
 
 SCRAPER = BookScraper(
@@ -49,5 +49,5 @@ SCRAPER = BookScraper(
         min_authenticated_hits=4,
     ),
     prop_preprocess=preprocess_mlb_props,
-    team_line_extractor=extract_team_lines,
+    team_line_extractor=extract_team_lines_dk,
 )

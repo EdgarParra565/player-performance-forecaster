@@ -44,6 +44,23 @@ _GAME_RE = re.compile(
 )
 
 
+def extract_grid_text(page) -> str:
+    """Return the lobby grid's rendered text via ``body.innerText``.
+
+    DK renders its odds grid into virtualized nodes whose text the generic
+    HTML-parse extraction (``page.content()`` → visible text) drops — it
+    captures the nav/footer shell but not the game rows. ``body.innerText``
+    reflects the live rendered DOM (after the fetcher's scroll pass) and does
+    include the grid, so we supply it as a targeted extractor. Best-effort:
+    returns "" on failure so the generic result stands.
+    """
+    try:
+        text = page.evaluate("document.body ? document.body.innerText : ''")
+    except Exception:
+        return ""
+    return " ".join(str(text or "").split())
+
+
 def _normalize_minus_signs(text: str) -> str:
     """Map Unicode minus (U+2212) and en-dash (U+2013) to ASCII '-'."""
     return text.replace("−", "-").replace("–", "-")
@@ -90,13 +107,20 @@ def extract_team_lines(text: str) -> list[dict]:
 SCRAPER = BookScraper(
     name="draftkings",
     domain="draftkings.com",
+    # DK migrated its lobby grid to `event-cell`-classed nodes (live-probed
+    # 2026-07-22); the older `sportsbook-outcome`/`outcome-cell` selectors match
+    # nothing now, so the fetcher skipped the extra content wait and captured
+    # only the nav shell. `event-cell` is listed first so the selector wait
+    # fires and the lazy grid renders before we scroll.
     wait_selectors=(
+        "[class*='event-cell']",
         "[class*='sportsbook-outcome']",
         "[class*='player-prop']",
         "[class*='outcome-cell']",
         "[data-testid*='outcome']",
     ),
     extra_wait_seconds=4.0,
+    js_extractor=extract_grid_text,
     session_markers=SessionMarkers(
         login_wall=(
             "sign up",

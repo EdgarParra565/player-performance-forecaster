@@ -13,6 +13,19 @@ fixed, anchorable sequence:
 We anchor on that block, then pair it with the two nearest MLB team names that
 precede it (away first, home second). Captured live from FanDuel MLB on
 2026-06-28.
+
+DraftKings MLB renders the SAME six markets but in a different token order —
+the moneyline sits AFTER each side's over/under block rather than beside the
+run line:
+
+    <away_RL> <away_RL_odds>
+    O <total> <over_odds> <away_ML>
+    <home_RL> <home_RL_odds>
+    U <total> <under_odds> <home_ML>
+
+``extract_team_lines`` (FanDuel order) and ``extract_team_lines_dk`` (DK order)
+share the same team-pairing + row-building; only the anchored block regex
+differs. DK block captured live on 2026-07-22 via CDP.
 """
 
 from __future__ import annotations
@@ -25,12 +38,19 @@ _ODDS = r"[+\-]\d{2,4}"
 _RL = r"[+\-]\d+(?:\.\d+)?"   # run line (usually ±1.5, alt lines larger)
 _TOT = r"\d{1,2}(?:\.\d+)?"
 
-# The fixed per-game odds block (run line / total / moneyline).
+# The fixed per-game odds block (run line / total / moneyline) — FanDuel order.
 _BLOCK_RE = re.compile(
     rf"(?P<away_rl>{_RL})\s+(?P<away_rl_odds>{_ODDS})\s+(?P<away_ml>{_ODDS})\s+"
     rf"O\s+(?P<total>{_TOT})\s+(?P<over_odds>{_ODDS})\s+"
     rf"(?P<home_rl>{_RL})\s+(?P<home_rl_odds>{_ODDS})\s+(?P<home_ml>{_ODDS})\s+"
     rf"U\s+(?P<total2>{_TOT})\s+(?P<under_odds>{_ODDS})"
+)
+# DraftKings order: moneyline follows each over/under block (see module docstring).
+_DK_BLOCK_RE = re.compile(
+    rf"(?P<away_rl>{_RL})\s+(?P<away_rl_odds>{_ODDS})\s+"
+    rf"O\s+(?P<total>{_TOT})\s+(?P<over_odds>{_ODDS})\s+(?P<away_ml>{_ODDS})\s+"
+    rf"(?P<home_rl>{_RL})\s+(?P<home_rl_odds>{_ODDS})\s+"
+    rf"U\s+(?P<total2>{_TOT})\s+(?P<under_odds>{_ODDS})\s+(?P<home_ml>{_ODDS})"
 )
 _TEAM_RE = re.compile(MLB_TEAM_NAME_PATTERN)
 
@@ -44,7 +64,17 @@ def _normalize_minus_signs(text: str) -> str:
 
 
 def extract_team_lines(text: str) -> list[dict]:
-    """Return one record per (game, market, side) found in MLB lobby text."""
+    """Return one record per (game, market, side) — FanDuel MLB token order."""
+    return _extract_with_block(text, _BLOCK_RE)
+
+
+def extract_team_lines_dk(text: str) -> list[dict]:
+    """Return one record per (game, market, side) — DraftKings MLB token order."""
+    return _extract_with_block(text, _DK_BLOCK_RE)
+
+
+def _extract_with_block(text: str, block_re: "re.Pattern") -> list[dict]:
+    """Shared team-pairing + row-building over one book's anchored odds block."""
     text = _normalize_minus_signs(text or "")
     # All team-name occurrences with positions (canonical, start).
     team_hits = [
@@ -54,13 +84,21 @@ def extract_team_lines(text: str) -> list[dict]:
 
     out: list[dict] = []
     seen: set[tuple] = set()
-    for blk in _BLOCK_RE.finditer(text):
+    for blk in block_re.finditer(text):
         preceding = [t for t in team_hits if t[0] < blk.start()
                      and blk.start() - t[0] <= _MAX_TEAM_LOOKBACK]
-        if len(preceding) < 2:
+        # Books render a team as "<ABBREV> <Nickname>" (DK: "CLE Guardians"),
+        # so the abbrev and nickname both resolve to the same canonical name and
+        # land as adjacent duplicate hits. Collapse consecutive duplicates so the
+        # last two DISTINCT names are the real away/home pair, not one team twice.
+        names: list[str] = []
+        for _pos, name in preceding:
+            if not names or names[-1] != name:
+                names.append(name)
+        if len(names) < 2:
             continue
-        away = preceding[-2][1]
-        home = preceding[-1][1]
+        away = names[-2]
+        home = names[-1]
         if not away or not home or away == home:
             continue
         game_key = (away, home, blk.start())
