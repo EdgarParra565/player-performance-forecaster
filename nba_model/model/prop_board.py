@@ -44,6 +44,19 @@ DEFAULT_TEAM_PRIOR_ALPHA = 0.3
 # projection (Edge Scanner "full" mode) should treat other stats as unfittable.
 PROJECTABLE_STATS = ("points", "assists", "rebounds", "pra")
 
+# NULL/NaN stat values inside the rolling window make pandas' rolling mean/std
+# NaN (``add_rolling_stats`` uses ``min_periods == window``, so one missing box
+# score in the trailing window drops the valid-observation count below the
+# threshold and voids the aggregate). Rather than let a single missing game
+# blank out an otherwise-usable projection, ``build_history_from_games``
+# recomputes μ/σ over the trailing window *excluding* the NULLs — available-case
+# analysis — as long as at least this fraction of the window survives. Below it
+# the window is too thin to trust, so μ/σ stays NaN and the row is skipped
+# downstream (Edge Scanner full mode and the hourly recompute both drop
+# non-finite rows). The floor is also clamped to a minimum of 2 valid games so a
+# sample standard deviation is always defined.
+MIN_VALID_WINDOW_FRACTION = 0.5
+
 
 @dataclass
 class BoardLine:
@@ -162,14 +175,56 @@ def build_history_from_games(
     date internally, so the input order (DESC from ``get_player_games`` or ASC)
     yields the same newest-``window`` projection. Returns ``None`` when there
     aren't enough games to fill the rolling window (mirrors the ``ValueError``
-    the CLI path raises)."""
+    the CLI path raises).
+
+    A NULL stat value inside the trailing window would otherwise leave the
+    latest row's ``rolling_mean_{stat}`` / ``rolling_std_{stat}`` NaN even though
+    ``rolling_mean_minutes`` (and hence this dropna gate) is finite — the root
+    cause of NaN μ/σ projections. ``_repair_nan_stat_moments`` recomputes those
+    NaN aggregates over the surviving window values before the row is returned;
+    see :data:`MIN_VALID_WINDOW_FRACTION` for the exclusion policy."""
     if games is None or getattr(games, "empty", True):
         return None
     enriched = add_rolling_stats(games, window=rolling_window)
-    latest = enriched.dropna(subset=["rolling_mean_minutes"])
-    if latest.empty:
+    valid = enriched.dropna(subset=["rolling_mean_minutes"])
+    if valid.empty:
         return None
-    return latest.iloc[-1]
+    latest = valid.iloc[-1].copy()
+    _repair_nan_stat_moments(enriched, latest, rolling_window)
+    return latest
+
+
+def _repair_nan_stat_moments(
+    enriched: pd.DataFrame,
+    latest: pd.Series,
+    rolling_window: int,
+) -> None:
+    """Recompute NaN rolling μ/σ over the trailing window, excluding NULLs.
+
+    Mutates ``latest`` in place. Only touches a stat whose ``rolling_mean_{stat}``
+    is *already* NaN, so clean-window projections are returned bit-for-bit
+    unchanged (available-case recompute over a complete window equals the value
+    pandas produced). ``add_rolling_stats`` date-sorts its output ascending, so
+    ``tail(rolling_window)`` is the newest ``rolling_window`` games regardless of
+    whether the caller supplied games newest-first (``get_player_games``) or
+    oldest-first — i.e. the exact window that fed the (now NaN) aggregate."""
+    min_valid = max(2, int(round(rolling_window * MIN_VALID_WINDOW_FRACTION)))
+    for stat in PROJECTABLE_STATS:
+        mean_col = f"rolling_mean_{stat}"
+        std_col = f"rolling_std_{stat}"
+        if stat not in enriched.columns or mean_col not in latest.index:
+            continue
+        if not pd.isna(latest[mean_col]):
+            continue  # clean window (or stat carried a value) — leave untouched
+        window_vals = pd.to_numeric(
+            enriched[stat].tail(rolling_window), errors="coerce").dropna()
+        if len(window_vals) < min_valid:
+            continue  # too few valid games — keep NaN so the row is skipped
+        latest[mean_col] = float(window_vals.mean())
+        # ddof=1 matches pandas' rolling ``.std()`` default; well-defined because
+        # min_valid >= 2. Legacy aliases (pts_mean/pts_std) aren't read by the
+        # projection path, so they don't need repair.
+        latest[std_col] = float(window_vals.std(ddof=1))
 
 
 def project_stat_moments(
@@ -232,7 +287,13 @@ def project_prop_line(
 
 
 def _project_stat_from_history(latest: pd.Series, stat_type: str) -> tuple[float, float]:
-    """Compute (mu, sigma) for a stat from rolling history."""
+    """Compute (mu, sigma) for a stat from rolling history.
+
+    Reads the pre-computed rolling aggregates on ``latest``. When those come
+    from ``build_history_from_games`` any NaN caused by a NULL in the window has
+    already been repaired (see :func:`_repair_nan_stat_moments`); a residual NaN
+    here means too few valid games survived, and it propagates so the caller
+    drops the row rather than persisting a bogus projection."""
     stat_key = _normalize_stat_type(stat_type)
 
     if stat_key == "points":

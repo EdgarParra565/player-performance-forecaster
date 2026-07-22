@@ -28,6 +28,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import os
 import sys
 import time
@@ -423,6 +424,24 @@ def _persist_predictions(db_path, board_lines, name_to_id, target_date) -> int:
         for line in board_lines:
             pid = name_to_id.get(line.player_name)
             if pid is None:
+                continue
+            # Defense in depth: never persist a NaN/inf projection. The root fix
+            # lives in prop_board.build_history_from_games (NULL-in-window μ/σ is
+            # recomputed over the surviving games), so this normally only fires
+            # when too few valid games remained and the moment stays NaN. A NaN
+            # REAL is stored by SQLite as NULL, which would then read back as a
+            # bogus prediction, so drop the row instead.
+            if not (
+                math.isfinite(line.mu)
+                and math.isfinite(line.sigma)
+                and math.isfinite(line.prob_over)
+            ):
+                logger.warning(
+                    "skipping non-finite prediction for %s %s (mu=%s sigma=%s "
+                    "prob_over=%s)",
+                    line.player_name, line.stat_type,
+                    line.mu, line.sigma, line.prob_over,
+                )
                 continue
             db.conn.execute(
                 "DELETE FROM predictions WHERE player_id = ? "

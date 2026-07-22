@@ -293,6 +293,124 @@ class PersistPredictionsTests(unittest.TestCase):
             n = _persist_predictions(db_path, lines, {}, "2025-04-01")
         self.assertEqual(n, 0)
 
+    def test_skips_non_finite_moment(self):
+        # Defense in depth: a NaN projection (too few valid games survived the
+        # NULL-in-window repair) must never be persisted. SQLite would store the
+        # NaN REAL as NULL and read it back as a bogus prediction.
+        from nba_model.data.database.db_manager import DatabaseManager
+        from nba_model.data.hourly_update import _persist_predictions
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = os.path.join(tmp, "nba.db")
+            with DatabaseManager(db_path=db_path):
+                pass
+            good = self._board_line("points", 25.5, 26.0)
+            bad = self._board_line("rebounds", 6.5, float("nan"))
+            n = _persist_predictions(
+                db_path, [good, bad], {"LeBron James": 2544}, "2025-04-01")
+            with DatabaseManager(db_path=db_path) as db:
+                rows = db.conn.execute(
+                    "SELECT stat_type, predicted_mean FROM predictions"
+                ).fetchall()
+        self.assertEqual(n, 1)
+        self.assertEqual([r[0] for r in rows], ["points"])
+        self.assertFalse(any(r[1] is None for r in rows))
+
+
+def _games_frame(pid, rebounds_per_game):
+    """A get_player_games-style frame (newest-first / DESC) with 12 games."""
+    import pandas as pd
+    points = [16, 18, 20, 22, 16, 18, 20, 22, 18, 20, 24, 26]
+    rows = []
+    for i, (p, r) in enumerate(zip(points, rebounds_per_game), start=1):
+        rows.append({
+            "player_id": pid, "game_id": f"g{pid}_{i}",
+            "game_date": f"2025-04-{i:02d}", "minutes": 34.0,
+            "points": float(p), "rebounds": r, "assists": 7.0,
+        })
+    return pd.DataFrame(rows[::-1]).reset_index(drop=True)  # DESC by date
+
+
+class NanRowRecomputeDefenseTests(unittest.TestCase):
+    """The hourly recompute path (build_history -> _build_board_lines ->
+    _persist_predictions) must not write NaN rows for NULL-in-window data."""
+
+    def test_hourly_style_recompute_over_null_data_writes_no_nan(self):
+        import pandas as pd
+        from nba_model.data.database.db_manager import DatabaseManager
+        from nba_model.data.hourly_update import _persist_predictions
+        from nba_model.model.prop_board import (
+            _build_board_lines,
+            build_history_from_games,
+        )
+
+        # Null Guy: 1 NULL in the trailing window -> finite μ over survivors.
+        # Sparse Guy: 6 NULLs -> μ stays NaN -> must be dropped, not persisted.
+        null_reb = [8.0] * 11 + [None]
+        sparse_reb = [8.0] * 6 + [None] * 6
+        histories = {
+            "Null Guy": build_history_from_games(_games_frame(700, null_reb), 10),
+            "Sparse Guy": build_history_from_games(_games_frame(701, sparse_reb), 10),
+        }
+        rows = pd.DataFrame([
+            {"game_date": "2025-04-12", "player_id": 700,
+             "player_name": "Null Guy", "team": None, "book": "Underdog",
+             "stat_type": "rebounds", "line_value": 6.5,
+             "over_odds": None, "under_odds": None},
+            {"game_date": "2025-04-12", "player_id": 701,
+             "player_name": "Sparse Guy", "team": None, "book": "Underdog",
+             "stat_type": "rebounds", "line_value": 6.5,
+             "over_odds": None, "under_odds": None},
+        ])
+        board = _build_board_lines(
+            rows=rows, player_histories=histories, rolling_window=10)
+        name_to_id = {"Null Guy": 700, "Sparse Guy": 701}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = os.path.join(tmp, "nba.db")
+            with DatabaseManager(db_path=db_path):
+                pass
+            persisted = _persist_predictions(
+                db_path, board, name_to_id, "2025-04-12")
+            with DatabaseManager(db_path=db_path) as db:
+                all_rows = db.conn.execute(
+                    "SELECT player_id, predicted_mean, predicted_std, prob_over "
+                    "FROM predictions"
+                ).fetchall()
+                nan_rows = db.conn.execute(
+                    "SELECT COUNT(*) FROM predictions WHERE predicted_mean IS NULL "
+                    "OR predicted_std IS NULL OR prob_over IS NULL"
+                ).fetchone()[0]
+
+        self.assertEqual(persisted, 1)                # only Null Guy survives
+        self.assertEqual([r[0] for r in all_rows], [700])
+        self.assertEqual(nan_rows, 0)                 # no NaN leaked into DB
+
+    def test_delete_nonfinite_predictions_cleans_persisted_nan(self):
+        from nba_model.data.database.db_manager import DatabaseManager
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = os.path.join(tmp, "nba.db")
+            with DatabaseManager(db_path=db_path) as db:
+                db.insert_prediction({
+                    "player_id": 1, "game_date": "2025-04-12",
+                    "stat_type": "points", "predicted_mean": 20.0,
+                    "predicted_std": 5.0, "prob_over": 0.55, "line_value": 17.5,
+                })
+                # A pre-fix NaN row: SQLite stores the NaN REAL as NULL.
+                db.insert_prediction({
+                    "player_id": 2, "game_date": "2025-04-12",
+                    "stat_type": "rebounds", "predicted_mean": float("nan"),
+                    "predicted_std": float("nan"), "prob_over": float("nan"),
+                    "line_value": 6.5,
+                })
+                removed = db.delete_nonfinite_predictions()
+                remaining = db.conn.execute(
+                    "SELECT player_id FROM predictions").fetchall()
+                # Idempotent: a second sweep removes nothing.
+                removed_again = db.delete_nonfinite_predictions()
+        self.assertEqual(removed, 1)
+        self.assertEqual([r[0] for r in remaining], [1])
+        self.assertEqual(removed_again, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

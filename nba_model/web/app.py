@@ -598,6 +598,21 @@ def _team_overview(
                 key=f"plotly_splits_team_{data.player_id}_{data.stat_type}",
             )
 
+        # Books don't post team assists/rebounds/etc., so non-points charts get
+        # a DERIVED reference (Σ players' consensus prop lines). Label it as
+        # such, or explain the empty-state when player-prop coverage is thin.
+        if data.derived_reference_line is not None:
+            st.caption(
+                f":triangular_ruler: {data.derived_reference_label} = "
+                f"{data.derived_reference_line:.1f} — a derived signal (sum of "
+                "rostered players' cross-book consensus prop lines), **not** a "
+                "posted book line."
+            )
+        elif stat_type != "points":
+            for note in data.notes:
+                if "props-derived" in note.lower():
+                    st.caption(f":information_source: {note}")
+
         st.divider()
 
 
@@ -1059,6 +1074,8 @@ def _edge_scanner_view(db_path: str, user) -> None:
         "scored against the -110 breakeven (52.4%)."
     )
 
+    from nba_model.web import edge_scanner_view as esv
+
     all_books = _cached_scanner_books(db_path)
     if not all_books:
         st.warning(
@@ -1091,13 +1108,11 @@ def _edge_scanner_view(db_path: str, user) -> None:
             value=min(25, int(n_games_max)), key="es_ngames",
         )
         model_mode_label = st.radio(
-            "Model", ["Last-N mean (charts)", "Rolling window (prop board)"],
-            index=0, key="es_model_mode",
+            "Model", esv.MODEL_MODE_LABELS, index=0, key="es_model_mode",
         )
-        model_mode = ("chart_mean" if model_mode_label.startswith("Last-N")
-                      else "rolling")
+        requested_mode = esv.label_to_mode(model_mode_label)
         rolling_window = 10
-        if model_mode == "rolling":
+        if requested_mode == "rolling":
             rolling_window = st.slider(
                 "Rolling window", min_value=3, max_value=30, value=10,
                 key="es_rolling",
@@ -1131,17 +1146,43 @@ def _edge_scanner_view(db_path: str, user) -> None:
             )
             return
 
+    # Model-mode capability check + graceful fallback (shared contract): a build
+    # whose model layer hasn't shipped ``full`` degrades to ``chart_mean`` with a
+    # caption notice instead of a stack trace.
+    effective_mode, notice = esv.resolve_model_mode(requested_mode, es)
     try:
         lines = es.fetch_latest_prop_lines(
             db_path, books=books, stat_types=stats or None,
         )
-        scored = es.score_prop_edges(
-            lines, db_path=db_path, n_games=int(n_games),
-            model_mode=model_mode, rolling_window=int(rolling_window),
-        )
     except Exception as exc:  # noqa: BLE001
         st.error(f"Edge scan failed: {exc}")
         return
+    # ``lines`` is now bound, so the chart_mean backstop below can safely retry.
+    try:
+        scored = es.score_prop_edges(
+            lines, db_path=db_path, n_games=int(n_games),
+            model_mode=effective_mode, rolling_window=int(rolling_window),
+        )
+    except (ValueError, TypeError) as exc:
+        # Backstop: model layer rejected the mode -> retry on chart_mean.
+        effective_mode = "chart_mean"
+        notice = (
+            f"Requested model mode unavailable ({exc}); fell back to last-N "
+            "mean (charts)."
+        )
+        try:
+            scored = es.score_prop_edges(
+                lines, db_path=db_path, n_games=int(n_games),
+                model_mode="chart_mean", rolling_window=int(rolling_window),
+            )
+        except Exception as exc2:  # noqa: BLE001
+            st.error(f"Edge scan failed: {exc2}")
+            return
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"Edge scan failed: {exc}")
+        return
+    if notice:
+        st.caption(f":information_source: {notice}")
 
     # Free tier: restrict to the preview player set (same gate as other views).
     if not is_premium and not scored.empty:
@@ -1203,6 +1244,11 @@ def _edge_scanner_view(db_path: str, user) -> None:
                 "Consensus", format="%.1f"),
             "observed_hours_ago": st.column_config.NumberColumn(
                 "Age (h)", format="%.1f"),
+            # Appended by score_prop_edges (SCORED_COLUMNS_FULL): the per-stat
+            # distribution (varies in full mode — poisson/normal) and the mode
+            # the row was scored under.
+            "distribution": st.column_config.TextColumn("Dist"),
+            "model_mode": st.column_config.TextColumn("Mode"),
         },
     )
     st.caption(

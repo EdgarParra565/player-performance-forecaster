@@ -298,5 +298,30 @@ class Workstream3Batch2FigureTests(unittest.TestCase):
         self.assertEqual(len(fig.layout.annotations), 1)
 
 
+class DerivedTeamReferenceRenderTests(unittest.TestCase):
+    """The props-derived team reference renders as its own hline + honest
+    label, and never as a 'book mean' (points behavior stays untouched)."""
+
+    def test_derived_line_adds_shape_and_honest_annotation(self):
+        data = _build_synthetic_data(stat_type="assists")
+        data.market_consensus_line = None
+        data.derived_reference_line = 26.0
+        data.derived_reference_label = "props-derived team mean (Σ 6 players)"
+        fig = plc.build_recent_games_figure(data, rolling_window=5)
+        # add_hline is a layout shape (not a trace) + an annotation.
+        self.assertEqual(len(fig.layout.shapes), 1)
+        texts = " ".join(a.text for a in fig.layout.annotations if a.text)
+        self.assertIn("props-derived", texts)
+        self.assertNotIn("book mean", texts)
+
+    def test_points_book_mean_unchanged_no_derived(self):
+        data = _build_synthetic_data(stat_type="points")  # market_consensus set
+        fig = plc.build_recent_games_figure(data, rolling_window=5)
+        self.assertEqual(len(fig.layout.shapes), 1)  # only the book-mean hline
+        texts = " ".join(a.text for a in fig.layout.annotations if a.text)
+        self.assertIn("book mean", texts)
+        self.assertNotIn("props-derived", texts)
+
+
 if __name__ == "__main__":
     unittest.main()

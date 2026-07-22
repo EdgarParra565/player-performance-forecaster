@@ -207,10 +207,12 @@ def _fit_player_stat_full(
         latest, canonical_stat, prior_inputs=prior_inputs)
     mu = float(moments["mu"])
     sigma = float(moments["sigma"])
-    # A NULL stat value inside the rolling window makes the rolling mean NaN
-    # (chart_mean avoids this by fillna(0)-ing the series). Drop rather than
-    # persist a nonsensical NaN row that would otherwise sort to the top of the
-    # edge ranking.
+    # A NULL stat value inside the rolling window used to make μ/σ NaN; the root
+    # fix (prop_board.build_history_from_games) now recomputes μ/σ over the
+    # surviving games, so this guard normally only fires when too few valid
+    # games remained (moment still NaN) or for a degenerate blend. Drop rather
+    # than persist a nonsensical NaN row that would otherwise sort to the top of
+    # the edge ranking.
     if not (math.isfinite(mu) and math.isfinite(sigma)):
         return None
     return {

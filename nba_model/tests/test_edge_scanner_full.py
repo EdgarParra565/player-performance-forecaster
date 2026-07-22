@@ -16,6 +16,7 @@ All offline (DB-direct; full mode never calls DataLoader / the NBA API), with
 Windows-safe teardown.
 """
 
+import math
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -194,17 +195,18 @@ class FullModeProjectionTests(EdgeScannerFullTestBase):
         self.assertTrue(scored.empty)
         self.assertEqual(list(scored.columns), es.SCORED_COLUMNS_FULL)
 
-    def test_null_stat_in_window_is_dropped_not_nan_row(self):
-        # A NULL stat value inside the rolling window would make the rolling
-        # mean NaN; full mode must drop that row rather than persist a NaN
-        # (which, for poisson stats, otherwise sorts to the top as a fake edge).
+    def test_single_null_in_window_yields_finite_mu_not_dropped(self):
+        # Root fix: one NULL stat value inside the rolling window is *excluded*
+        # from μ/σ (available-case) rather than voiding the projection. The row
+        # survives with a finite μ (rebounds = 8 over the 9 valid games), and no
+        # NaN leaks into any row's model_mu.
         with DatabaseManager(db_path=self.db_path) as db:
             db.upsert_active_players_reference([
                 {"player_id": 9500, "player_name": "Null Guy",
                  "synced_at_utc": self.recent}])
             null_rows = []
             for j, p in enumerate(NEWEST_10_POINTS):
-                row = _game_row(9500, j + 1, p)
+                row = _game_row(9500, j + 1, p)  # rebounds defaults to 8
                 if j == len(NEWEST_10_POINTS) - 1:  # newest game: NULL rebounds
                     row["rebounds"] = None
                 null_rows.append(row)
@@ -214,8 +216,34 @@ class FullModeProjectionTests(EdgeScannerFullTestBase):
                       self.recent, 20)])
         full = self._scored("full")
         ng = full[full["player_name"] == "Null Guy"]
-        self.assertTrue(ng.empty)
-        # And no NaN leaked into any surviving row's model_mu.
+        self.assertEqual(len(ng), 1)
+        self.assertTrue(math.isfinite(float(ng.iloc[0]["model_mu"])))
+        # No team prior for Null Guy (absent from players) → μ is the plain mean.
+        self.assertAlmostEqual(float(ng.iloc[0]["model_mu"]), 8.0, places=6)
+        self.assertFalse(full["model_mu"].isna().any())
+
+    def test_too_few_valid_in_window_is_dropped_not_nan_row(self):
+        # When the window is mostly NULL (fewer than MIN_VALID_WINDOW_FRACTION of
+        # the games survive), μ/σ stays NaN and full mode drops the row rather
+        # than persist a NaN (which, for poisson stats, otherwise sorts to the
+        # top as a fake edge).
+        with DatabaseManager(db_path=self.db_path) as db:
+            db.upsert_active_players_reference([
+                {"player_id": 9600, "player_name": "Sparse Guy",
+                 "synced_at_utc": self.recent}])
+            sparse_rows = []
+            for j, p in enumerate(NEWEST_10_POINTS):
+                row = _game_row(9600, j + 1, p)
+                if j >= 4:  # 6 of the newest 10 rebounds are NULL → 4 valid < 5
+                    row["rebounds"] = None
+                sparse_rows.append(row)
+            db.insert_game_logs(pd.DataFrame(sparse_rows))
+            db.insert_web_prop_cards([
+                _card("Underdog", "Sparse Guy", "rebounds", 6.5, "over",
+                      self.recent, 21)])
+        full = self._scored("full")
+        sg = full[full["player_name"] == "Sparse Guy"]
+        self.assertTrue(sg.empty)
         self.assertFalse(full["model_mu"].isna().any())
 
 

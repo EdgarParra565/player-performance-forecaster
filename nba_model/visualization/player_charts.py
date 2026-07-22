@@ -70,6 +70,13 @@ class PlayerChartData:
     # Per-book line-movement summaries (only books whose line actually moved
     # within the lookback window). See ``_fetch_line_movement``.
     line_movement: list[dict] = field(default_factory=list)
+    # Derived team reference line + its label (e.g. the sum of a team's
+    # players' consensus prop lines for a stat). Distinct from
+    # ``market_consensus_line`` (a posted book line): this is a clearly-labeled
+    # DERIVED signal and must never be rendered as a book line. Only set for
+    # team charts on non-points stats; ``None`` everywhere else.
+    derived_reference_line: Optional[float] = None
+    derived_reference_label: Optional[str] = None
 
     @property
     def market_median_line(self) -> Optional[float]:
@@ -619,6 +626,14 @@ def build_recent_games_figure(
         ax.axhline(
             data.market_consensus_line, color="#666", linestyle="--",
             linewidth=1.2, label=f"book mean {data.market_consensus_line:.1f}",
+        )
+    # Derived team reference (dotted green) — distinct style + honest label so
+    # it can never be read as a posted book line.
+    if data.derived_reference_line is not None:
+        label = data.derived_reference_label or "props-derived team mean"
+        ax.axhline(
+            data.derived_reference_line, color="#10b981", linestyle=":",
+            linewidth=1.6, label=f"{label} {data.derived_reference_line:.1f}",
         )
 
     tick_step = max(1, n // 10)
@@ -2017,6 +2032,115 @@ def _fetch_latest_team_book_lines(
     return pd.DataFrame(out).sort_values("book").reset_index(drop=True)
 
 
+# Books don't post team assists/rebounds/etc. at the lobby level, so for the
+# non-points team stats we synthesize a DERIVED reference: the sum of the
+# team's players' cross-book consensus prop lines for that stat. Require at
+# least this many players with a current prop before we show it — a handful of
+# players isn't a credible team aggregate, and offseason slates (empty
+# web_prop_cards) fall below the floor and show an empty-state instead.
+DERIVED_TEAM_REF_MIN_PLAYERS = 5
+DERIVED_TEAM_REF_SINCE_HOURS = 48.0
+
+# Stats for which players' props exist in web_prop_cards AND team-summing them
+# is defensible. ``pra``/``ra`` are player combos that don't sum to a clean
+# team quantity, and ``minutes`` team-totals are ~constant (~240), so both are
+# excluded — the reference is only offered for the additive counting stats.
+DERIVED_TEAM_REF_STATS = (
+    "assists", "rebounds", "three_pointers_made", "field_goals_made",
+)
+
+
+def _team_roster_names(db: DatabaseManager, team_code: str) -> set[str]:
+    """Lower-cased player names currently on ``team_code``.
+
+    Team membership is resolved from each player's most-recent
+    ``game_logs.matchup`` (first whitespace-delimited token) — the same
+    fallback ``list_players_with_data`` / ``list_team_codes`` use, because
+    ``players.team`` is mostly NULL in the snapshot DB. Names come from
+    ``nba_active_players_ref`` (scraper-synced, matches ``web_prop_cards``)
+    with a fallback to the sparse ``players`` table.
+    """
+    rows = db.conn.execute(
+        """
+        WITH team_players AS (
+            SELECT
+                g.player_id,
+                upper(trim(substr(g.matchup, 1, instr(g.matchup, ' ') - 1))) AS team,
+                ROW_NUMBER() OVER (
+                    PARTITION BY g.player_id
+                    ORDER BY g.game_date DESC, g.game_log_id DESC
+                ) AS rn
+            FROM game_logs g
+            WHERE g.matchup IS NOT NULL AND instr(g.matchup, ' ') > 0
+        )
+        SELECT COALESCE(r.player_name, p.name) AS name
+        FROM team_players tp
+        LEFT JOIN nba_active_players_ref r ON r.player_id = tp.player_id
+        LEFT JOIN players p ON p.player_id = tp.player_id
+        WHERE tp.rn = 1
+          AND upper(tp.team) = upper(?)
+          AND COALESCE(r.player_name, p.name) IS NOT NULL
+        """,
+        (str(team_code).strip(),),
+    ).fetchall()
+    return {str(row[0]).strip().lower() for row in rows if row[0]}
+
+
+def _fetch_props_derived_team_reference(
+    db: DatabaseManager,
+    team_code: str,
+    canonical_stat: str,
+    *,
+    min_players: int = DERIVED_TEAM_REF_MIN_PLAYERS,
+    since_hours: float = DERIVED_TEAM_REF_SINCE_HOURS,
+) -> dict:
+    """Σ of a team's players' consensus prop lines for a stat — a DERIVED team
+    reference, never a posted book line.
+
+    Books surface player props (``web_prop_cards``) but not team assists /
+    rebounds / etc. at the lobby level, so we approximate a team reference as
+    the sum, over the team's rostered players who currently have a prop, of
+    each player's cross-book consensus (mean-across-books) line for the stat.
+
+    Returns ``{"value", "n_players", "players", "label"}``. ``value`` is
+    ``None`` when the stat isn't eligible or fewer than ``min_players`` players
+    have a current prop (thin coverage / offseason) — the caller shows an
+    empty-state in that case.
+    """
+    result = {"value": None, "n_players": 0, "players": [], "label": None}
+    if canonical_stat not in DERIVED_TEAM_REF_STATS:
+        return result
+
+    # Validate the tunable numeric inputs through the shared validation layer
+    # (lazy import avoids a module-load cycle, matching ``list_team_codes``).
+    from nba_model.web import input_validation as iv
+    min_players = iv.validate_min_players(min_players)
+    since_hours = iv.validate_since_hours(since_hours)
+
+    roster = _team_roster_names(db, team_code)
+    if not roster:
+        return result
+
+    consensus = db.get_consensus_prop_lines(
+        stat_type=canonical_stat, side="over",
+        since_hours=since_hours, min_books=1,
+    )
+    contributing = [
+        c for c in consensus
+        if c.get("mean_line") is not None
+        and str(c.get("player_name", "")).strip().lower() in roster
+    ]
+    n = len(contributing)
+    result["n_players"] = n
+    result["players"] = sorted(str(c["player_name"]) for c in contributing)
+    if n < int(min_players):
+        return result
+
+    result["value"] = float(sum(c["mean_line"] for c in contributing))
+    result["label"] = f"props-derived team mean (Σ {n} players)"
+    return result
+
+
 def fetch_recent_games(
     db_path: str,
     n: int = 50,
@@ -2193,11 +2317,32 @@ def fetch_team_chart_data(
         "players per game on average."
     )
 
-    # Pull cross-book consensus for the team's most recent game.  Currently
-    # only the ``points`` stat has a meaningful book reference (derived from
-    # game total + spread); other team stats return an empty frame.
+    # Pull the team reference line for the most recent game. For ``points`` the
+    # books surface a real lobby line (implied team total = (game_total -
+    # team_spread) / 2) — kept exactly as before. For the other stats books
+    # don't post a team line, so we synthesize a clearly-labeled DERIVED
+    # reference from the sum of the team's players' consensus prop lines.
+    derived_reference_line: Optional[float] = None
+    derived_reference_label: Optional[str] = None
     with DatabaseManager(db_path=db_path) as db:
         team_book_lines = _fetch_latest_team_book_lines(db, team_code, canonical)
+        if canonical != "points":
+            derived = _fetch_props_derived_team_reference(db, team_code, canonical)
+            if derived["value"] is not None:
+                derived_reference_line = derived["value"]
+                derived_reference_label = derived["label"]
+                notes.append(
+                    f"{derived['label']}: sum of {derived['n_players']} players' "
+                    "cross-book consensus prop lines. Derived signal — NOT a "
+                    "posted book line."
+                )
+            elif canonical in DERIVED_TEAM_REF_STATS:
+                notes.append(
+                    f"No props-derived {canonical} reference: only "
+                    f"{derived['n_players']} rostered player(s) have a current "
+                    f"prop (need >= {DERIVED_TEAM_REF_MIN_PLAYERS}). Offseason "
+                    "slates are usually empty."
+                )
     market_line = _market_consensus_line(team_book_lines)
     if not team_book_lines.empty and market_line is not None:
         notes.append(
@@ -2214,6 +2359,8 @@ def fetch_team_chart_data(
         book_lines=team_book_lines,
         market_consensus_line=market_line,
         notes=notes,
+        derived_reference_line=derived_reference_line,
+        derived_reference_label=derived_reference_label,
     )
 
 

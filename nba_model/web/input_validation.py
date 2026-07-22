@@ -163,6 +163,39 @@ def validate_n_games(n: Any, *, min_value: int = 1) -> int:
     return min(val, N_GAMES_HARD_CAP)
 
 
+def validate_min_players(n: Any, *, default: int = 5) -> int:
+    """Coerce a minimum-player-count floor for the props-derived team reference.
+
+    Team-charts pass this to gate the "sum of players' consensus prop lines"
+    signal; must be a positive integer. ``None`` falls back to ``default``.
+    Capped at a full roster (15) since no NBA team dresses more.
+    """
+    if n is None:
+        return default
+    if not _is_finite_number(n):
+        raise ValidationError(f"min_players must be a finite integer; got {n!r}")
+    val = int(round(float(n)))
+    if val < 1:
+        raise ValidationError(f"min_players must be >= 1; got {val}")
+    return min(val, 15)
+
+
+def validate_since_hours(h: Any, *, default: float = 48.0) -> float:
+    """Coerce a `within the last N hours` staleness window (positive float).
+
+    Used to keep stale ``web_prop_cards`` rows out of the props-derived team
+    reference. ``None`` falls back to ``default``; capped at 30 days.
+    """
+    if h is None:
+        return default
+    if not _is_finite_number(h):
+        raise ValidationError(f"since_hours must be a finite number; got {h!r}")
+    val = float(h)
+    if val <= 0:
+        raise ValidationError(f"since_hours must be > 0; got {val}")
+    return min(val, 24.0 * 30.0)
+
+
 def validate_n_sims(n: Any, *, default: int = 20_000,
                     hard_cap: int = 200_000) -> int:
     """Coerce + cap a Monte Carlo `n_sims` request."""

@@ -771,6 +771,18 @@ def build_recent_games_figure(
             annotation_text=f"book mean {data.market_consensus_line:.1f}",
             annotation_position="top right",
         )
+    # Derived team reference (green, dotted) — distinct style + honest label so
+    # it reads as a derived signal, never a posted book line.
+    derived = getattr(data, "derived_reference_line", None)
+    if derived is not None:
+        label = getattr(data, "derived_reference_label", None) \
+            or "props-derived team mean"
+        fig.add_hline(
+            y=float(derived),
+            line=dict(color=THEME["ok"], width=1.6, dash="dot"),
+            annotation_text=f"{label} {float(derived):.1f}",
+            annotation_position="bottom right",
+        )
 
     step = max(1, n // 12)
     _apply_theme(

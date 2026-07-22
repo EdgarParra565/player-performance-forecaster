@@ -24,7 +24,7 @@ The current baseline is designed to be reproducible offline (synthetic benchmark
 - Admin dashboard (subscribers / MRR estimate / churn) gated to `is_admin()`; Stripe `STRIPE_MODE=test|live` env toggle; webhook alert on `invoice.payment_failed`; free-tier app-layer scan throttle; optional first-sign-in trial (`ENABLE_TRIAL`).
 - ETL alerting: daily + hourly reports embed an `alert` marker and accept `--alert-webhook-url`. The hourly recompute persists predictions for points/assists/rebounds/pra. The distribution sweep settles each stat at a realistic per-stat line by default (no more `line == mean` degeneracy).
 - **Multi-sport scaffolding:** idempotent `sport` column on core tables, per-`(book, sport)` scraper resolution, registry-driven stat validation. `sports/` package: NBA live; MLB data layer beta (ingest + FanDuel team lines); NFL/NHL/soccer stubs. Streamlit sport-picker shows roadmap cards for non-live sports. Rollout plan: [docs/MULTI_SPORT_PLAN.md](docs/MULTI_SPORT_PLAN.md). Active tracker: `notes.txt`.
-- **626 tests passing** (regression + stress + adversarial + edge-scanner + cross-book + bet-log/paper-trading + billing + multi-sport). `bandit` MEDIUM/HIGH = 0; `pip-audit` clean.
+- **672 tests passing** (regression + stress + adversarial + edge-scanner + cross-book + bet-log/paper-trading + billing + multi-sport + team-chart derived references). `bandit` MEDIUM/HIGH = 0; `pip-audit` clean.
 
 ## Repository Layout
 
