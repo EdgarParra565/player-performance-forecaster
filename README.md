@@ -11,7 +11,7 @@ The current baseline is designed to be reproducible offline (synthetic benchmark
 - `run_model` supports executable demo modes for single props and correlated parlays.
 - Deterministic smoke tests are in place for features, probability math, and backtest integration.
 - Baseline benchmark artifacts are generated and saved under `nba_model/evaluation/artifacts/`.
-- Per-book scraper package (`nba_model/scrapers/`) registers 20 books — 9 actively producing parsed data (PrizePicks, Underdog, Pick6, ParlayPlay for player props; BetMGM, Caesars, DraftKings, Bovada, Kalshi for team lines). Cross-book consensus rolls into both player and team charts as `book mean X.X`.
+- Per-book scraper package (`nba_model/scrapers/`) registers 20 books — 10 actively producing parsed data (PrizePicks, Underdog, Pick6, ParlayPlay for player props; BetMGM, Caesars, DraftKings, Bovada, Kalshi for team lines; VegasInsider aggregator for real 11-book player-prop odds → `betting_lines`). Cross-book consensus rolls into both player and team charts as `book mean X.X`.
 - NBA API ingest (`nba_model/data/nba_results_ingestion.py`) populates a `games` table (8K+ team-game rows) and bulk player game logs (90K+ rows across 3 seasons + 1K players) from `leaguegamefinder` / `playergamelogs`.
 - Streamlit + Tk UIs both expose Player charts, Team charts, Game Results, and Player Stats Browse. All graphing inputs go through `nba_model/web/input_validation.py` (stat type / team code / season / rolling window).
 - Streamlit web app is at full feature parity with the desktop Tk UI: Single prop (full model tuning), Manual lines import (admin-only DB save), and an admin-only Operations console join the Player/Team chart, Compare, browse, and Parlay views. Every web chart renders via Plotly (zoom / hover / legend-toggle); the line board highlights the best-EV side and offers a compact "line ladder" layout.
@@ -28,6 +28,7 @@ The current baseline is designed to be reproducible offline (synthetic benchmark
 
 ## Repository Layout
 
+- `nba_model/logging_utils.py` - shared structured logging (stdlib only): JSON-lines file formatter (UTC ISO ts + `extra=` fields) + human console, `LOG_LEVEL`-configurable, via `get_logger` / `configure_logging`. Used by the ETL / ingest / publish / paper-trading CLIs.
 - `nba_model/data/` - API loading, caching, and database utilities
   - `nba_results_ingestion.py` - bulk team-game + player-game-log ingest from `nba_api`
 - `nba_model/model/` - feature engineering, probability, simulation, EV, parlay modeling
@@ -1119,7 +1120,7 @@ Latest results are generated into:
 - Cross-book/model-vs-book and monthly diagnostics depend on having populated `betting_lines` and `predictions` data.
 - The Book Edge Scanner and Line Movement views need scraped `web_prop_cards` / `betting_line_snapshots` rows from the Chrome-host ETL; both show an empty-state until that data is present.
 - The Cross-book view's **line shopping / middle** signals work off the DFS board (`web_prop_cards`), but its **TRUE arb** detection is data-starved until real sportsbook odds are scraped into `betting_lines` in-season — DFS -110 defaults can never be arb, so the arb count stays 0 in the offseason (expected; the view shows a clean empty-state).
-- 11 of 20 scrapers are still parser-less (need authenticated CDP snapshots from the dev-Mac Chrome host).
+- 10 of 20 scrapers are still parser-less. theScore Bet / DraftKings / Fliff have working fetch paths but their NBA extractors await in-season captures (July boards are legitimately empty); Fanatics / Sleeper / Dabble are mobile-app-only, BettingPros is subscription-gated, HardRock needs a 21+ account, and OddsShark publishes projections rather than book odds (see the blocker table in `notes.txt`).
 - `betting_lines` market coverage is thin. Use `nba_model.data.historical_odds_backfill` to derive additional market lines from scraped `web_prop_cards` before running `--use-market-lines` sweeps / CLV analysis; coverage is then bounded by how many props the Chrome-host ETL has scraped.
 
 ## Operational Runbook (ETL & Odds Ingestion)

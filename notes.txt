@@ -17,8 +17,10 @@ Windows: `.venv\Scripts\python.exe -m pytest nba_model/tests -q`).
 2. **Run WS10 validation** — market-line backtests, 4–8 week paper trade
    (`bet_slip` → `bet_log` → `calibration_report`), CLV review. Tooling is built;
    only live data is missing. **Do not bet real money until this passes.**
-3. **More scrapers** — 9 of 20 books produce parsed rows; rest blocked on auth/render/season.
-   Sportsbook odds feeds also unlock TRUE-arb + CLV.
+3. **More scrapers** — 10 of 20 books produce parsed rows (VegasInsider now feeds real
+   11-book odds into `betting_lines`). theScore/DraftKings/Fliff fetch paths are fixed but
+   NBA-offseason-empty — their extractors are the first preseason task. Remaining blocks
+   are external (mobile-only / paywalled / 21+), not code. See scraper follow-ups below.
 4. **Multi-sport** — MLB data layer is beta (off NBA consensus path). NFL scaffold parked.
    NBA deploy does not require shipping MLB/NFL web views.
 
@@ -80,6 +82,17 @@ save; web = Plotly, Tk = matplotlib; do not delete `sports/` scaffolding.
   `historical_odds_backfill.py`, FanDuel/BetRivers/ESPNBet team-line parsers (fixtures).
 - **Multi-sport** — `sport` column migration; `(book, sport)` scraper resolution; MLB Stats
   API ingest + `mlb_game_logs`; FanDuel MLB team lines validated live; NFL scaffold only.
+- **Scraper mission (2026-07-21)** — **VegasInsider aggregator parser**
+  (`scrapers/vegasinsider.py` + `data/vegasinsider_odds_ingestion.py`): real American
+  odds from ~11 books → `betting_lines` with `source='vegasinsider'` provenance
+  (additive nullable `source` column, idempotent migration); 462 rows landed from the
+  stored May capture. **Fetch-path infra:** CLI now actually forwards
+  `--chrome-debug-port` (was silently dropped → plain-requests path); generic
+  per-book `BookScraper.scroll_page` flag (DK lazy grid); iframe-aware
+  `js_extractor` pattern (Fliff emulator iframe). **espnbet → theScore Bet** rebrand
+  (`sportsbook.thescore.bet`, old ENV/cert blocker cleared). Working URLs added to
+  `web_text_urls.txt`. Blocked-with-proof: Fanatics/Sleeper/Dabble (app-only),
+  BettingPros (paywalled), HardRock (21+), OddsShark (projections, not odds).
 
 ---
 
@@ -121,11 +134,57 @@ save; web = Plotly, Tk = matplotlib; do not delete `sports/` scaffolding.
       roster via `game_logs.matchup` (players.team sparse); staleness via `since_hours`
       (validated by `iv.validate_min_players` / `validate_since_hours`). Points path
       byte-identical. Tests: `test_team_props_reference.py`.
-- [ ] Structured logging; MLB per-game player-props parser + park factors.
+- [x] Structured logging (2026-07-21): shared `nba_model/logging_utils.py` (stdlib
+      only; JSON-lines file formatter with UTC ISO ts + `extra=` fields, human
+      console, `LOG_LEVEL` env, `get_logger` / `configure_logging`). Migrated
+      daily_etl, hourly_update, publish_db, nba_results_ingestion, bet_slip,
+      calibration_report — report/alert/exit-code contracts unchanged; per-step
+      `step` / `status` / `duration_ms` fields added. `webhook_app` left untouched
+      (strict A09 redaction; its tests stay green). TODO: migrate scraper/fetch path
+      to logging_utils once scraper work lands. Note: `market_reverse_engineering`
+      calls `logging.basicConfig` at import, which no-ops daily_etl's own file
+      handler (pre-existing; hourly uses `force=` and is unaffected). Tests:
+      `test_logging_utils.py`.
+- [ ] MLB per-game player-props parser + park factors.
+
+### Scraper follow-ups (post-2026-07-21 mission: shortcomings + next steps)
+
+Known shortcomings of what shipped:
+
+- **VegasInsider is over-only** — the grid posts over cells (`o8.5 -105`); rows land
+  with `under_odds` NULL. Great for `--use-market-lines` / CLV / line shopping, but
+  `detect_two_way_arb` needs real odds on BOTH sides, so TRUE-arb stays data-starved
+  until a two-sided odds source lands (sportsbook extractors below, or check whether
+  VI exposes under odds on per-player/expanded pages).
+- **Single-aggregator drift risk** — the VI parser is pinned to the May-2026 grid
+  layout (fixture-tested). Aggregator markup drifts; re-validate on the first
+  in-season capture before trusting hourly ingestion.
+- **462 rows = one May snapshot** — a proof-of-pipe, not volume. Value arrives only
+  with an in-season fetch cadence.
+- **theScore / DraftKings / Fliff are fetch-fixed but extractor-less for NBA** —
+  offseason boards were legitimately empty, so their parsers could not be authored
+  against real NBA content. Fetch proofs are stored; parsers are deferred, not done.
+
+Next steps (in order):
+
+- [ ] **Wire VegasInsider into the ETL cadence** — `vegasinsider_odds_ingestion` is a
+      standalone CLI today; hourly ETL only stores the snapshot. Add the ingestion
+      step to `hourly_update` / `daily_etl` (after the structured-logging work lands
+      to avoid conflicts) so fresh grids auto-flow into `betting_lines`.
+- [ ] **Preseason capture sprint (~Oct)** — re-fetch and author the deferred
+      extractors against real NBA content: theScore `team_line_extractor`,
+      DraftKings NBA validation (scroll path), Fliff `prop_preprocess` (PP-style
+      More/Less), VI grid re-validation; re-check the DFS boards
+      (PrizePicks/Underdog/Pick6/ParlayPlay) per the SEASON blocker row.
+- [ ] **BetRivers re-login** (`:9222` Chrome) — still the one AUTH blocker; parser
+      already exists, needs a live-capture validation.
+- [ ] **App-only books (Fanatics/Sleeper/Dabble) + HardRock (21+)** — unscrapeable on
+      web. If their odds matter, the path is The Odds API bookmaker keys (see README
+      "smaller or alternate books"), not scraping. Revisit HardRock later.
 
 ---
 
-## Scraper / season blockers (2026-06-30 snapshot)
+## Scraper / season blockers (2026-07-21 snapshot)
 
 Re-run fetch→parse when blocker clears. NBA **offseason** = empty lobbies, not parser bugs.
 
@@ -177,7 +236,9 @@ real-data benchmarks used rolling mean as the line (model vs itself) — not boo
 
 - Sparse scraped lines → Edge Scanner / Cross-book / Line Movement / CLV mostly empty
   until the Mac ETL runs in-season (offseason arb count 0 = expected).
-- `betting_lines` thin → market-line validation + TRUE-arb blocked (backfill tooling exists).
+- `betting_lines` thin → market-line validation still volume-starved (VegasInsider now
+  feeds real 11-book odds, but over-only + one May snapshot so far); TRUE-arb needs a
+  two-sided real-odds source (backfill + aggregator tooling exists).
 - Team charts: per-game aggregates for points/assists/rebounds/pra/3pm/fgm. Only
   `points` has a posted book reference (implied team total); other stats get a
   props-derived reference (Σ players' consensus prop lines) shown only when ≥5
