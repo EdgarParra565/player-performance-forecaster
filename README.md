@@ -11,7 +11,7 @@ The current baseline is designed to be reproducible offline (synthetic benchmark
 - `run_model` supports executable demo modes for single props and correlated parlays.
 - Deterministic smoke tests are in place for features, probability math, and backtest integration.
 - Baseline benchmark artifacts are generated and saved under `nba_model/evaluation/artifacts/`.
-- Per-book scraper package (`nba_model/scrapers/`) registers 20 books — 10 actively producing parsed data (PrizePicks, Underdog, Pick6, ParlayPlay for player props; BetMGM, Caesars, DraftKings, Bovada, Kalshi for team lines; VegasInsider aggregator for real 11-book player-prop odds → `betting_lines`). Cross-book consensus rolls into both player and team charts as `book mean X.X`.
+- Per-book scraper package (`nba_model/scrapers/`) registers 20 books — 10 actively producing parsed data (PrizePicks, Underdog, Pick6, ParlayPlay for player props; BetMGM, Caesars, DraftKings, Bovada, Kalshi for team lines; VegasInsider aggregator for real 11-book player-prop odds → `betting_lines`). Cross-book consensus rolls into both player and team charts as `book mean X.X`. All parser-bearing paths were re-verified end-to-end on 2026-07-22: FanDuel + DraftKings MLB team lines are **live-verified** (fresh fetch → rows in DB today); the NBA paths are mechanically proven against stored captures and wait only on in-season content (full verification matrix in `notes.txt`).
 - NBA API ingest (`nba_model/data/nba_results_ingestion.py`) populates a `games` table (8K+ team-game rows) and bulk player game logs (90K+ rows across 3 seasons + 1K players) from `leaguegamefinder` / `playergamelogs`.
 - Streamlit + Tk UIs both expose Player charts, Team charts, Game Results, and Player Stats Browse. All graphing inputs go through `nba_model/web/input_validation.py` (stat type / team code / season / rolling window).
 - Streamlit web app is at full feature parity with the desktop Tk UI: Single prop (full model tuning), Manual lines import (admin-only DB save), and an admin-only Operations console join the Player/Team chart, Compare, browse, and Parlay views. Every web chart renders via Plotly (zoom / hover / legend-toggle); the line board highlights the best-EV side and offers a compact "line ladder" layout.
@@ -1128,6 +1128,11 @@ Latest results are generated into:
 
 ## Operational Runbook (ETL & Odds Ingestion)
 
+- **CDP Chrome tab hygiene (scraping host)**: the fetcher reuses an existing tab
+  already open on a target URL, and existing-tab reuse skips navigation and content
+  waits — so stale tabs left open in the `:9222` debug Chrome produce silently-stale
+  captures (this masked a DraftKings grid regression on 2026-07-22 until 9 leftover
+  tabs were closed). Close leftover book tabs in the debug Chrome before scrape runs.
 - **Check scheduler health**:
   - Verify the `Daily NBA ETL` GitHub Actions workflow is running on schedule and succeeding.
   - On failures, inspect the workflow logs and the **"Show ETL failure summary"** step (which prints per-step status from the last report).

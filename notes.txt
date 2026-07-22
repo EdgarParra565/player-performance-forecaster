@@ -104,6 +104,14 @@ save; web = Plotly, Tk = matplotlib; do not delete `sports/` scaffolding.
   Dashboard, Player Detail, Edge Scanner) verified against the live DB; 11 API tests
   (`api/tests`, separate from the nba_model baseline). Details + Phase 2/3 backlog in
   the "New UI (flagship)" section at the bottom.
+- **Parser verification sweep (2026-07-22)** — all 16 parser-bearing book paths
+  swept end-to-end (fresh CDP fetch → parse → DB): **2 LIVE** (FanDuel MLB 84 rows,
+  DraftKings MLB 84 rows — DK was the one BROKEN book, fixed: `event-cell` wait
+  selector + `body.innerText` js_extractor + DK-order `extract_team_lines_dk` +
+  adjacency-collapse team pairing), **13 MECH** (fetch + session classification +
+  parser proven on stored snapshots; NBA offseason = no live content), **1 BLOCKED**
+  (BetRivers AUTH, login-wall correctly detected). Hourly-style pass over all 16
+  URLs: 16/16 fetched, dedupe holds, loop verified unattended. Full matrix below.
 - **Scraper mission (2026-07-21)** — **VegasInsider aggregator parser**
   (`scrapers/vegasinsider.py` + `data/vegasinsider_odds_ingestion.py`): real American
   odds from ~11 books → `betting_lines` with `source='vegasinsider'` provenance
@@ -171,13 +179,17 @@ Next steps (in order):
       (PrizePicks/Underdog/Pick6/ParlayPlay) per the SEASON blocker row.
 - [ ] **BetRivers re-login** (`:9222` Chrome) — still the one AUTH blocker; parser
       already exists, needs a live-capture validation.
+- [ ] **VegasInsider MLB player-props page** (optional, in-season MLB value now) —
+      VI publishes a 60KB MLB props page, but the NBA over-cell grid parser reads
+      0 rows there (different layout). Would need its own extractor; only worth it
+      if MLB market lines become a priority before October.
 - [ ] **App-only books (Fanatics/Sleeper/Dabble) + HardRock (21+)** — unscrapeable on
       web. If their odds matter, the path is The Odds API bookmaker keys (see README
       "smaller or alternate books"), not scraping. Revisit HardRock later.
 
 ---
 
-## Scraper / season blockers (2026-07-21 snapshot)
+## Scraper / season blockers (2026-07-22 snapshot)
 
 Re-run fetch→parse when blocker clears. NBA **offseason** = empty lobbies, not parser bugs.
 
@@ -282,6 +294,11 @@ real-data benchmarks used rolling mean as the line (model vs itself) — not boo
   `players.team` sparse, so team membership uses the `matchup` fallback.
 - Scraping host = dev Mac; dev box may be Windows (`DataLoader` sqlite leak on temp DB
   teardown — scanner `full` mode is DB-direct and unaffected).
+- **CDP tab hygiene** — the fetcher REUSES an existing Chrome tab already open on a
+  target URL, and existing-tab reuse skips navigation + content waits. Stale tabs
+  left open in the `:9222` Chrome therefore produce silently-stale captures (this
+  masked the DK grid regression until 9 leftover tabs were closed on 2026-07-22).
+  Before an ETL/verification run, close leftover book tabs in the debug Chrome.
 - Hourly `predictions` NaN rows for NULL-in-window stats: fixed 2026-07-21 (root-fix in
   `build_history_from_games` + `_persist_predictions` guard + `delete_nonfinite_predictions`
   cleanup). Below the valid-games floor a row is intentionally skipped, not projected.
