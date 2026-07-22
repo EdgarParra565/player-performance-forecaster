@@ -52,6 +52,7 @@ The current baseline is designed to be reproducible offline (synthetic benchmark
   - `webhook_app.py` - FastAPI app that handles Stripe webhooks
   - `parlay_compare.py` - cross-comparison helpers for the Parlay analysis view
   - `cross_book_view.py` - Streamlit-free helpers for the Cross-book view (KPI math, table shaping, model-mode fallback)
+  - `edge_scanner_view.py` - Streamlit-free helpers for the Line edge scanner view (model-mode selector labels + label→mode map; re-exports the shared model-mode fallback)
 - `sports/` - **multi-sport registry** (top-level, sibling to `nba_model`)
   - `__init__.py` - `Sport` dataclass + `SPORTS` registry + `get_sport(key)` lookup
   - `nba.py` - NBA config (live)
@@ -292,19 +293,29 @@ Then open http://localhost:8501. Layout:
 
 The Player charts view above is one of a growing set of top-level view modes.
 The others:
-- **Team charts** (free + premium): per-game team aggregates with a
-  `book mean` reference line derived from the cross-book consensus
-  `(game_total - team_spread) / 2` per book (currently `points` only — the
-  only stat books surface at the lobby level). Free tier sees preview
-  stats; premium sees all of `points / assists / rebounds / pra / 3pm /
-  fgm / minutes`.
+- **Team charts** (free + premium): per-game team aggregates for
+  `points / assists / rebounds / pra / 3pm / fgm`. `points` carries a posted
+  `book mean` reference from the cross-book consensus
+  `(game_total - team_spread) / 2` per book (the only stat books surface at
+  the lobby level). The other stats get a clearly-labeled `props-derived team
+  mean` — the sum of the team's players' cross-book consensus prop lines —
+  shown only when at least 5 rostered players have a current prop (thin /
+  offseason coverage shows an empty-state); it is a derived signal, never a
+  posted book line. Free tier sees preview stats; premium sees all team
+  stats. (`minutes` is player-only — a team minutes total is ~constant.)
 - **Line edge scanner** (free preview + premium): pick one or more books and
   see every current prop ranked by model-vs-line edge (P(over) under the
   fitted normal vs the implied breakeven). Filters for books / stats / history
   window / min-edge / min-P(over) / only-+EV, a model-mode toggle
-  (last-N mean | rolling window), a KPI row (props scanned / +EV / freshness),
-  a sortable table with progress-bar columns for `p_over` and `model_edge`,
-  CSV export, and an "open in Player Charts" jump. Free tier is limited to the
+  (last-N mean | rolling window | **Full model (beta)** — the WS9 `full` mode:
+  rolling μ/σ + team priors + per-stat distribution, with a graceful fallback to
+  last-N mean if the mode is ever unavailable, sharing the same labeling and
+  fallback contract as the Cross-book view via `nba_model/web/edge_scanner_view.py`),
+  a KPI row (props scanned / +EV / freshness),
+  a sortable table with progress-bar columns for `p_over` and `model_edge`
+  (full mode fills the appended `distribution` / `model_mode` columns per row),
+  CSV export, and an "open in Player Charts" jump. Free-tier preview limits and
+  the 8-scans/min throttle apply to every mode, `full` included. Free tier is limited to the
   preview players/stats; premium scans the full slate. CLI equivalent:
   `python3 -m nba_model.model.edge_scanner --books underdog prizepicks --min-edge 0.05`
   (add `--model-mode full` for the full prop_board projection — see
@@ -592,15 +603,16 @@ implied team totals). Each book exports a `BookScraper` describing its
 domain(s), Playwright wait selectors, session markers (login-wall vs
 authenticated content), and optional parser hooks.
 
-**Currently producing parsed data (9 of 20):**
+**Currently producing parsed data (10 of 20):**
 
 | Book | Type | Mechanism |
 |---|---|---|
 | PrizePicks, Underdog, Pick6, ParlayPlay | Player props (DFS pickem) | Per-book `prop_preprocess` emits `"<name> <line> <stat> <side>"` segments; generic `_CARD_PATTERNS` in `browser_prop_parser.py` extract them. Pick6's parser expands abbreviated names (`J. Brunson`) via `nba_active_players_ref`. |
 | BetMGM, Caesars, DraftKings, Bovada | Team lines (spread/total/moneyline) | Per-book `team_line_extractor` returns one record per (game, market, side) using NBA team names normalized via `scrapers/team_names.py`. |
 | Kalshi | Team moneylines | Decimal-odds → American conversion; index page only exposes moneyline at the lobby level. |
+| VegasInsider (aggregator) | Player-prop **real American odds** from ~11 books → `betting_lines` | `scrapers/vegasinsider.py:extract_odds_rows` parses the cross-book odds grid (over-only cells per book column); `data/vegasinsider_odds_ingestion.py` resolves player_id, attributes each cell to the **underlying** book, and inserts with `source='vegasinsider'` provenance. This is the real-odds source `--use-market-lines` / cross-book line-shopping were starved for. Over-only ⇒ `under_odds` NULL ⇒ feeds market-line math, not two-way arb. |
 
-**Stub-only (config without parser yet):** fliff, sleeper, dabble, fanduel, betrivers, fanatics, espnbet, hardrockbet, oddsshark, vegasinsider, bettingpros. Their fetch path runs and stores snapshots; add a parser by implementing `prop_preprocess` (DFS shape) or `team_line_extractor` (sportsbook shape) in their `nba_model/scrapers/<book>.py` once an authenticated NBA-page sample is on disk.
+**Stub-only (config without parser yet):** fliff, sleeper, dabble, fanduel, betrivers, fanatics, espnbet, hardrockbet, oddsshark, bettingpros. Their fetch path runs and stores snapshots; add a parser by implementing `prop_preprocess` (DFS shape) or `team_line_extractor` (sportsbook shape) in their `nba_model/scrapers/<book>.py` once an authenticated NBA-page sample is on disk.
 
 **End-to-end flow (single book):**
 ```bash
@@ -622,7 +634,7 @@ Cross-book consensus is read by the chart code via:
 - `db.get_consensus_prop_lines(player_name, stat_type, side, since_hours, min_books)`
 - `db.get_consensus_team_lines(away_team, home_team, market_type, side, since_hours, min_books)`
 
-Both return `mean_line`, `min_line`, `max_line`, `n_books`, and the contributing-book list. The chart's `book mean X.X` reference line is derived from these — for player charts directly, for team charts via `(game_total - team_spread) / 2` per book.
+Both return `mean_line`, `min_line`, `max_line`, `n_books`, and the contributing-book list. The chart's `book mean X.X` reference line is derived from these — for player charts directly, for team `points` via `(game_total - team_spread) / 2` per book. Non-points team charts have no lobby line, so `get_consensus_prop_lines` also feeds a `props-derived team mean` = Σ of the team's players' consensus prop lines (`player_charts._fetch_props_derived_team_reference`; ≥5-player floor, `matchup`-based roster) — a derived signal, drawn distinctly and never labeled a book line.
 
 ### 5) Daily ETL Runner (Game Logs + Defense + Odds + Reverse Engineering)
 
@@ -1130,4 +1142,4 @@ Open-access NBA deploy is shippable today. Full detail + model/auto-bet plan in 
 2. **Stub scrapers** — add parsers for the 11 books that only store snapshots today; sportsbook odds feeds are what make TRUE-arb detection and CLV meaningful.
 3. **Validate before any auto-bet** — the tooling shipped (Edge Scanner `full` mode, `cross_book_arb.py`, `bet_log` / `bet_slip` / `calibration_report`); what's left is running it: market-line backtests, a 4–8 week paper-trade, and calibration review (`notes.txt` WS10 Phases 1–2).
 
-**Later:** multi-sport web views (MLB beta data exists off NBA path), team-chart stats beyond lobby `points`, structured logging. Multi-sport rollout: [docs/MULTI_SPORT_PLAN.md](docs/MULTI_SPORT_PLAN.md).
+**Later:** multi-sport web views (MLB beta data exists off NBA path), structured logging. (Team charts now cover assists/rebounds/pra/3pm/fgm with a props-derived team reference for the non-points stats.) Multi-sport rollout: [docs/MULTI_SPORT_PLAN.md](docs/MULTI_SPORT_PLAN.md).

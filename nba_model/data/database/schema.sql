@@ -93,6 +93,7 @@ CREATE TABLE IF NOT EXISTS betting_lines (
     over_odds INTEGER,
     under_odds INTEGER,
     scraped_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    source TEXT,  -- provenance: NULL = direct scrape; e.g. 'vegasinsider' = lifted off an aggregator
     FOREIGN KEY (player_id) REFERENCES players(player_id)
 );
 

@@ -133,8 +133,30 @@ class DatabaseManager:
             self.conn.executescript(f.read())
 
         self._ensure_sport_columns()
+        self._ensure_betting_lines_source_column()
 
         logger.info("Database initialized at %s", self.db_path)
+
+    def _ensure_betting_lines_source_column(self):
+        """Add a nullable ``source`` provenance column to ``betting_lines``.
+
+        Real odds harvested from a public aggregator (e.g. VegasInsider, which
+        republishes ~11 books' lines) are attributed to the UNDERLYING book in
+        ``book`` but tagged here with the aggregator name so a row's origin
+        stays auditable — a direct FanDuel scrape (``source`` NULL) is
+        distinguishable from a FanDuel line lifted off an aggregator
+        (``source='vegasinsider'``). Idempotent; additive (default NULL) so
+        every existing row and insert path is unaffected."""
+        try:
+            cols = {
+                r[1] for r in self.conn.execute(
+                    "PRAGMA table_info(betting_lines)").fetchall()
+            }
+        except sqlite3.OperationalError:
+            return
+        if cols and "source" not in cols:
+            self.conn.execute("ALTER TABLE betting_lines ADD COLUMN source TEXT")
+            self.conn.commit()
 
     def _ensure_sport_columns(self):
         """Add ``sport TEXT NOT NULL DEFAULT 'nba'`` to the multi-sport tables
@@ -775,8 +797,9 @@ class DatabaseManager:
 
         query = """
             INSERT INTO betting_lines
-                (player_id, game_date, book, stat_type, line_value, over_odds, under_odds)
-            SELECT ?, ?, ?, ?, ?, ?, ?
+                (player_id, game_date, book, stat_type, line_value,
+                 over_odds, under_odds, source)
+            SELECT ?, ?, ?, ?, ?, ?, ?, ?
             WHERE NOT EXISTS (
                 SELECT 1
                 FROM betting_lines bl
@@ -817,7 +840,11 @@ class DatabaseManager:
             ):
                 rejected_implausible += 1
                 continue
-            payload.append(row + row)
+            # INSERT carries the 7 core columns + optional provenance ``source``
+            # (NULL for direct scrapes); the WHERE-NOT-EXISTS dedup keys off the
+            # 7 core columns only, so re-tagging never creates duplicate rows.
+            source = rec.get("source")
+            payload.append(row + (source,) + row)
 
         if not payload:
             return {
@@ -2000,6 +2027,27 @@ class DatabaseManager:
                 (cursor.lastrowid, model_config_json),
             )
         self.conn.commit()
+
+    def delete_nonfinite_predictions(self):
+        """Delete predictions with a non-finite projected moment (one-off cleanup).
+
+        ``predictions`` rows persisted before the NULL-in-window μ/σ fix could
+        carry a NaN ``predicted_mean`` / ``predicted_std`` / ``prob_over``.
+        SQLite stores a Python ``float('nan')`` REAL as NULL, so those broken
+        rows are exactly the ones with a NULL in any of those three columns
+        (``insert_prediction`` always binds a real float, so a NULL there is the
+        NaN signature, not a legitimately-missing value). Returns the row count
+        removed. Idempotent."""
+        cursor = self.conn.execute(
+            """
+            DELETE FROM predictions
+            WHERE predicted_mean IS NULL
+               OR predicted_std IS NULL
+               OR prob_over IS NULL
+            """
+        )
+        self.conn.commit()
+        return int(cursor.rowcount)
 
     def get_prediction_config(self, prediction_id):
         """Fetch model configuration JSON for a prediction id."""
