@@ -6,7 +6,8 @@ Active tracker only: architecture, what's done, what's next. CLI runbooks,
 deployment, and security live in **README.md** and **docs/** — not duplicated here.
 
 Test baseline: **702 passing** (`.venv/bin/python3 -m pytest nba_model/tests -q`;
-Windows: `.venv\Scripts\python.exe -m pytest nba_model/tests -q`).
+Windows: `.venv\Scripts\python.exe -m pytest nba_model/tests -q`), plus **11 API
+tests** run separately (`.venv/bin/python3 -m pytest api/tests -q`).
 
 ---
 
@@ -21,14 +22,17 @@ Windows: `.venv\Scripts\python.exe -m pytest nba_model/tests -q`).
    11-book odds into `betting_lines`). theScore/DraftKings/Fliff fetch paths are fixed but
    NBA-offseason-empty — their extractors are the first preseason task. Remaining blocks
    are external (mobile-only / paywalled / 21+), not code. See scraper follow-ups below.
-4. **Multi-sport** — MLB data layer is beta (off NBA consensus path). NFL scaffold parked.
+4. **Flagship UI Phase 2** — cross-book view, parlay builder, line-movement animation
+   on the new FastAPI + React frontend (see "New UI (flagship)" section at the bottom).
+5. **Multi-sport** — MLB data layer is beta (off NBA consensus path). NFL scaffold parked.
    NBA deploy does not require shipping MLB/NFL web views.
 
 ---
 
 ## Architecture (compact)
 
-- **Stack:** Python 3.11, SQLite `data/database/nba_data.db`, Streamlit + Tk, pytest.
+- **Stack:** Python 3.11, SQLite `data/database/nba_data.db`, Streamlit + Tk, pytest;
+  new flagship UI = FastAPI (`api/`, read-only) + React/Vite/Tailwind (`frontend/`).
 - **Ingest:** `nba_results_ingestion.py`, `daily_etl.py`, `hourly_update.py` (Mac host).
 - **Scrapers:** `nba_model/scrapers/` (20 registered); fetch via CDP + real Chrome `:9222`.
 - **Model:** `simulation.py`, `prop_board.py` (shared projection helpers),
@@ -82,6 +86,24 @@ save; web = Plotly, Tk = matplotlib; do not delete `sports/` scaffolding.
   `historical_odds_backfill.py`, FanDuel/BetRivers/ESPNBet team-line parsers (fixtures).
 - **Multi-sport** — `sport` column migration; `(book, sport)` scraper resolution; MLB Stats
   API ingest + `mlb_game_logs`; FanDuel MLB team lines validated live; NFL scaffold only.
+- **Hardening sprint (2026-07-21)** — (1) Edge-scanner view exposes `full` mode
+  ("Full model (beta)"; shared label/fallback contract in `web/edge_scanner_view.py`,
+  graceful degrade to chart_mean; preview limits/throttle unchanged). (2) NaN-moment
+  root-fix: `_repair_nan_stat_moments` in `build_history_from_games` recomputes rolling
+  μ/σ over surviving games when NULLs land in-window (≥50% valid floor, else row
+  skipped); `_persist_predictions` non-finite guard; `delete_nonfinite_predictions()`
+  cleanup; scanner/hourly parity preserved. (3) Team charts: props-derived team
+  reference for non-points stats (Σ players' consensus prop lines, ≥5-player floor,
+  matchup-based rosters, never presented as a book line); points path byte-identical.
+  (4) Structured logging: `nba_model/logging_utils.py` (stdlib, JSON-lines file +
+  human console, `LOG_LEVEL`); migrated daily_etl / hourly_update / publish_db /
+  nba_results_ingestion / bet_slip / calibration_report with report/alert/exit-code
+  contracts unchanged; `webhook_app` untouched (strict A09 redaction).
+- **Flagship UI Phase 1 (2026-07-22)** — read-only FastAPI `api/` + React/Vite/
+  Tailwind/ECharts `frontend/` (trading-terminal design system); 3 views (Slate
+  Dashboard, Player Detail, Edge Scanner) verified against the live DB; 11 API tests
+  (`api/tests`, separate from the nba_model baseline). Details + Phase 2/3 backlog in
+  the "New UI (flagship)" section at the bottom.
 - **Scraper mission (2026-07-21)** — **VegasInsider aggregator parser**
   (`scrapers/vegasinsider.py` + `data/vegasinsider_odds_ingestion.py`): real American
   odds from ~11 books → `betting_lines` with `source='vegasinsider'` provenance
@@ -110,42 +132,13 @@ save; web = Plotly, Tk = matplotlib; do not delete `sports/` scaffolding.
 
 ### Smaller follow-ups
 
-- [x] Expose `full` mode in the **Line edge scanner** view's model toggle
-      (2026-07-21) — "Full model (beta)" added to the selector, mirroring the
-      Cross-book view: shared label/fallback contract via
-      `nba_model/web/edge_scanner_view.py` (re-exports `resolve_model_mode`),
-      graceful degrade to chart_mean when unavailable. Preview limits + scan
-      throttle apply to `full` unchanged. Tests: `test_edge_scanner_view.py`.
-- [x] Root-fix NaN moments (2026-07-21): `build_history_from_games` now recomputes
-      NaN rolling μ/σ over the surviving games when a NULL stat value lands inside the
-      window (available-case; `_repair_nan_stat_moments`, floor
-      `MIN_VALID_WINDOW_FRACTION`=0.5 → ≥5 of 10, min 2). Below the floor μ/σ stays NaN
-      and the row is skipped. `_persist_predictions` also drops non-finite rows (defense
-      in depth) and `db.delete_nonfinite_predictions()` cleans any pre-fix NaN rows
-      (SQLite stores NaN REAL as NULL). Parity with Edge Scanner full mode preserved;
-      clean-window μ/σ unchanged.
-- [x] Team charts beyond lobby `points` (2026-07-21): per-game team aggregates already
-      cover points/assists/rebounds/pra/3pm/fgm (`_team_value_sql_expr`; minutes stays
-      out — team sum is ~constant and the SQL allowlist forbids it). New for non-points:
-      a **props-derived team reference** = Σ of the team's players' cross-book consensus
-      prop lines (`_fetch_props_derived_team_reference`), rendered as a distinct dotted
-      line labeled "props-derived team mean", never a book line. Coverage floor
-      `DERIVED_TEAM_REF_MIN_PLAYERS`=5 (empty-state below it; offseason usually empty);
-      roster via `game_logs.matchup` (players.team sparse); staleness via `since_hours`
-      (validated by `iv.validate_min_players` / `validate_since_hours`). Points path
-      byte-identical. Tests: `test_team_props_reference.py`.
-- [x] Structured logging (2026-07-21): shared `nba_model/logging_utils.py` (stdlib
-      only; JSON-lines file formatter with UTC ISO ts + `extra=` fields, human
-      console, `LOG_LEVEL` env, `get_logger` / `configure_logging`). Migrated
-      daily_etl, hourly_update, publish_db, nba_results_ingestion, bet_slip,
-      calibration_report — report/alert/exit-code contracts unchanged; per-step
-      `step` / `status` / `duration_ms` fields added. `webhook_app` left untouched
-      (strict A09 redaction; its tests stay green). TODO: migrate scraper/fetch path
-      to logging_utils once scraper work lands. Note: `market_reverse_engineering`
-      calls `logging.basicConfig` at import, which no-ops daily_etl's own file
-      handler (pre-existing; hourly uses `force=` and is unaffected). Tests:
-      `test_logging_utils.py`.
 - [ ] MLB per-game player-props parser + park factors.
+- [ ] Migrate the scraper/fetch path (`web_text_ingestion`, browser/team-line
+      parsers) to `logging_utils` (deferred while scraper verification is active).
+      Pre-existing quirk to fix alongside: `market_reverse_engineering` calls
+      `logging.basicConfig` at import, which no-ops daily_etl's own file handler
+      (hourly uses `force=` and is unaffected).
+- [ ] Flagship UI Phase 2 — see the "New UI (flagship)" backlog at the bottom.
 
 ### Scraper follow-ups (post-2026-07-21 mission: shortcomings + next steps)
 
@@ -169,8 +162,8 @@ Next steps (in order):
 
 - [ ] **Wire VegasInsider into the ETL cadence** — `vegasinsider_odds_ingestion` is a
       standalone CLI today; hourly ETL only stores the snapshot. Add the ingestion
-      step to `hourly_update` / `daily_etl` (after the structured-logging work lands
-      to avoid conflicts) so fresh grids auto-flow into `betting_lines`.
+      step to `hourly_update` / `daily_etl` so fresh grids auto-flow into
+      `betting_lines`.
 - [ ] **Preseason capture sprint (~Oct)** — re-fetch and author the deferred
       extractors against real NBA content: theScore `team_line_extractor`,
       DraftKings NBA validation (scroll path), Fliff `prop_preprocess` (PP-style
@@ -338,17 +331,27 @@ A brand-new, standalone frontend that will become the flagship surface. It is
   scrape" instead of a blank pane (LeBron detail renders fully from historical
   logs; live-line surfaces are correctly empty until October).
 
-### Phase 2 / 3 backlog
+### Phase 2 — next up (feature parity on the money views)
 
 - [ ] **Cross-book view** — wire `cross_book_arb` (line shopping / middles /
-      true-arb) into a dedicated view, mirroring the Streamlit Cross-book layer.
+      true-arb) into a dedicated view, mirroring the Streamlit Cross-book layer:
+      new read-only endpoints in `api/` + a dense table view with the distinct
+      true-arb section and min-gap / books / stats filters.
+- [ ] **Line-movement animations** — animate `betting_line_snapshots` drift per
+      book (the data + Streamlit "Line Movement" tab already exist); ECharts
+      timeline or replay scrubber on the Player Detail view.
+- [ ] **Team charts view** — per-game team aggregates + the props-derived team
+      reference (parity with the Streamlit Team charts view shipped 2026-07-21).
+- [ ] **Code-split ECharts** — bundle is ~1.4 MB; lazy-load charts / manualChunks.
+- [ ] **Frontend tests** — component tests for the design-system table/probability
+      components once the Phase 2 surface stabilizes.
+
+### Phase 3 — later
+
 - [ ] **Parlay builder** — multi-leg SGP with correlation, on top of the
       existing parlay model helpers.
-- [ ] **Line-movement animations** — animate `betting_line_snapshots` drift per
-      book (the data + Streamlit "Line Movement" tab already exist).
-- [ ] **Code-split ECharts** — bundle is ~1.4 MB; lazy-load charts / manualChunks.
-- [ ] **Auth + deploy story** — Phase 1 is local-only, no auth. Phase 3: reuse
-      the existing OIDC/Stripe tier model, add a deploy target (the API is
+- [ ] **Auth + deploy story** — Phase 1/2 are local-only, no auth. Reuse the
+      existing OIDC/Stripe tier model, add a deploy target (the API is
       stateless + read-only, so it fronts the same published DB the cloud app uses).
-- [ ] **Frontend tests** — component/e2e once the surface stabilizes (not required
-      in Phase 1).
+- [ ] **Watchlist / bet-slip surface** — read `bet_log` + calibration artifacts so
+      the WS10 paper-trade review happens in the flagship UI instead of CSVs.

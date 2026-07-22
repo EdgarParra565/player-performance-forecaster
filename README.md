@@ -24,7 +24,8 @@ The current baseline is designed to be reproducible offline (synthetic benchmark
 - Admin dashboard (subscribers / MRR estimate / churn) gated to `is_admin()`; Stripe `STRIPE_MODE=test|live` env toggle; webhook alert on `invoice.payment_failed`; free-tier app-layer scan throttle; optional first-sign-in trial (`ENABLE_TRIAL`).
 - ETL alerting: daily + hourly reports embed an `alert` marker and accept `--alert-webhook-url`. The hourly recompute persists predictions for points/assists/rebounds/pra. The distribution sweep settles each stat at a realistic per-stat line by default (no more `line == mean` degeneracy).
 - **Multi-sport scaffolding:** idempotent `sport` column on core tables, per-`(book, sport)` scraper resolution, registry-driven stat validation. `sports/` package: NBA live; MLB data layer beta (ingest + **FanDuel and DraftKings team lines, both live-verified**); NFL/NHL/soccer stubs. Streamlit sport-picker shows roadmap cards for non-live sports. Rollout plan: [docs/MULTI_SPORT_PLAN.md](docs/MULTI_SPORT_PLAN.md). Active tracker: `notes.txt`.
-- **702 tests passing** (regression + stress + adversarial + edge-scanner + cross-book + bet-log/paper-trading + billing + multi-sport + team-chart derived references). `bandit` MEDIUM/HIGH = 0; `pip-audit` clean.
+- **New flagship UI (Phase 1)**: a standalone trading-terminal-style frontend — read-only FastAPI service in `api/` + React/TypeScript/Vite/Tailwind/ECharts app in `frontend/` — parallel to (not replacing) the Streamlit and Tk UIs. Three views verified against the live DB: Slate Dashboard, Player Detail (flagship), Edge Scanner. Run: `.venv/bin/python3 -m uvicorn api.main:app --port 8000` + `npm run dev` in `frontend/` → http://localhost:5173 (docs in `frontend/README.md`; Phase 2/3 roadmap in `notes.txt` "New UI (flagship)").
+- **702 tests passing** in the core suite (regression + stress + adversarial + edge-scanner + cross-book + bet-log/paper-trading + billing + multi-sport + team-chart derived references), plus 11 API-service tests run separately (`.venv/bin/python3 -m pytest api/tests -q`). `bandit` MEDIUM/HIGH = 0; `pip-audit` clean.
 
 ## Repository Layout
 
@@ -44,6 +45,8 @@ The current baseline is designed to be reproducible offline (synthetic benchmark
   - `bet_slip.py` / `calibration_report.py` - paper-trading slip export (`bet_log`) + reliability/Brier reporting (WS10)
 - `nba_model/tests/` - smoke and integration-style tests
 - `nba_model/visualization/` - distribution plotting + Player/Team chart builders (`player_charts.py` powers both UIs; also exposes `fetch_recent_games` / `fetch_player_recent_results` / `list_seasons` for the browse views)
+- `api/` - **read-only FastAPI service** backing the new flagship UI (wraps the same `player_charts` / `edge_scanner` / consensus functions Streamlit uses; pydantic models; input validation via `nba_model/web/input_validation.py`; tests in `api/tests/`)
+- `frontend/` - **flagship React UI** (TypeScript + Vite + Tailwind + ECharts; trading-terminal design system; talks to `api/` through the Vite `/api` proxy — see `frontend/README.md`)
 - `nba_model/web/` - Streamlit web frontend + auth + Stripe membership glue
   - `app.py` - the Streamlit app (Player charts, Team charts, Game Results, Player Stats Browse, plus premium views)
   - `auth.py` - native OIDC wrapper + tier-based feature gating

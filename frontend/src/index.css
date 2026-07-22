@@ -1,0 +1,99 @@
+@import "tailwindcss";
+
+/*
+ * Design tokens — "trading terminal for sports".
+ * Near-black surfaces, one restrained accent per polarity (electric green for
+ * +EV, red for -EV), monospaced tabular numerals for every line/odd/prob.
+ * Tokens defined here become Tailwind utilities automatically:
+ *   --color-pos  -> text-pos / bg-pos / border-pos
+ *   --font-mono  -> font-mono
+ */
+@theme {
+  /* Surfaces (darkest -> raised) */
+  --color-base: #08090b;
+  --color-panel: #0e1014;
+  --color-panel-2: #14171d;
+  --color-panel-3: #1a1e26;
+
+  /* Borders */
+  --color-line: #20242c;
+  --color-line-strong: #2c313b;
+
+  /* Text */
+  --color-fg: #e7eaf0;
+  --color-muted: #8a92a1;
+  --color-faint: #59606d;
+
+  /* Polarity accents */
+  --color-pos: #12e29a;
+  --color-pos-dim: #0c7a56;
+  --color-pos-soft: #0f2a22;
+  --color-neg: #ff495f;
+  --color-neg-dim: #a52537;
+  --color-neg-soft: #2a1116;
+
+  /* Support accents (used sparingly) */
+  --color-warn: #f4b740;
+  --color-info: #58a6ff;
+
+  --font-sans: "Inter", ui-sans-serif, system-ui, -apple-system, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+}
+
+@layer base {
+  html {
+    background-color: var(--color-base);
+    color-scheme: dark;
+  }
+
+  body {
+    margin: 0;
+    background-color: var(--color-base);
+    color: var(--color-fg);
+    font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+
+  /* Every number is tabular so columns align down the page. */
+  .tnum {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    font-feature-settings: "tnum" 1;
+  }
+
+  /* Thin scrollbars that read as part of the terminal chrome. */
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: var(--color-line-strong) transparent;
+  }
+  *::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  *::-webkit-scrollbar-thumb {
+    background: var(--color-line-strong);
+    border-radius: 4px;
+  }
+  *::-webkit-scrollbar-track {
+    background: transparent;
+  }
+}
+
+@layer components {
+  /* A subtle top-lit panel — the base container for every card/table. */
+  .panel {
+    background-color: var(--color-panel);
+    border: 1px solid var(--color-line);
+    border-radius: 6px;
+  }
+
+  /* Uppercase micro-label used for section headers and column captions. */
+  .eyebrow {
+    font-size: 10px;
+    letter-spacing: 0.09em;
+    text-transform: uppercase;
+    color: var(--color-faint);
+    font-weight: 600;
+  }
+}
