@@ -6,6 +6,8 @@ const NAV = [
   { to: "/", label: "Slate", end: true },
   { to: "/player", label: "Player", end: false },
   { to: "/edges", label: "Edge Scanner", end: false },
+  { to: "/cross-book", label: "Cross-book", end: false },
+  { to: "/teams", label: "Team Charts", end: false },
 ];
 
 export function Layout() {

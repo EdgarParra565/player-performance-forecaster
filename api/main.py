@@ -223,3 +223,67 @@ def player_detail(
         n_games=_validated_n_games(n_games),
         rolling_window=_validated_rolling(rolling_window),
     ))
+
+
+@app.get("/api/players/{player_id}/line-movement",
+         response_model=schemas.LineMovementResponse)
+def line_movement(
+    player_id: int,
+    stat: str = Query("points"),
+    lookback_hours: float = Query(168.0),
+) -> schemas.LineMovementResponse:
+    db_path = _require_db()
+    canonical_stat = _validated_stat(stat)
+    return schemas.LineMovementResponse(**services.line_movement(
+        db_path, player_id, canonical_stat,
+        lookback_hours=_validated_since(lookback_hours),
+    ))
+
+
+@app.get("/api/cross-book", response_model=schemas.CrossBookResponse)
+def cross_book(
+    books: Optional[list[str]] = Query(None),
+    stats: Optional[list[str]] = Query(None),
+    since_hours: float = Query(48.0),
+    n_games: int = Query(25, ge=1),
+    model_mode: str = Query("chart_mean"),
+    rolling_window: int = Query(10, ge=1),
+    min_gap: float = Query(0.5, ge=0.0),
+    min_books: int = Query(2, ge=2),
+) -> schemas.CrossBookResponse:
+    db_path = _require_db()
+    if model_mode not in es.MODEL_MODES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"model_mode must be one of {list(es.MODEL_MODES)}",
+        )
+    clean_stats = [_validated_stat(s) for s in stats] if stats else None
+    return schemas.CrossBookResponse(**services.cross_book(
+        db_path,
+        books=books,
+        stats=clean_stats,
+        since_hours=_validated_since(since_hours),
+        n_games=_validated_n_games(n_games),
+        model_mode=model_mode,
+        rolling_window=_validated_rolling(rolling_window),
+        min_gap=min_gap,
+        min_books=min_books,
+    ))
+
+
+@app.get("/api/teams/{team}/chart", response_model=schemas.TeamChartResponse)
+def team_chart(
+    team: str,
+    stat: str = Query("points"),
+    n_games: int = Query(25, ge=1),
+) -> schemas.TeamChartResponse:
+    db_path = _require_db()
+    try:
+        canonical_team = iv.validate_team_code(team)
+    except iv.ValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    canonical_stat = _validated_stat(stat)
+    return schemas.TeamChartResponse(**services.team_chart(
+        db_path, canonical_team, canonical_stat,
+        n_games=_validated_n_games(n_games),
+    ))

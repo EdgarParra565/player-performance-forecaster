@@ -59,6 +59,23 @@ October, and the UI shows "last data" / "last scrape" rather than blank panes):
    table (books, stats, min-edge, min-P(over), only-+EV) with the same
    `chart_mean | rolling | full` model-mode semantics as the CLI.
 
+## What's in Phase 2 (money views)
+
+1. **Cross-book** (`/cross-book`) — line shopping & middle candidates from the
+   DFS board plus a distinct TRUE two-way arbitrage section (real posted odds
+   only). KPI row (pairs / max gap / ≥min-gap / true arbs / freshest), model-mode
+   / min-gap / min-books / books / stats filters, CSV export, Player-Detail jump.
+   Middles are labeled candidates, never guaranteed.
+2. **Line-movement replay** — a panel on Player Detail that animates
+   `betting_line_snapshots` drift per book (play/pause + scrubber, per-book
+   open→close deltas).
+3. **Team Charts** (`/teams`) — per-game team aggregates; points carries the
+   implied team total, other stats show the props-derived reference (Σ players'
+   consensus lines, ≥5-player floor, clearly labeled as derived).
+
+ECharts is now code-split (lazy-loaded) so the initial route ships ~370 KB
+instead of ~1.4 MB.
+
 ## Design system
 
 A small real design system drives every view (in `src/components/` and the
@@ -85,18 +102,24 @@ All GET, all read-only, all with `Cache-Control` (short `max-age` on data,
 | `GET /api/slate/edges` | scored edges (dashboard + Edge Scanner) |
 | `GET /api/players/search` | server-side player search |
 | `GET /api/players/{id}` | player detail (series, distribution, book table) |
+| `GET /api/players/{id}/line-movement` | snapshot drift per book (replay) |
+| `GET /api/cross-book` | line shopping / middles + TRUE two-way arb |
+| `GET /api/teams/{team}/chart` | per-game team aggregates + derived reference |
 
 ### Tests
 
 ```bash
+# API (httpx TestClient against a temp seeded DB) — 21 tests
 .venv/bin/python3 -m pytest api/tests -q
-```
 
-Frontend tests are out of scope for Phase 1 (working + clean code is the bar).
+# Frontend component tests (vitest + testing-library) — 14 tests
+cd frontend && npm run test
+```
 
 ## Notes
 
-- The production bundle is ~1.4 MB (ECharts is heavy); acceptable for a
-  local-only tool. Code-splitting ECharts is a Phase 2 nicety.
+- ECharts is code-split behind a lazy boundary (`EChart` / `LineSparkline`) with
+  a `manualChunks` vendor split, so the initial route no longer pays the ~1 MB
+  charting cost.
 - A parallel agent runs live scraper tests against the same DB — treat the DB as
   read-only and expect its contents to change under you.

@@ -22,8 +22,9 @@ tests** run separately (`.venv/bin/python3 -m pytest api/tests -q`).
    11-book odds into `betting_lines`). theScore/DraftKings/Fliff fetch paths are fixed but
    NBA-offseason-empty — their extractors are the first preseason task. Remaining blocks
    are external (mobile-only / paywalled / 21+), not code. See scraper follow-ups below.
-4. **Flagship UI Phase 2** — cross-book view, parlay builder, line-movement animation
-   on the new FastAPI + React frontend (see "New UI (flagship)" section at the bottom).
+4. **Flagship UI** — Phases 1 + 2 shipped (5 views incl. Cross-book, Team Charts,
+   line-movement replay). Phase 3 (deploy/auth/WS10 surfaces) is the remaining slice —
+   see "New UI (flagship)" section at the bottom.
 5. **Multi-sport** — MLB data layer is beta (off NBA consensus path). NFL scaffold parked.
    NBA deploy does not require shipping MLB/NFL web views.
 
@@ -102,8 +103,10 @@ save; web = Plotly, Tk = matplotlib; do not delete `sports/` scaffolding.
 - **Flagship UI Phase 1 (2026-07-22)** — read-only FastAPI `api/` + React/Vite/
   Tailwind/ECharts `frontend/` (trading-terminal design system); 3 views (Slate
   Dashboard, Player Detail, Edge Scanner) verified against the live DB; 11 API tests
-  (`api/tests`, separate from the nba_model baseline). Details + Phase 2/3 backlog in
-  the "New UI (flagship)" section at the bottom.
+  (`api/tests`, separate from the nba_model baseline). **Phase 2 shipped 2026-07-29**
+  (Cross-book, line-movement replay, Team Charts, ECharts code-split, frontend tests;
+  api tests 11 → 21, +14 vitest). Details + Phase 3 backlog in the "New UI (flagship)"
+  section at the bottom.
 - **Parser verification sweep (2026-07-22)** — all 16 parser-bearing book paths
   swept end-to-end (fresh CDP fetch → parse → DB): **2 LIVE** (FanDuel MLB 84 rows,
   DraftKings MLB 84 rows — DK was the one BROKEN book, fixed: `event-cell` wait
@@ -146,7 +149,11 @@ save; web = Plotly, Tk = matplotlib; do not delete `sports/` scaffolding.
       Pre-existing quirk to fix alongside: `market_reverse_engineering` calls
       `logging.basicConfig` at import, which no-ops daily_etl's own file handler
       (hourly uses `force=` and is unaffected).
-- [ ] Flagship UI Phase 2 — see the "New UI (flagship)" backlog at the bottom.
+- [x] Flagship UI Phase 2 — shipped 2026-07-29; Phase 3 backlog remains (see the
+      "New UI (flagship)" section at the bottom).
+- [ ] Flagship line-movement lookback — `validate_since_hours` caps replay depth at
+      30 days; add a deeper-window validator (e.g. `validate_lookback_hours`) so the
+      flagship can review months of drift.
 
 ### Scraper follow-ups (post-2026-07-21 mission: shortcomings + next steps)
 
@@ -348,20 +355,59 @@ A brand-new, standalone frontend that will become the flagship surface. It is
   scrape" instead of a blank pane (LeBron detail renders fully from historical
   logs; live-line surfaces are correctly empty until October).
 
-### Phase 2 — next up (feature parity on the money views)
+### Phase 2 — shipped (2026-07-29)
 
-- [ ] **Cross-book view** — wire `cross_book_arb` (line shopping / middles /
-      true-arb) into a dedicated view, mirroring the Streamlit Cross-book layer:
-      new read-only endpoints in `api/` + a dense table view with the distinct
-      true-arb section and min-gap / books / stats filters.
-- [ ] **Line-movement animations** — animate `betting_line_snapshots` drift per
-      book (the data + Streamlit "Line Movement" tab already exist); ECharts
-      timeline or replay scrubber on the Player Detail view.
-- [ ] **Team charts view** — per-game team aggregates + the props-derived team
-      reference (parity with the Streamlit Team charts view shipped 2026-07-21).
-- [ ] **Code-split ECharts** — bundle is ~1.4 MB; lazy-load charts / manualChunks.
-- [ ] **Frontend tests** — component tests for the design-system table/probability
-      components once the Phase 2 surface stabilizes.
+Feature parity on the money views. Same additive/read-only contract as Phase 1
+(no `nba_model/**` changes; new endpoints wrap the SAME functions Streamlit uses;
+inputs validated through `nba_model/web/input_validation.py`).
+
+- [x] **Cross-book view** — new `GET /api/cross-book` runs the exact Streamlit
+      pipeline: `fetch_latest_prop_lines` → `score_prop_edges` →
+      `cross_book_arb.find_cross_book_opportunities` (line-gap / middle
+      candidates), plus `fetch_two_way_lines` → `detect_two_way_arb` (TRUE arb,
+      real odds both legs only); KPIs from `cross_book_view.compute_kpis`. Dense
+      `CrossBookTable` + a visually distinct green true-arb section, model-mode /
+      min-gap / min-books / books / stats filters, client-side CSV export, and a
+      Player-Detail jump. Middles are labeled "MIDDLE?" (candidate), never
+      guaranteed; the book chip list unions `web_prop_cards` + `betting_lines`.
+- [x] **Line-movement animation** — new `GET /api/players/{id}/line-movement`
+      returns `betting_line_snapshots` forward-filled per book onto a shared
+      timestamp axis; a replay panel on Player Detail with play/pause + a scrubber
+      and per-book open→close drift deltas. Historical depth is bounded by
+      `validate_since_hours` (30-day cap) — see deferred note below.
+- [x] **Team charts view** — new `GET /api/teams/{team}/chart` wraps
+      `fetch_team_chart_data`: per-game team aggregates (points/assists/rebounds/
+      pra/ra/3pm/fgm), points carries the implied team total, other stats show the
+      props-derived reference (Σ players' consensus lines, ≥5-player floor),
+      clearly labeled as derived, with an empty-state when thin.
+- [x] **Code-split ECharts** — `EChart`/`LineSparkline` moved behind `React.lazy`
+      + a `manualChunks` echarts vendor split. Initial route chunk dropped from
+      ~1.4 MB to ~370 KB (114 KB gz); the 1.06 MB echarts chunk loads lazily
+      behind the chart boundary.
+- [x] **Frontend tests** — vitest + testing-library (jsdom). 14 tests across
+      `DataTable` (sort/nulls-sink/row-click/initialSort), `ProbabilityBar`
+      (label/null/marker), and `CrossBookTable` (rows/middle-candidate labeling/
+      sort/row-click/empty). Run: `npm run test` in `frontend/`.
+- **API tests** — `api/tests/test_api_phase2.py`, 10 cases (cross-book line-gap +
+      TRUE-arb, line-movement series/empty/bad-stat, team-chart populated/empty/
+      bad-team, bad-model-mode). Kept OUT of `nba_model/tests`.
+- **Verified rendering** — team charts render populated from live NBA history
+      (ATL points, mean 116.3); cross-book + line-movement render their offseason
+      empty-states on the live DB (all stored props are 2026-05-08 and snapshots
+      2026-03-14, both older than the 30-day window) and render fully populated
+      against a seeded recent-timestamp DB (4 cross-book rows incl. 1 true arb at
+      +9.1%; 3-book × 6-timestamp line drift). Screenshotted both states.
+
+Test counts after Phase 2: **nba_model 702**, **api 21** (11 + 10 new),
+**frontend 14** (all new).
+
+Deferred / follow-ups:
+- Line-movement historical depth is capped at 30 days by `validate_since_hours`
+  (the closest existing validator). Offseason stored snapshots are older, so the
+  live view shows the empty-state; a deeper-window validator (or a dedicated
+  `validate_lookback_hours`) would let the flagship review months of drift.
+- Cross-book CSV is client-side (mirrors the Streamlit download without adding a
+  write/response path to the read-only API).
 
 ### Phase 3 — later
 

@@ -17,8 +17,10 @@ import pandas as pd
 from scipy.stats import norm
 
 from nba_model.data.database.db_manager import DatabaseManager
+from nba_model.model import cross_book_arb as cba
 from nba_model.model import edge_scanner as es
 from nba_model.visualization import player_charts as pc
+from nba_model.web import cross_book_view as cbv
 
 # Stats the chart layer can actually series/fit (mirrors player_charts).
 CHARTABLE_STATS = (
@@ -447,4 +449,230 @@ def player_detail(
         "last_line_scraped_utc": (
             staleness.get("latest_iso") if staleness else None
         ),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Cross-book layer (line shopping / middles / TRUE two-way arb)
+# ---------------------------------------------------------------------------
+
+def _cross_rows(df: pd.DataFrame) -> list[dict]:
+    out: list[dict] = []
+    if df is None or df.empty:
+        return out
+    for r in df.to_dict("records"):
+        out.append({
+            "player_name": _str(r.get("player_name")) or "",
+            "stat_type": _str(r.get("stat_type")) or "",
+            "n_books": _int(r.get("n_books")) or 0,
+            "line_min": _num(r.get("line_min")),
+            "line_max": _num(r.get("line_max")),
+            "line_gap": _num(r.get("line_gap")),
+            "best_over_book": _str(r.get("best_over_book")),
+            "best_under_book": _str(r.get("best_under_book")),
+            "consensus_mean": _num(r.get("consensus_mean")),
+            "p_over_at_line_min": _num(r.get("p_over_at_line_min")),
+            "p_over_at_line_max": _num(r.get("p_over_at_line_max")),
+            "middle_size": _num(r.get("middle_size")),
+            "opportunity_type": _str(r.get("opportunity_type")),
+            "model_mu": _num(r.get("model_mu")),
+            "model_sigma": _num(r.get("model_sigma")),
+        })
+    return out
+
+
+def _arb_rows(df: pd.DataFrame) -> list[dict]:
+    out: list[dict] = []
+    if df is None or df.empty:
+        return out
+    for r in df.to_dict("records"):
+        out.append({
+            "player_name": _str(r.get("player_name")) or "",
+            "stat_type": _str(r.get("stat_type")) or "",
+            "game_date": _str(r.get("game_date")),
+            "over_book": _str(r.get("over_book")) or "",
+            "over_line": _num(r.get("over_line")),
+            "over_odds": _int(r.get("over_odds")),
+            "under_book": _str(r.get("under_book")) or "",
+            "under_line": _num(r.get("under_line")),
+            "under_odds": _int(r.get("under_odds")),
+            "implied_over": _num(r.get("implied_over")),
+            "implied_under": _num(r.get("implied_under")),
+            "combined_implied": _num(r.get("combined_implied")),
+            "devig_over": _num(r.get("devig_over")),
+            "devig_under": _num(r.get("devig_under")),
+            "guaranteed_margin": _num(r.get("guaranteed_margin")),
+            "legs": _str(r.get("legs")),
+        })
+    return out
+
+
+def cross_book(
+    db_path: str,
+    *,
+    books: Optional[Sequence[str]] = None,
+    stats: Optional[Sequence[str]] = None,
+    since_hours: float = 48.0,
+    n_games: int = 25,
+    model_mode: str = "chart_mean",
+    rolling_window: int = 10,
+    min_gap: float = 0.5,
+    min_books: int = 2,
+) -> dict:
+    """Cross-book line-shopping / middle candidates + TRUE two-way arb.
+
+    Runs the SAME pipeline the Streamlit Cross-book view uses:
+    ``fetch_latest_prop_lines`` -> ``score_prop_edges`` ->
+    ``find_cross_book_opportunities`` (line-gap / middles from the DFS board),
+    and ``fetch_two_way_lines`` -> ``detect_two_way_arb`` (real-odds-only arb).
+    KPIs come from ``cross_book_view.compute_kpis``. Middles are candidates,
+    never guaranteed; arb rows come only from real posted odds on both legs.
+    """
+    lines = es.fetch_latest_prop_lines(
+        db_path, books=books, stat_types=stats, since_hours=since_hours,
+    )
+    n_lines = 0 if lines is None or lines.empty else int(len(lines))
+    scored = es.score_prop_edges(
+        lines, db_path=db_path, n_games=n_games,
+        model_mode=model_mode, rolling_window=rolling_window,
+    )
+    n_scored = 0 if scored is None or scored.empty else int(len(scored))
+
+    # KPIs are computed on the UNFILTERED opportunity set (so "pairs" counts
+    # every 2+ book prop and "over_threshold" counts those meeting the gap);
+    # the display table is then filtered to the min-gap slider.
+    cross_all = cba.find_cross_book_opportunities(scored, min_books=min_books)
+
+    odds_lines = cba.fetch_two_way_lines(
+        db_path, books=books, stat_types=stats, since_hours=since_hours,
+    )
+    arbs = cba.detect_two_way_arb(odds_lines)
+    kpis = cbv.compute_kpis(scored, cross_all, arbs, min_gap)
+
+    cross_disp = cross_all
+    if not cross_all.empty and min_gap:
+        cross_disp = cross_all[
+            cross_all["line_gap"] >= float(min_gap)
+        ].reset_index(drop=True)
+
+    with DatabaseManager(db_path=db_path) as db:
+        books_available = _distinct_books(db)
+
+    return {
+        "rows": _cross_rows(cross_disp),
+        "arbs": _arb_rows(arbs),
+        "kpis": {
+            "pairs": _int(kpis.get("pairs")) or 0,
+            "max_gap": _num(kpis.get("max_gap")) or 0.0,
+            "over_threshold": _int(kpis.get("over_threshold")) or 0,
+            "arb_count": _int(kpis.get("arb_count")) or 0,
+            "freshest_hours": _num(kpis.get("freshest_hours")),
+        },
+        "n_lines": n_lines,
+        "n_scored": n_scored,
+        "min_gap": float(min_gap),
+        "model_mode": model_mode,
+        "books_available": books_available,
+        "stats_available": list(CHARTABLE_STATS),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Line movement (snapshot drift per book) — Player Detail animation
+# ---------------------------------------------------------------------------
+
+def line_movement(
+    db_path: str,
+    player_id: int,
+    stat_type: str,
+    lookback_hours: float = 168.0,
+) -> dict:
+    df = pc.fetch_line_movement_snapshots(
+        db_path, player_id, stat_type, lookback_hours=lookback_hours,
+    )
+    series: list[dict] = []
+    timestamps: list[str] = []
+    n_snapshots = 0
+    if df is not None and not df.empty:
+        ts_all = sorted(
+            {_str(t) for t in df["snapshot_ts_utc"].tolist() if _str(t)}
+        )
+        timestamps = ts_all
+        n_snapshots = int(len(df))
+        for book, grp in df.groupby("book", sort=True):
+            points = []
+            for r in grp.to_dict("records"):
+                ts = _str(r.get("snapshot_ts_utc"))
+                line = _num(r.get("line_value"))
+                if ts is None or line is None:
+                    continue
+                points.append({
+                    "ts": ts,
+                    "line": line,
+                    "over_odds": _int(r.get("over_odds")),
+                    "under_odds": _int(r.get("under_odds")),
+                })
+            if not points:
+                continue
+            opening = points[0]["line"]
+            closing = points[-1]["line"]
+            series.append({
+                "book": _str(book) or "",
+                "points": points,
+                "open_line": opening,
+                "close_line": closing,
+                "line_delta": closing - opening,
+            })
+    return {
+        "player_id": int(player_id),
+        "stat_type": pc._canonical_stat_type(stat_type),
+        "series": series,
+        "timestamps": timestamps,
+        "n_books": len(series),
+        "n_snapshots": n_snapshots,
+        "last_snapshot_utc": timestamps[-1] if timestamps else None,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Team charts (per-game aggregates + props-derived team reference)
+# ---------------------------------------------------------------------------
+
+def team_chart(
+    db_path: str,
+    team: str,
+    stat_type: str,
+    n_games: int = 25,
+) -> dict:
+    data = pc.fetch_team_chart_data(db_path, team, stat_type, n_games=n_games)
+    values = data.values
+    games = data.games
+    series: list[dict] = []
+    if games is not None and not games.empty and values.size:
+        records = games.to_dict("records")
+        for i, val in enumerate(values):
+            row = records[i] if i < len(records) else {}
+            series.append({
+                "game_date": _str(row.get("game_date")),
+                "value": float(val),
+                "opponent": _str(pc._extract_opponent(row.get("matchup"))),
+                "home_away": _str(row.get("home_away")),
+                "result": _str(row.get("result")),
+            })
+    return {
+        "team": (team or "").strip().upper(),
+        "stat_type": data.stat_type,
+        "n_games": int(values.size),
+        "series": series,
+        "kpis": {
+            "n_games": int(values.size),
+            "mu": _num(data.mu),
+            "sigma": _num(data.sigma),
+            "market_consensus_line": _num(data.market_consensus_line),
+            "derived_reference_line": _num(data.derived_reference_line),
+        },
+        "market_consensus_line": _num(data.market_consensus_line),
+        "derived_reference_line": _num(data.derived_reference_line),
+        "derived_reference_label": _str(data.derived_reference_label),
+        "notes": list(data.notes or []),
     }

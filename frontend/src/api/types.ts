@@ -152,3 +152,113 @@ export interface Meta {
   seasons: string[];
   books: string[];
 }
+
+export interface CrossBookRow {
+  player_name: string;
+  stat_type: string;
+  n_books: number;
+  line_min: number | null;
+  line_max: number | null;
+  line_gap: number | null;
+  best_over_book: string | null;
+  best_under_book: string | null;
+  consensus_mean: number | null;
+  p_over_at_line_min: number | null;
+  p_over_at_line_max: number | null;
+  middle_size: number | null;
+  opportunity_type: string | null;
+  model_mu: number | null;
+  model_sigma: number | null;
+}
+
+export interface ArbRow {
+  player_name: string;
+  stat_type: string;
+  game_date: string | null;
+  over_book: string;
+  over_line: number | null;
+  over_odds: number | null;
+  under_book: string;
+  under_line: number | null;
+  under_odds: number | null;
+  implied_over: number | null;
+  implied_under: number | null;
+  combined_implied: number | null;
+  devig_over: number | null;
+  devig_under: number | null;
+  guaranteed_margin: number | null;
+  legs: string | null;
+}
+
+export interface CrossBookKpis {
+  pairs: number;
+  max_gap: number;
+  over_threshold: number;
+  arb_count: number;
+  freshest_hours: number | null;
+}
+
+export interface CrossBookResponse {
+  rows: CrossBookRow[];
+  arbs: ArbRow[];
+  kpis: CrossBookKpis;
+  n_lines: number;
+  n_scored: number;
+  min_gap: number;
+  model_mode: string;
+  books_available: string[];
+  stats_available: string[];
+}
+
+export interface LineMovementPoint {
+  ts: string;
+  line: number;
+  over_odds: number | null;
+  under_odds: number | null;
+}
+
+export interface LineMovementSeries {
+  book: string;
+  points: LineMovementPoint[];
+  open_line: number | null;
+  close_line: number | null;
+  line_delta: number | null;
+}
+
+export interface LineMovementResponse {
+  player_id: number;
+  stat_type: string;
+  series: LineMovementSeries[];
+  timestamps: string[];
+  n_books: number;
+  n_snapshots: number;
+  last_snapshot_utc: string | null;
+}
+
+export interface TeamSeriesPoint {
+  game_date: string | null;
+  value: number;
+  opponent: string | null;
+  home_away: string | null;
+  result: string | null;
+}
+
+export interface TeamChartKpis {
+  n_games: number;
+  mu: number | null;
+  sigma: number | null;
+  market_consensus_line: number | null;
+  derived_reference_line: number | null;
+}
+
+export interface TeamChartResponse {
+  team: string;
+  stat_type: string;
+  n_games: number;
+  series: TeamSeriesPoint[];
+  kpis: TeamChartKpis;
+  market_consensus_line: number | null;
+  derived_reference_line: number | null;
+  derived_reference_label: string | null;
+  notes: string[];
+}

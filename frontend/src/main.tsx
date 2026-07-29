@@ -7,6 +7,8 @@ import { Layout } from "./components/Layout";
 import { SlateDashboard } from "./views/SlateDashboard";
 import { PlayerDetail } from "./views/PlayerDetail";
 import { EdgeScanner } from "./views/EdgeScanner";
+import { CrossBook } from "./views/CrossBook";
+import { TeamCharts } from "./views/TeamCharts";
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -27,6 +29,8 @@ const router = createBrowserRouter([
       { path: "player", element: <PlayerDetail /> },
       { path: "player/:playerId", element: <PlayerDetail /> },
       { path: "edges", element: <EdgeScanner /> },
+      { path: "cross-book", element: <CrossBook /> },
+      { path: "teams", element: <TeamCharts /> },
     ],
   },
 ]);

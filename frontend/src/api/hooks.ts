@@ -1,13 +1,16 @@
 import { useQuery, keepPreviousData } from "@tanstack/react-query";
 import { apiGet } from "./client";
 import type {
+  CrossBookResponse,
   EdgeScanResponse,
   Health,
+  LineMovementResponse,
   Meta,
   PlayerDetail,
   PlayerSearchResponse,
   RecentGamesResponse,
   SlateKpis,
+  TeamChartResponse,
 } from "./types";
 
 export function useHealth() {
@@ -74,6 +77,57 @@ export function usePlayerSearch(q: string, team?: string, onlyWithLines = false)
         limit: 40,
       }),
     placeholderData: keepPreviousData,
+  });
+}
+
+export interface CrossBookParams {
+  books?: string[];
+  stats?: string[];
+  model_mode?: string;
+  min_gap?: number;
+  min_books?: number;
+  since_hours?: number;
+}
+
+export function useCrossBook(params: CrossBookParams) {
+  return useQuery({
+    queryKey: ["cross-book", params],
+    queryFn: () =>
+      apiGet<CrossBookResponse>(
+        "/cross-book",
+        params as Record<string, unknown>,
+      ),
+    placeholderData: keepPreviousData,
+  });
+}
+
+export function useLineMovement(
+  playerId: number | null,
+  stat: string,
+  lookbackHours = 168,
+) {
+  return useQuery({
+    queryKey: ["line-movement", playerId, stat, lookbackHours],
+    enabled: playerId !== null,
+    placeholderData: keepPreviousData,
+    queryFn: () =>
+      apiGet<LineMovementResponse>(`/players/${playerId}/line-movement`, {
+        stat,
+        lookback_hours: lookbackHours,
+      }),
+  });
+}
+
+export function useTeamChart(team: string | null, stat: string, nGames = 25) {
+  return useQuery({
+    queryKey: ["team-chart", team, stat, nGames],
+    enabled: !!team,
+    placeholderData: keepPreviousData,
+    queryFn: () =>
+      apiGet<TeamChartResponse>(`/teams/${team}/chart`, {
+        stat,
+        n_games: nGames,
+      }),
   });
 }
 

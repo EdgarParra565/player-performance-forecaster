@@ -170,3 +170,123 @@ class MetaResponse(BaseModel):
     teams: list[str]
     seasons: list[str]
     books: list[str]
+
+
+# --- Cross-book layer -----------------------------------------------------
+
+class CrossBookRow(BaseModel):
+    model_config = ConfigDict(protected_namespaces=())
+
+    player_name: str
+    stat_type: str
+    n_books: int
+    line_min: Optional[float] = None
+    line_max: Optional[float] = None
+    line_gap: Optional[float] = None
+    best_over_book: Optional[str] = None
+    best_under_book: Optional[str] = None
+    consensus_mean: Optional[float] = None
+    p_over_at_line_min: Optional[float] = None
+    p_over_at_line_max: Optional[float] = None
+    middle_size: Optional[float] = None
+    opportunity_type: Optional[str] = None
+    model_mu: Optional[float] = None
+    model_sigma: Optional[float] = None
+
+
+class ArbRow(BaseModel):
+    player_name: str
+    stat_type: str
+    game_date: Optional[str] = None
+    over_book: str
+    over_line: Optional[float] = None
+    over_odds: Optional[int] = None
+    under_book: str
+    under_line: Optional[float] = None
+    under_odds: Optional[int] = None
+    implied_over: Optional[float] = None
+    implied_under: Optional[float] = None
+    combined_implied: Optional[float] = None
+    devig_over: Optional[float] = None
+    devig_under: Optional[float] = None
+    guaranteed_margin: Optional[float] = None
+    legs: Optional[str] = None
+
+
+class CrossBookKpis(BaseModel):
+    pairs: int
+    max_gap: float
+    over_threshold: int
+    arb_count: int
+    freshest_hours: Optional[float] = None
+
+
+class CrossBookResponse(BaseModel):
+    model_config = ConfigDict(protected_namespaces=())
+
+    rows: list[CrossBookRow]
+    arbs: list[ArbRow]
+    kpis: CrossBookKpis
+    n_lines: int
+    n_scored: int
+    min_gap: float
+    model_mode: str
+    books_available: list[str]
+    stats_available: list[str]
+
+
+# --- Line movement --------------------------------------------------------
+
+class LineMovementPoint(BaseModel):
+    ts: str
+    line: float
+    over_odds: Optional[int] = None
+    under_odds: Optional[int] = None
+
+
+class LineMovementSeries(BaseModel):
+    book: str
+    points: list[LineMovementPoint]
+    open_line: Optional[float] = None
+    close_line: Optional[float] = None
+    line_delta: Optional[float] = None
+
+
+class LineMovementResponse(BaseModel):
+    player_id: int
+    stat_type: str
+    series: list[LineMovementSeries]
+    timestamps: list[str]
+    n_books: int
+    n_snapshots: int
+    last_snapshot_utc: Optional[str] = None
+
+
+# --- Team charts ----------------------------------------------------------
+
+class TeamSeriesPoint(BaseModel):
+    game_date: Optional[str] = None
+    value: float
+    opponent: Optional[str] = None
+    home_away: Optional[str] = None
+    result: Optional[str] = None
+
+
+class TeamChartKpis(BaseModel):
+    n_games: int
+    mu: Optional[float] = None
+    sigma: Optional[float] = None
+    market_consensus_line: Optional[float] = None
+    derived_reference_line: Optional[float] = None
+
+
+class TeamChartResponse(BaseModel):
+    team: str
+    stat_type: str
+    n_games: int
+    series: list[TeamSeriesPoint]
+    kpis: TeamChartKpis
+    market_consensus_line: Optional[float] = None
+    derived_reference_line: Optional[float] = None
+    derived_reference_label: Optional[str] = None
+    notes: list[str] = []

@@ -9,6 +9,7 @@ import {
 import type { BookLineRow, PlayerDetail as PlayerDetailData } from "../api/types";
 import { StatCard } from "../components/StatCard";
 import { EChart } from "../components/EChart";
+import { LineMovementPanel } from "../components/LineMovementPanel";
 import { DataTable, type Column } from "../components/DataTable";
 import { EmptyState } from "../components/EmptyState";
 import { Loading, ErrorState } from "../components/Loading";
@@ -636,6 +637,16 @@ export function PlayerDetail() {
                 <div className="px-2 py-3">
                   <HitRateChart books={d.book_lines} />
                 </div>
+              </section>
+
+              <section className="panel">
+                <div className="flex items-center justify-between border-b border-line px-4 py-2.5">
+                  <h2 className="eyebrow">Line movement · snapshot replay</h2>
+                  <span className="text-[11px] text-faint">
+                    per-book drift · ▶ to animate
+                  </span>
+                </div>
+                <LineMovementPanel playerId={selected.id} stat={stat} />
               </section>
 
               {d.notes.length > 0 && (

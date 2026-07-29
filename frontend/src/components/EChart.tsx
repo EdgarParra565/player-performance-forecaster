@@ -1,21 +1,23 @@
-import ReactECharts from "echarts-for-react";
-import type { EChartsOption } from "echarts";
+import { lazy, Suspense } from "react";
+import type { EChartProps } from "./EChartImpl";
 
-interface EChartProps {
-  option: EChartsOption;
-  height?: number | string;
+const EChartImpl = lazy(() => import("./EChartImpl"));
+
+function ChartSkeleton({ height }: { height?: number | string }) {
+  return (
+    <div
+      className="animate-pulse rounded bg-panel-2"
+      style={{ height: height ?? 260, width: "100%" }}
+    />
+  );
 }
 
-// Thin wrapper: transparent background (the panel behind it provides the
-// surface), no merge so option changes fully replace, and a consistent height.
+// Public chart entry point. Lazy-loads the echarts bundle on first render so
+// non-chart routes (and the initial paint) don't pay the ~1 MB cost.
 export function EChart({ option, height = 260 }: EChartProps) {
   return (
-    <ReactECharts
-      option={{ backgroundColor: "transparent", ...option }}
-      notMerge
-      lazyUpdate
-      style={{ height, width: "100%" }}
-      opts={{ renderer: "canvas" }}
-    />
+    <Suspense fallback={<ChartSkeleton height={height} />}>
+      <EChartImpl option={option} height={height} />
+    </Suspense>
   );
 }
