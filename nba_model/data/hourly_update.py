@@ -11,10 +11,11 @@ Pipeline (in order, each step writes to the JSON report):
     2. Web-text ingestion (CDP) over data/config/web_text_urls.txt
     3. Browser prop parser (prizepicks / underdog / pick6 / parlayplay)
     4. Team-line parser (betmgm / caesars / draftkings / bovada / kalshi)
-    5. Lightweight nba_api refresh (recent games + recent player logs)
-    6. Re-derive team_priors (single-pass reverse engineering)
-    7. Settle prediction outcomes (idempotent backfill)
-    8. Write timestamped JSON report under nba_model/data/artifacts/hourly/
+    5. VegasInsider ingestion (freshest stored grid → betting_lines, over-only)
+    6. Lightweight nba_api refresh (recent games + recent player logs)
+    7. Re-derive team_priors (single-pass reverse engineering)
+    8. Settle prediction outcomes (idempotent backfill)
+    9. Write timestamped JSON report under nba_model/data/artifacts/hourly/
 
 Idempotency / overlap safety:
     Acquires an fcntl flock on a lockfile so two overlapping runs can't
@@ -260,6 +261,28 @@ def _run_team_line_parser(db_path: str) -> dict:
         max_snapshots_per_url=1,
         max_total_snapshots=20,
     )
+
+
+def _run_vegasinsider_ingestion(db_path: str) -> dict:
+    """Ingest the freshest stored VegasInsider grid into ``betting_lines``.
+
+    Runs right after web-text ingestion has (re)stored the VI snapshot, so the
+    ingester reads today's grid. Contract:
+      * **Idempotent** — ``ingest_vegasinsider_odds`` inserts change-only via
+        ``insert_betting_lines_records`` (exact-dup skip + plausibility filter),
+        so an unchanged snapshot inserts 0 rows.
+      * **Resilient** — an empty/offseason grid (0 parsed rows) is a NORMAL
+        return (``status='success'``/``'no_snapshot'``, ``inserted=0``), not an
+        error, so it never trips the alert marker. A genuine parse EXCEPTION is
+        allowed to propagate: ``_record_step`` records it in ``failed_steps``
+        (firing the alert) without aborting the remaining hourly steps.
+
+    Returns the ingest summary (parsed/resolved/inserted/duplicate counts) so it
+    lands in the report under ``steps.vegasinsider_ingestion.result``.
+    """
+    from nba_model.data.vegasinsider_odds_ingestion import ingest_vegasinsider_odds
+
+    return ingest_vegasinsider_odds(db_path=db_path)
 
 
 def _run_game_log_refresh(db_path: str, max_players: int) -> dict:
@@ -520,6 +543,7 @@ def run_hourly_update(
     )
     _record_step(report, "browser_prop_parser", _run_browser_prop_parser, db_path)
     _record_step(report, "team_line_parser", _run_team_line_parser, db_path)
+    _record_step(report, "vegasinsider_ingestion", _run_vegasinsider_ingestion, db_path)
     _record_step(report, "game_log_refresh", _run_game_log_refresh, db_path, max_players)
     _record_step(report, "players_table_sync", _run_players_table_sync, db_path)
     _record_step(report, "reverse_engineering", _run_reverse_engineering, db_path)

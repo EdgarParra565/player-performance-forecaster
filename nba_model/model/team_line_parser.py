@@ -10,14 +10,14 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import logging
 from typing import Optional
 
 from nba_model.data.database.db_manager import DatabaseManager
+from nba_model.logging_utils import configure_logging, get_logger
 from nba_model.model.web_text_ingestion import detect_login_wall
 from nba_model.scrapers import get_scraper_for_url
 
-logger = logging.getLogger("nba_model.team_line_parser")
+logger = get_logger("nba_model.team_line_parser")
 
 PARSER_VERSION = "team_lines_v1"
 DEFAULT_MAX_SNAPSHOTS_PER_URL = 1
@@ -256,6 +256,9 @@ def main() -> None:
         type=float, default=DEFAULT_MIN_PARSE_CONFIDENCE,
     )
     args = parser.parse_args()
+    # Shared logging (human console + JSON-lines file), matching daily_etl /
+    # hourly_update. The stdout summary below is unchanged.
+    configure_logging(file_prefix="team_line_parser")
     summary = parse_and_store_web_team_lines(
         db_path=args.db_path,
         source_urls=args.urls,

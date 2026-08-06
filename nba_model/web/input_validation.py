@@ -196,6 +196,26 @@ def validate_since_hours(h: Any, *, default: float = 48.0) -> float:
     return min(val, 24.0 * 30.0)
 
 
+def validate_lookback_hours(h: Any, *, default: float = 24.0 * 30.0) -> float:
+    """Coerce a line-movement *replay* lookback window (positive float).
+
+    Same shape as :func:`validate_since_hours` but with a **1-year** cap
+    (``24*365`` h) instead of 30 days: the flagship Player Detail line-movement
+    replay must reach snapshots months old (e.g. offseason boards captured back
+    in the spring), which the 30-day staleness cap would clip to an empty state.
+    Kept as a SEPARATE validator so the tighter ``since_hours`` cap other
+    endpoints rely on is not loosened. ``None`` falls back to ``default``.
+    """
+    if h is None:
+        return default
+    if not _is_finite_number(h):
+        raise ValidationError(f"lookback_hours must be a finite number; got {h!r}")
+    val = float(h)
+    if val <= 0:
+        raise ValidationError(f"lookback_hours must be > 0; got {val}")
+    return min(val, 24.0 * 365.0)
+
+
 def validate_n_sims(n: Any, *, default: int = 20_000,
                     hard_cap: int = 200_000) -> int:
     """Coerce + cap a Monte Carlo `n_sims` request."""

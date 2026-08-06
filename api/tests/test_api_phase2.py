@@ -101,6 +101,21 @@ def _seed(db_path: str) -> None:
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             snaps,
         )
+        # OLD rebounds snapshots ~45 days back: unreachable under the 30-day
+        # since_hours cap, but within the line-movement 1-year lookback cap.
+        old_ts = _utc(now - timedelta(days=45))
+        db.conn.executemany(
+            """INSERT INTO betting_line_snapshots
+               (snapshot_ts_utc, game_date, player_id, book, market_key,
+                stat_type, line_value, over_odds, under_odds)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            [
+                (old_ts, today, LEBRON_ID, "FanDuel", "player_rebounds",
+                 "rebounds", 8.5, -110, -110),
+                (old_ts, today, LEBRON_ID, "DraftKings", "player_rebounds",
+                 "rebounds", 8.0, -110, -110),
+            ],
+        )
         db.conn.commit()
 
 
@@ -187,6 +202,33 @@ class Phase2ApiTestCase(unittest.TestCase):
         r = self.client.get(
             f"/api/players/{LEBRON_ID}/line-movement?stat=notastat")
         self.assertEqual(r.status_code, 400)
+
+    def test_line_movement_lookback_beyond_30_days(self):
+        # A 45-day-old snapshot is invisible under the default (7-day) window
+        # AND would be clipped by the old 30-day since_hours cap...
+        default = self.client.get(
+            f"/api/players/{LEBRON_ID}/line-movement?stat=rebounds")
+        self.assertEqual(default.status_code, 200)
+        self.assertEqual(default.json()["n_snapshots"], 0)
+        # ...but a 60-day (1440h) lookback reaches it via validate_lookback_hours.
+        r = self.client.get(
+            f"/api/players/{LEBRON_ID}/line-movement?stat=rebounds"
+            f"&lookback_hours=1440")
+        self.assertEqual(r.status_code, 200)
+        body = r.json()
+        self.assertEqual(body["n_books"], 2)
+        self.assertGreater(body["n_snapshots"], 0)
+        self.assertIn("FanDuel", {s["book"] for s in body["series"]})
+
+    def test_line_movement_bad_lookback_rejected(self):
+        # Non-positive values reach validate_lookback_hours -> ValidationError
+        # -> HTTP 400 (a non-float would be FastAPI's own 422 before our
+        # validator, so it's out of scope for this validator-rejection test).
+        for bad in ("-5", "0"):
+            r = self.client.get(
+                f"/api/players/{LEBRON_ID}/line-movement?stat=points"
+                f"&lookback_hours={bad}")
+            self.assertEqual(r.status_code, 400, f"lookback={bad!r}")
 
     # --- team chart -------------------------------------------------------
 

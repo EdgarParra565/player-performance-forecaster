@@ -15,7 +15,12 @@ from nba_model.model.minutes_projection import project_minutes
 from nba_model.model.probability import prob_over_distribution
 from nba_model.model.simulation import normalize_distribution_name
 
-logging.basicConfig(level=logging.INFO)
+# NB: no module-level ``logging.basicConfig`` here. It ran at import time and,
+# because this module is pulled in transitively (nba_model.evaluation.__init__
+# -> backtest) before an ETL entry point calls ``configure_logging``, it
+# installed a root handler that made the later (idempotent) ``configure_logging``
+# no-op — silently dropping daily_etl's JSON-lines file handler. Logging config
+# is the caller/entry-point's responsibility (see nba_model.logging_utils).
 logger = logging.getLogger(__name__)
 
 

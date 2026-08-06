@@ -111,6 +111,15 @@ def _validated_since(h: float) -> float:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+def _validated_lookback(h: float) -> float:
+    # Line-movement replay only: 1-year cap (not the 30-day since_hours cap) so
+    # offseason snapshots months old still replay. See iv.validate_lookback_hours.
+    try:
+        return iv.validate_lookback_hours(h)
+    except iv.ValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
@@ -236,7 +245,7 @@ def line_movement(
     canonical_stat = _validated_stat(stat)
     return schemas.LineMovementResponse(**services.line_movement(
         db_path, player_id, canonical_stat,
-        lookback_hours=_validated_since(lookback_hours),
+        lookback_hours=_validated_lookback(lookback_hours),
     ))
 
 

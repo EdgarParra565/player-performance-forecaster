@@ -2,7 +2,6 @@
 
 import argparse
 import hashlib
-import logging
 import os
 import threading
 import time
@@ -15,9 +14,10 @@ import requests
 from nba_api.stats.static import players as nba_players
 
 from nba_model.data.database.db_manager import DatabaseManager
+from nba_model.logging_utils import configure_logging, get_logger
 from nba_model.scrapers import get_scraper_for_url
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 DEFAULT_WEB_TEXT_REQUEST_TIMEOUT = 20
 DEFAULT_WEB_TEXT_REQUEST_RETRIES = 1
@@ -1551,6 +1551,10 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def main():
     args = _build_parser().parse_args()
+    # Configure shared logging once (human console + JSON-lines file), matching
+    # the daily_etl / hourly_update CLIs. The human-readable summary below still
+    # prints to stdout; logger calls carry the structured diagnostics.
+    configure_logging(file_prefix="web_text_ingestion")
 
     if args.connect_chrome:
         state_file = args.browser_auth_state_file

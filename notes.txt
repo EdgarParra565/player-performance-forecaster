@@ -1,19 +1,22 @@
 # NBA Player Performance Forecaster - Working Notes
 
-Last updated: 2026-07-22
+Last updated: 2026-08-05
 
 Active tracker only: architecture, what's done, what's next. CLI runbooks,
 deployment, and security live in **README.md** and **docs/** — not duplicated here.
 
-Test baseline: **702 passing** (`.venv/bin/python3 -m pytest nba_model/tests -q`;
-Windows: `.venv\Scripts\python.exe -m pytest nba_model/tests -q`), plus **11 API
-tests** run separately (`.venv/bin/python3 -m pytest api/tests -q`).
+Test baseline: **707 passing** (`.venv/bin/python3 -m pytest nba_model/tests -q`;
+Windows: `.venv\Scripts\python.exe -m pytest nba_model/tests -q`), plus **23 API
+tests** (`.venv/bin/python3 -m pytest api/tests -q`) and **14 frontend tests**
+(`cd frontend && npm run test`).
 
 ---
 
 ## Near-term objectives (NBA)
 
 1. **In-season data loop** — Mac Chrome `:9222` → hourly ETL → `publish_db.sh` → cloud app.
+   Hourly ETL now: web-text fetch → prop/team-line parsers → **VegasInsider ingestion
+   (fresh grid → `betting_lines`)** → nba_api refresh → priors → settle → report.
    This is the gating item: WS10 validation and TRUE-arb detection are data-starved without it.
 2. **Run WS10 validation** — market-line backtests, 4–8 week paper trade
    (`bet_slip` → `bet_log` → `calibration_report`), CLV review. Tooling is built;
@@ -144,16 +147,28 @@ save; web = Plotly, Tk = matplotlib; do not delete `sports/` scaffolding.
 ### Smaller follow-ups
 
 - [ ] MLB per-game player-props parser + park factors.
-- [ ] Migrate the scraper/fetch path (`web_text_ingestion`, browser/team-line
-      parsers) to `logging_utils` (deferred while scraper verification is active).
-      Pre-existing quirk to fix alongside: `market_reverse_engineering` calls
-      `logging.basicConfig` at import, which no-ops daily_etl's own file handler
-      (hourly uses `force=` and is unaffected).
+- [x] Migrate the scraper/fetch path (`web_text_ingestion`, browser/team-line
+      parsers) to `logging_utils` (2026-08-05): all three now use
+      `get_logger` + call `configure_logging(file_prefix=...)` in their CLI
+      `main()`, matching daily_etl/hourly_update. Report dicts / alert markers /
+      exit codes + stdout summaries unchanged. Fixed the pre-existing quirk: the
+      import-time `logging.basicConfig` lived in `evaluation/backtest.py` (pulled
+      in transitively via `evaluation/__init__` → daily_etl's
+      `market_reverse_engineering` import), installing a root handler before
+      `configure_logging` ran so the idempotent config no-op'd and dropped
+      daily_etl's JSON-lines file handler. Removed it (callers configure logging);
+      verified importing daily_etl leaves 0 root handlers and the file handler now
+      installs.
 - [x] Flagship UI Phase 2 — shipped 2026-07-29; Phase 3 backlog remains (see the
       "New UI (flagship)" section at the bottom).
-- [ ] Flagship line-movement lookback — `validate_since_hours` caps replay depth at
-      30 days; add a deeper-window validator (e.g. `validate_lookback_hours`) so the
-      flagship can review months of drift.
+- [x] Flagship line-movement lookback (2026-08-05) — added
+      `input_validation.validate_lookback_hours` (1-year cap, same
+      error/clamping style as `validate_since_hours`, kept SEPARATE so the 30-day
+      `since_hours` cap other endpoints use is untouched). Wired into
+      `/api/players/{id}/line-movement` ONLY (`_validated_lookback`). Verified on
+      the live DB: the 2026-03-14 board (~3464h old, 6 books/18 snapshots) is
+      empty under the default 168h window but replays with `lookback_hours=4000`.
+      API tests: >30-day replay + non-positive rejection (api/tests, 21→23).
 
 ### Scraper follow-ups (post-2026-07-21 mission: shortcomings + next steps)
 
@@ -175,10 +190,17 @@ Known shortcomings of what shipped:
 
 Next steps (in order):
 
-- [ ] **Wire VegasInsider into the ETL cadence** — `vegasinsider_odds_ingestion` is a
-      standalone CLI today; hourly ETL only stores the snapshot. Add the ingestion
-      step to `hourly_update` / `daily_etl` so fresh grids auto-flow into
-      `betting_lines`.
+- [x] **Wire VegasInsider into the ETL cadence** (2026-08-05) — added a
+      `vegasinsider_ingestion` step to `hourly_update` (after the team-line parser,
+      before the game-log refresh) and to `daily_etl` (after `browser_parser`,
+      gated on `web_text_urls`, else `skipped`). It parses the freshest stored VI
+      grid into `betting_lines` (`source='vegasinsider'`). Idempotent (change-only
+      insert + plausibility filter → unchanged snapshot inserts 0) and resilient
+      (empty/offseason grid = 0 rows, `status='success'`, no alert; a parse
+      EXCEPTION surfaces via `_record_step`/`run_with_retry` → alert marker,
+      without aborting the run). Counts (parsed/resolved/inserted/duplicate) land
+      in the report under the step's `result`. Tests: stored-snapshot ingest +
+      empty-grid + wiring/report-contract (test_vegasinsider_odds, +5).
 - [ ] **Preseason capture sprint (~Oct)** — re-fetch and author the deferred
       extractors against real NBA content: theScore `team_line_extractor`,
       DraftKings NBA validation (scroll path), Fliff `prop_preprocess` (PP-style

@@ -679,6 +679,21 @@ def _run_browser_parser_step(
     )
 
 
+def _run_vegasinsider_step(db_path: str) -> dict:
+    """Ingest the freshest stored VegasInsider grid into ``betting_lines``.
+
+    Mirrors the hourly VI step: idempotent (change-only insert + plausibility
+    filter in ``insert_betting_lines_records``) and resilient — an
+    empty/offseason grid returns ``status='success'``/``'no_snapshot'`` with
+    ``inserted=0`` (a normal outcome, never promoted to failed/partial). A parse
+    EXCEPTION propagates so ``run_with_retry`` marks the step failed and the
+    alert marker fires, without aborting the rest of the run.
+    """
+    from nba_model.data.vegasinsider_odds_ingestion import ingest_vegasinsider_odds
+
+    return ingest_vegasinsider_odds(db_path=db_path)
+
+
 def _run_reverse_engineering_step(
     db_path: str,
     source: str,
@@ -1076,6 +1091,24 @@ def run_daily_etl(
             elif parser_status in {"partial_success", "failed"}:
                 browser_parser_step["status"] = parser_status
         steps["browser_parser"] = browser_parser_step
+
+    # VegasInsider ingestion: parse the freshest stored VI grid into
+    # betting_lines. Gated on web_text_urls (the fetch that stores the snapshot),
+    # mirroring browser_parser. 0-row/offseason grids stay 'success' (no alert);
+    # only a genuine exception rolls up to failed.
+    if not web_text_urls:
+        steps["vegasinsider_ingestion"] = {
+            "status": "skipped",
+            "reason": "No web text URLs provided.",
+        }
+    else:
+        steps["vegasinsider_ingestion"] = run_with_retry(
+            step_name="vegasinsider_ingestion",
+            func=lambda: _run_vegasinsider_step(db_path=db_path),
+            retries=max(0, retries),
+            retry_delay_seconds=retry_delay_seconds,
+            retry_backoff=retry_backoff,
+        )
 
     odds_status = steps.get("odds", {}).get("status")
     if skip_reverse_engineering:

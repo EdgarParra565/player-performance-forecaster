@@ -9,12 +9,12 @@ generic ``Player Line Stat Side`` patterns, and writes the results to the
 
 import argparse
 import hashlib
-import logging
 import re
 from typing import Optional
 from urllib.parse import urlparse
 
 from nba_model.data.database.db_manager import DatabaseManager
+from nba_model.logging_utils import configure_logging, get_logger
 from nba_model.model.web_text_ingestion import detect_login_wall, load_urls_from_file
 from nba_model.scrapers import SCRAPERS, get_scraper_for_url
 from nba_model.scrapers.base import NAME_STOP_WORDS
@@ -22,7 +22,7 @@ from nba_model.scrapers.base import NAME_STOP_WORDS
 from nba_model.scrapers.prizepicks import preprocess as _preprocess_prizepicks_text  # noqa: F401
 from nba_model.scrapers.underdog import preprocess as _preprocess_underdog_text  # noqa: F401
 
-logger = logging.getLogger("nba_model.browser_prop_parser")
+logger = get_logger("nba_model.browser_prop_parser")
 
 PARSER_VERSION = "visible_text_v2"
 DEFAULT_MIN_PARSE_CONFIDENCE = 0.45
@@ -563,6 +563,9 @@ def _build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     """CLI entry point for browser/visible-text prop parser."""
     args = _build_parser().parse_args()
+    # Shared logging (human console + JSON-lines file), matching daily_etl /
+    # hourly_update. The stdout summary below is unchanged.
+    configure_logging(file_prefix="browser_prop_parser")
     urls = list(args.urls or [])
     if args.urls_file:
         urls.extend(load_urls_from_file(args.urls_file))
