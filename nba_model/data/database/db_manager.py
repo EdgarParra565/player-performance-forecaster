@@ -9,6 +9,11 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
+# team_priors rows carry no game date; the hourly runner recomputes a live
+# matchup's prior every tick, so anything older than a day is a past game's
+# prior and must not blend into today's projection.
+TEAM_PRIOR_MAX_AGE_HOURS = 24.0
+
 
 def _safe_int(value):
     """Coerce ``value`` to int, returning None on failure or NaN."""
@@ -134,8 +139,154 @@ class DatabaseManager:
 
         self._ensure_sport_columns()
         self._ensure_betting_lines_source_column()
+        self._ensure_last_seen_columns()
+        self._ensure_betting_lines_main_line_column()
+        self._migrate_team_priors_to_abbrev_keys()
 
         logger.info("Database initialized at %s", self.db_path)
+
+    # Change-only boards: a row is written only when the line moves, so
+    # observed_at_utc means "last CHANGED". last_seen_at_utc is bumped on every
+    # unchanged re-scrape so freshness windows (since_hours) keep stable lines.
+    _LAST_SEEN_TABLES = ("web_prop_cards", "web_team_lines")
+
+    @staticmethod
+    def seen_at_sql(alias: str = "") -> str:
+        """SQL expression for "when was this line last observed" (NULL-safe
+        for rows written before the column existed)."""
+        p = f"{alias}." if alias else ""
+        return f"COALESCE({p}last_seen_at_utc, {p}observed_at_utc)"
+
+    def _ensure_last_seen_columns(self):
+        """Add nullable ``last_seen_at_utc`` to the change-only board tables
+        and backfill it from ``observed_at_utc`` once. Idempotent."""
+        for table in self._LAST_SEEN_TABLES:
+            try:
+                cols = {
+                    r[1] for r in self.conn.execute(
+                        f"PRAGMA table_info({table})").fetchall()
+                }
+            except sqlite3.OperationalError:
+                continue
+            if not cols or "last_seen_at_utc" in cols:
+                continue
+            self.conn.execute(f"ALTER TABLE {table} ADD COLUMN last_seen_at_utc TEXT")
+            self.conn.execute(
+                f"UPDATE {table} SET last_seen_at_utc = observed_at_utc "
+                "WHERE last_seen_at_utc IS NULL"
+            )
+            self.conn.commit()
+
+    def _bump_last_seen(self, table, id_col, key_sql, seen):
+        """Move ``last_seen_at_utc`` forward on the CURRENT row of each key.
+
+        ``seen`` maps key tuple → latest observed_at of an unchanged re-scrape.
+        Only ever moves forward (re-parsing an old snapshot is a no-op)."""
+        if not seen:
+            return
+        sql = f"""
+            UPDATE {table} SET last_seen_at_utc = ?
+            WHERE {id_col} = (
+                SELECT {id_col} FROM {table} WHERE {key_sql}
+                ORDER BY observed_at_utc DESC, {id_col} DESC LIMIT 1
+            )
+            AND (last_seen_at_utc IS NULL
+                 OR datetime(last_seen_at_utc) < datetime(?))
+        """
+        self.conn.executemany(
+            sql, [(ts, *key, ts) for key, ts in seen.items()]
+        )
+
+    # SQL predicate: row is a main line (legacy/untagged NULL rows count as main).
+    MAIN_LINE_SQL = "COALESCE({p}is_main_line, 1) = 1"
+
+    @classmethod
+    def main_line_sql(cls, alias: str = "") -> str:
+        return cls.MAIN_LINE_SQL.format(p=f"{alias}." if alias else "")
+
+    def _ensure_betting_lines_main_line_column(self):
+        """Add ``betting_lines.is_main_line`` (1 main / 0 alt rung / NULL
+        untagged) and tag existing ladders once. Idempotent.
+
+        Backfill groups legacy rows by (player, date, book, stat, scraped_at):
+        one writer call stamps one ``scraped_at``, so a group is one scrape's
+        ladder; its main rung is picked by ``odds.main_line_index``."""
+        try:
+            cols = {
+                r[1] for r in self.conn.execute(
+                    "PRAGMA table_info(betting_lines)").fetchall()
+            }
+        except sqlite3.OperationalError:
+            return
+        if not cols or "is_main_line" in cols:
+            return
+        from nba_model.model.odds import main_line_index
+
+        self.conn.execute("ALTER TABLE betting_lines ADD COLUMN is_main_line INTEGER")
+        rows = self.conn.execute(
+            """
+            SELECT line_id, player_id, game_date, lower(book), lower(stat_type),
+                   scraped_at, line_value, over_odds, under_odds
+            FROM betting_lines ORDER BY line_id
+            """
+        ).fetchall()
+        groups: dict = {}
+        for r in rows:
+            groups.setdefault(r[1:6], []).append(
+                {"line_id": r[0], "line_value": r[6],
+                 "over_odds": r[7], "under_odds": r[8]}
+            )
+        updates = []
+        for ladder in groups.values():
+            main = main_line_index(ladder)
+            updates.extend(
+                (1 if i == main else 0, c["line_id"]) for i, c in enumerate(ladder)
+            )
+        self.conn.executemany(
+            "UPDATE betting_lines SET is_main_line = ? WHERE line_id = ?", updates)
+        self.conn.commit()
+
+    def _migrate_team_priors_to_abbrev_keys(self):
+        """Re-key legacy ``team_priors`` rows from nicknames ("76ers") to the
+        NBA codes ("PHI") every consumer looks up by. Idempotent: rows already
+        keyed by codes (or unknown names) are left alone; when both a legacy
+        and a code-keyed row exist for the same matchup, the newer
+        ``computed_at_utc`` wins."""
+        from nba_model.scrapers.team_names import NBA_TEAM_ABBREVS, team_abbrev
+
+        try:
+            rows = self.conn.execute(
+                "SELECT away_team, home_team, computed_at_utc FROM team_priors"
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return
+        changed = False
+        for away, home, computed in rows:
+            if away in NBA_TEAM_ABBREVS and home in NBA_TEAM_ABBREVS:
+                continue
+            new_away = team_abbrev(away) or away
+            new_home = team_abbrev(home) or home
+            if (new_away, new_home) == (away, home):
+                continue
+            existing = self.conn.execute(
+                "SELECT computed_at_utc FROM team_priors "
+                "WHERE away_team = ? AND home_team = ?",
+                (new_away, new_home),
+            ).fetchone()
+            if existing is not None and str(existing[0] or "") >= str(computed or ""):
+                self.conn.execute(
+                    "DELETE FROM team_priors WHERE away_team = ? AND home_team = ?",
+                    (away, home),
+                )
+            else:
+                self.conn.execute(
+                    "UPDATE OR REPLACE team_priors SET away_team = ?, home_team = ? "
+                    "WHERE away_team = ? AND home_team = ?",
+                    (new_away, new_home, away, home),
+                )
+            changed = True
+        if changed:
+            self.conn.commit()
 
     def _ensure_betting_lines_source_column(self):
         """Add a nullable ``source`` provenance column to ``betting_lines``.
@@ -240,9 +391,15 @@ class DatabaseManager:
         return sum(pts) / len(pts)
 
     def upsert_team_priors(self, records):
-        """Upsert reverse-engineered priors (one row per matchup)."""
+        """Upsert reverse-engineered priors (one row per matchup).
+
+        Team keys are normalized to NBA codes ("76ers" → "PHI") — the key
+        space players.team / games.team_abbrev use — so consumer lookups
+        actually hit. Unknown names are stored as given.
+        """
         if not records:
             return {"upserted": 0, "attempted": 0}
+        from nba_model.scrapers.team_names import team_abbrev
         query = """
             INSERT OR REPLACE INTO team_priors (
                 away_team, home_team, computed_at_utc,
@@ -256,7 +413,8 @@ class DatabaseManager:
         payload = []
         for r in records:
             payload.append((
-                r.get("away_team"), r.get("home_team"),
+                team_abbrev(r.get("away_team")) or r.get("away_team"),
+                team_abbrev(r.get("home_team")) or r.get("home_team"),
                 r.get("computed_at_utc"),
                 _safe_float(r.get("consensus_total")),
                 _safe_float(r.get("home_spread")),
@@ -277,10 +435,37 @@ class DatabaseManager:
         upserted = self.conn.total_changes - before
         return {"upserted": int(upserted), "attempted": int(len(payload))}
 
-    def get_team_prior(self, away_team: str, home_team: str):
-        """Look up the latest prior row for a matchup; returns None if absent."""
+    @staticmethod
+    def _team_prior_fresh_clause(max_age_hours):
+        """``(sql, params)`` restricting team_priors to recent computations.
+
+        Priors carry no game date, so without an age cap a May prior would
+        blend into an October projection for the same teams."""
+        if max_age_hours is None:
+            return "1=1", ()
+        return (
+            "datetime(computed_at_utc) >= datetime('now', ?)",
+            (f"-{float(max_age_hours)} hours",),
+        )
+
+    def get_team_prior(
+        self,
+        away_team: str,
+        home_team: str,
+        max_age_hours: Optional[float] = TEAM_PRIOR_MAX_AGE_HOURS,
+    ):
+        """Look up the latest prior row for a matchup; returns None if absent.
+
+        Accepts any team form (nickname / full name / code); only priors
+        computed within ``max_age_hours`` count (``None`` = no age cap).
+        """
+        from nba_model.scrapers.team_names import team_abbrev
+
+        away_key = team_abbrev(away_team) or away_team
+        home_key = team_abbrev(home_team) or home_team
+        fresh_sql, fresh_params = self._team_prior_fresh_clause(max_age_hours)
         row = self.conn.execute(
-            """
+            f"""
             SELECT away_team, home_team, computed_at_utc,
                    consensus_total, home_spread, away_spread,
                    home_team_total, away_team_total,
@@ -289,8 +474,11 @@ class DatabaseManager:
             FROM team_priors
             WHERE lower(away_team) = lower(?)
               AND lower(home_team) = lower(?)
+              AND {fresh_sql}
+            ORDER BY datetime(computed_at_utc) DESC
+            LIMIT 1
             """,
-            (away_team, home_team),
+            (away_key, home_key, *fresh_params),
         ).fetchone()
         if row is None:
             return None
@@ -301,7 +489,12 @@ class DatabaseManager:
                 "pace_factor", "n_books", "latest_observed_at"]
         return dict(zip(keys, row))
 
-    def get_team_prior_inputs(self, player_team: str, opponent_team: str) -> dict:
+    def get_team_prior_inputs(
+        self,
+        player_team: str,
+        opponent_team: str,
+        max_age_hours: Optional[float] = TEAM_PRIOR_MAX_AGE_HOURS,
+    ) -> dict:
         """Resolve the team-prior signals for a player's team in a matchup.
 
         ``team_priors`` is keyed by ``(away_team, home_team)``; we don't know
@@ -314,46 +507,54 @@ class DatabaseManager:
         if not player_team or not opponent_team:
             return {}
         # Player at home → matchup stored as (opponent=away, player=home).
-        prior = self.get_team_prior(opponent_team, player_team)
+        prior = self.get_team_prior(opponent_team, player_team, max_age_hours)
         player_is_home = True
         if prior is None:
-            prior = self.get_team_prior(player_team, opponent_team)
+            prior = self.get_team_prior(player_team, opponent_team, max_age_hours)
             player_is_home = False
         if prior is None:
             return {}
         implied = (prior.get("home_team_total") if player_is_home
                    else prior.get("away_team_total"))
+        own_key = prior.get("home_team") if player_is_home else prior.get("away_team")
         return {
             "pace_factor": prior.get("pace_factor"),
             "implied_team_total": implied,
-            "team_recent_avg_total": self.get_team_recent_avg_points(player_team),
+            "team_recent_avg_total": self.get_team_recent_avg_points(own_key),
         }
 
-    def get_team_prior_inputs_map(self) -> dict:
-        """Map every team in ``team_priors`` to its ``blend_team_prior`` inputs.
+    def get_team_prior_inputs_map(
+        self,
+        max_age_hours: Optional[float] = TEAM_PRIOR_MAX_AGE_HOURS,
+    ) -> dict:
+        """Map every team (NBA code) with a FRESH prior to its
+        ``blend_team_prior`` inputs.
 
-        Each matchup row contributes both sides (home + away). When a team
-        appears in multiple matchups the last row wins — fine for a single
-        current slate. Used by the prop-board / hourly recompute paths to
-        blend priors for the whole slate at once.
+        Each matchup row contributes both sides (home + away). Rows are read
+        oldest → newest, so when a team appears in several fresh matchups the
+        most recently computed one wins. Priors older than ``max_age_hours``
+        are ignored (``None`` = no age cap). Used by the prop-board / hourly
+        recompute / scanner full-mode paths to blend the whole slate at once.
         """
+        from nba_model.scrapers.team_names import team_abbrev
+
+        fresh_sql, fresh_params = self._team_prior_fresh_clause(max_age_hours)
         rows = self.conn.execute(
             "SELECT away_team, home_team, away_team_total, home_team_total, "
-            "pace_factor FROM team_priors"
+            f"pace_factor FROM team_priors WHERE {fresh_sql} "
+            "ORDER BY datetime(computed_at_utc) ASC",
+            fresh_params,
         ).fetchall()
         out: dict = {}
         for away, home, away_tt, home_tt, pace in rows:
-            if home:
-                out[str(home).upper()] = {
+            for team, team_total in ((home, home_tt), (away, away_tt)):
+                if not team:
+                    continue
+                key = team_abbrev(team) or str(team).upper()
+                out[key] = {
                     "pace_factor": pace,
-                    "implied_team_total": home_tt,
-                    "team_recent_avg_total": self.get_team_recent_avg_points(home),
-                }
-            if away:
-                out[str(away).upper()] = {
-                    "pace_factor": pace,
-                    "implied_team_total": away_tt,
-                    "team_recent_avg_total": self.get_team_recent_avg_points(away),
+                    "implied_team_total": team_total,
+                    "team_recent_avg_total": self.get_team_recent_avg_points(key),
                 }
         return out
 
@@ -505,15 +706,19 @@ class DatabaseManager:
         return {"inserted": int(inserted), "attempted": int(len(payload))}
 
     def _closing_clv_delta(self, player_id, game_date, stat_type, side,
-                           entry_implied):
+                           entry_implied, line=None, book=None):
         """CLV delta for one pick from the latest line snapshot, or ``None``.
 
         Reuses ``clv_proxy`` odds→implied conversion. Returns
         ``closing_side_implied − entry_implied`` (positive = the market closed
         toward the bet's side vs the entry price). ``None`` when there's no
-        snapshot, no odds on that side, or no entry implied prob."""
+        snapshot AT THE PICK'S LINE, no odds on that side, or no entry implied
+        prob. A price at a different line is not the same bet, so it is never
+        used; among same-line snapshots the pick's own book wins, then the
+        latest snapshot (``snapshot_id`` breaks ties within one poll)."""
         entry = _safe_float(entry_implied)
-        if entry is None or player_id is None:
+        line_value = _safe_float(line)
+        if entry is None or player_id is None or line_value is None:
             return None
         row = self.conn.execute(
             """
@@ -522,10 +727,13 @@ class DatabaseManager:
             WHERE player_id = ?
               AND DATE(game_date) = DATE(?)
               AND lower(stat_type) = lower(?)
-            ORDER BY snapshot_ts_utc DESC
+              AND ABS(line_value - ?) < 1e-6
+            ORDER BY (lower(book) = lower(?)) DESC,
+                     snapshot_ts_utc DESC, snapshot_id DESC
             LIMIT 1
             """,
-            (int(player_id), str(game_date), str(stat_type)),
+            (int(player_id), str(game_date), str(stat_type), line_value,
+             str(book or "")),
         ).fetchone()
         if not row:
             return None
@@ -550,7 +758,8 @@ class DatabaseManager:
         now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         pending = self.conn.execute(
             """
-            SELECT log_id, player_id, game_date, stat_type, line, side, implied_prob
+            SELECT log_id, player_id, game_date, stat_type, line, side,
+                   implied_prob, book
             FROM bet_log
             WHERE status = 'pending'
             """
@@ -570,7 +779,8 @@ class DatabaseManager:
         clv_filled = 0
         unsupported_stats: set[str] = set()
 
-        for log_id, player_id, game_date, stat_type, line, side, implied_prob in pending:
+        for (log_id, player_id, game_date, stat_type, line, side,
+             implied_prob, book) in pending:
             scanned += 1
             stat = (stat_type or "").strip().lower()
             expr = _GAMELOG_STAT_EXPR.get(stat)
@@ -594,7 +804,8 @@ class DatabaseManager:
             if status is None:
                 continue
             clv = self._closing_clv_delta(
-                player_id, game_date, stat, side, implied_prob
+                player_id, game_date, stat, side, implied_prob,
+                line=line, book=book,
             ) if fill_clv else None
             if clv is not None:
                 clv_filled += 1
@@ -779,14 +990,26 @@ class DatabaseManager:
 
     def insert_betting_lines_records(self, records):
         """
-        Insert betting lines while skipping exact duplicates.
+        Insert betting lines change-only, tagging alt-line ladders.
+
+        One call is treated as one scrape. Per (player, date, book, stat) the
+        batch's rungs are tagged ``is_main_line`` (1 = the main line picked by
+        ``odds.main_line_index``, 0 = alt rung). A row is skipped only when it
+        equals the LATEST stored row of its kind — the latest main line for
+        the key, or the latest alt row at the same line value — so an
+        A→B→A move is recorded (the old check skipped anything that matched
+        ANY historical row, leaving latest-by-scraped_at stale). Book keys
+        compare case-insensitively ('FanDuel' == 'fanduel'); the stored name
+        is kept as given.
 
         Args:
             records: Iterable of dicts with keys:
-                player_id, game_date, book, stat_type, line_value, over_odds, under_odds
+                player_id, game_date, book, stat_type, line_value, over_odds,
+                under_odds (+ optional provenance ``source``)
 
         Returns:
-            dict: Insert summary with keys inserted, duplicates_ignored, attempted.
+            dict: inserted, duplicates_ignored, rejected_implausible, attempted,
+            alt_lines_tagged.
         """
         if not records:
             return {
@@ -795,34 +1018,25 @@ class DatabaseManager:
                 "attempted": 0,
             }
 
-        query = """
-            INSERT INTO betting_lines
-                (player_id, game_date, book, stat_type, line_value,
-                 over_odds, under_odds, source)
-            SELECT ?, ?, ?, ?, ?, ?, ?, ?
-            WHERE NOT EXISTS (
-                SELECT 1
-                FROM betting_lines bl
-                WHERE bl.player_id = ?
-                  AND bl.game_date = ?
-                  AND bl.book = ?
-                  AND bl.stat_type = ?
-                  AND bl.line_value = ?
-                  AND IFNULL(bl.over_odds, -99999) = IFNULL(?, -99999)
-                  AND IFNULL(bl.under_odds, -99999) = IFNULL(?, -99999)
-            )
-        """
-
         # SECURITY (data poisoning defense): drop scraper-poisoned rows that
         # claim a structurally implausible line/odds. The scrapers are the
         # only third-party-influenced surface; even one bad row pollutes the
         # consensus mean + EV math for every user. The validator's range is
         # deliberately generous - real outliers pass, deliberate bad data
         # (negative lines, 9999.5 points, nan, inf, odds=0) gets dropped.
+        from nba_model.model.odds import main_line_index
         from nba_model.web.input_validation import is_plausible_betting_line
 
-        payload = []
+        def _odds(v):
+            try:
+                return int(v) if v is not None else None
+            except (TypeError, ValueError):
+                return None
+
+        valid = []
         rejected_implausible = 0
+        seen_in_batch = set()
+        batch_dupes = 0
         for rec in records:
             row = (
                 rec.get("player_id"),
@@ -840,24 +1054,86 @@ class DatabaseManager:
             ):
                 rejected_implausible += 1
                 continue
-            # INSERT carries the 7 core columns + optional provenance ``source``
-            # (NULL for direct scrapes); the WHERE-NOT-EXISTS dedup keys off the
-            # 7 core columns only, so re-tagging never creates duplicate rows.
-            source = rec.get("source")
-            payload.append(row + (source,) + row)
+            group = (row[0], str(row[1]), str(row[2]).strip().lower(),
+                     str(row[3]).strip().lower())
+            ident = group + (self._norm_line(row[4]), _odds(row[5]), _odds(row[6]))
+            if ident in seen_in_batch:
+                batch_dupes += 1
+                continue
+            seen_in_batch.add(ident)
+            valid.append({"row": row, "group": group, "source": rec.get("source"),
+                          "line_value": row[4], "over_odds": row[5],
+                          "under_odds": row[6]})
 
-        if not payload:
+        if not valid:
             return {
                 "inserted": 0,
-                "duplicates_ignored": 0,
+                "duplicates_ignored": int(batch_dupes),
+                "rejected_implausible": int(rejected_implausible),
                 "attempted": 0,
             }
 
+        # Tag each scrape-ladder's main rung.
+        ladders: dict = {}
+        for item in valid:
+            ladders.setdefault(item["group"], []).append(item)
+        alt_tagged = 0
+        for ladder in ladders.values():
+            main = main_line_index(ladder)
+            for i, item in enumerate(ladder):
+                item["is_main"] = 1 if i == main else 0
+                alt_tagged += 1 - item["is_main"]
+
+        main_sql = self.main_line_sql()
+        latest_main_q = f"""
+            SELECT line_value, over_odds, under_odds FROM betting_lines
+            WHERE player_id = ? AND game_date = ? AND lower(book) = ?
+              AND lower(stat_type) = ? AND {main_sql}
+            ORDER BY scraped_at DESC, line_id DESC LIMIT 1
+        """
+        latest_alt_q = """
+            SELECT over_odds, under_odds FROM betting_lines
+            WHERE player_id = ? AND game_date = ? AND lower(book) = ?
+              AND lower(stat_type) = ? AND is_main_line = 0
+              AND round(line_value, 3) = ?
+            ORDER BY scraped_at DESC, line_id DESC LIMIT 1
+        """
+        state: dict = {}
+        payload = []
+        for item in valid:
+            row, group = item["row"], item["group"]
+            line = self._norm_line(row[4])
+            prices = (_odds(row[5]), _odds(row[6]))
+            if item["is_main"]:
+                skey = ("main",) + group
+                if skey not in state:
+                    got = self.conn.execute(latest_main_q, group).fetchone()
+                    state[skey] = (None if got is None else
+                                   (self._norm_line(got[0]), _odds(got[1]), _odds(got[2])))
+                current = (line,) + prices
+            else:
+                skey = ("alt",) + group + (line,)
+                if skey not in state:
+                    got = self.conn.execute(latest_alt_q, group + (line,)).fetchone()
+                    state[skey] = (None if got is None else (_odds(got[0]), _odds(got[1])))
+                current = prices
+            if state[skey] is not None and state[skey] == current:
+                continue
+            state[skey] = current
+            payload.append(row + (item["source"], item["is_main"]))
+
+        query = """
+            INSERT INTO betting_lines
+                (player_id, game_date, book, stat_type, line_value,
+                 over_odds, under_odds, source, is_main_line)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """
         before_changes = self.conn.total_changes
-        self.conn.executemany(query, payload)
-        self.conn.commit()
+        if payload:
+            self.conn.executemany(query, payload)
+            self.conn.commit()
         inserted = self.conn.total_changes - before_changes
-        ignored = len(payload) - inserted
+        ignored = batch_dupes + (len(valid) - inserted)
         if rejected_implausible:
             logger.warning(
                 "Dropped %s implausible betting_lines rows (likely scraper "
@@ -866,14 +1142,15 @@ class DatabaseManager:
             )
         logger.info(
             "Inserted %s betting_lines rows (%s duplicates ignored, "
-            "%s implausible)",
-            inserted, ignored, rejected_implausible,
+            "%s implausible, %s alt rungs tagged)",
+            inserted, ignored, rejected_implausible, alt_tagged,
         )
         return {
             "inserted": int(inserted),
             "duplicates_ignored": int(ignored),
             "rejected_implausible": int(rejected_implausible),
-            "attempted": int(len(payload)),
+            "attempted": int(len(valid) + batch_dupes),
+            "alt_lines_tagged": int(alt_tagged),
         }
 
     def insert_betting_line_snapshots(self, records):
@@ -1048,7 +1325,11 @@ class DatabaseManager:
         Args:
             source_urls: optional iterable of URL filters.
             max_snapshots_per_url: max snapshots returned per URL.
-            limit_total: hard cap for total snapshots returned.
+            limit_total: hard cap for total snapshots returned. Applied
+                newest-first, so the cap drops the OLDEST snapshots (it used
+                to sort by URL and silently drop every alphabetically-late
+                URL — sportsbook.*, www.bovada, www.vegasinsider — once
+                stale URLs pushed the count past the cap).
         """
         per_url_limit = max(1, int(max_snapshots_per_url))
         total_limit = max(1, int(limit_total))
@@ -1064,7 +1345,7 @@ class DatabaseManager:
                 SELECT snapshot_id, source_url, fetched_at_utc, text_content, text_length, content_sha256
                 FROM web_text_snapshots
                 WHERE source_url IN ({placeholders})
-                ORDER BY source_url ASC, fetched_at_utc DESC, snapshot_id DESC
+                ORDER BY datetime(fetched_at_utc) DESC, snapshot_id DESC
             """
             rows = self.conn.execute(query, tuple(urls)).fetchall()
         else:
@@ -1072,7 +1353,7 @@ class DatabaseManager:
                 """
                 SELECT snapshot_id, source_url, fetched_at_utc, text_content, text_length, content_sha256
                 FROM web_text_snapshots
-                ORDER BY source_url ASC, fetched_at_utc DESC, snapshot_id DESC
+                ORDER BY datetime(fetched_at_utc) DESC, snapshot_id DESC
                 """
             ).fetchall()
 
@@ -1219,7 +1500,9 @@ class DatabaseManager:
         Beyond the per-snapshot ``record_sha256`` uniqueness, this also skips
         any card whose line equals the most-recently-stored line for the same
         (book, player, stat, side): re-scraping an unchanged game adds no row,
-        and a new row lands only when the book moves the line.
+        and a new row lands only when the book moves the line. A skipped
+        re-scrape still bumps the current row's ``last_seen_at_utc`` so
+        freshness windows keep lines that are stable across days.
 
         Args:
             records: Iterable[dict] with parser output fields.
@@ -1244,13 +1527,16 @@ class DatabaseManager:
                 parse_confidence,
                 raw_card_text,
                 parser_version,
-                record_sha256
+                record_sha256,
+                last_seen_at_utc
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """
 
         payload = []
         skipped_unchanged = 0
+        # key -> newest observed_at among unchanged re-scrapes (last_seen bump).
+        seen_unchanged: dict = {}
         # Cache of the line we consider "current" per (book, player, stat, side),
         # seeded from the DB and updated as we accept rows so two unchanged
         # cards in the same batch don't both insert.
@@ -1302,11 +1588,16 @@ class DatabaseManager:
             new_line = self._norm_line(line_value)
             if latest_line[key] is not None and latest_line[key] == new_line:
                 skipped_unchanged += 1
+                if row[3] > seen_unchanged.get(key, ""):
+                    seen_unchanged[key] = row[3]
                 continue
             latest_line[key] = new_line
-            payload.append(row)
+            payload.append(row + (row[3],))  # last_seen starts at observed
 
+        prop_key_sql = "book = ? AND player_name = ? AND stat_type = ? AND side = ?"
         if not payload:
+            self._bump_last_seen("web_prop_cards", "card_id", prop_key_sql, seen_unchanged)
+            self.conn.commit()
             return {
                 "inserted": 0,
                 "attempted": 0,
@@ -1315,8 +1606,11 @@ class DatabaseManager:
 
         before_changes = self.conn.total_changes
         self.conn.executemany(query, payload)
+        inserted_changes = self.conn.total_changes - before_changes
+        # After the inserts, so an in-batch duplicate bumps the row this batch wrote.
+        self._bump_last_seen("web_prop_cards", "card_id", prop_key_sql, seen_unchanged)
         self.conn.commit()
-        inserted = self.conn.total_changes - before_changes
+        inserted = inserted_changes
         logger.info(
             "Inserted %s web_prop_cards rows (%s skipped: line unchanged)",
             inserted,
@@ -1367,8 +1661,9 @@ class DatabaseManager:
             except (TypeError, ValueError):
                 hours = None
             if hours and hours > 0:
+                # Last SEEN, not last changed: stable lines stay in-window.
                 clauses.append(
-                    "observed_at_utc >= datetime('now', ?)"
+                    f"datetime({self.seen_at_sql()}) >= datetime('now', ?)"
                 )
                 params.append(f"-{hours} hours")
         where_sql = " AND ".join(clauses) if clauses else "1=1"
@@ -1382,6 +1677,7 @@ class DatabaseManager:
                     book,
                     line_value,
                     observed_at_utc,
+                    {self.seen_at_sql()} AS seen_at_utc,
                     ROW_NUMBER() OVER (
                         PARTITION BY lower(player_name), lower(stat_type), lower(side), lower(book)
                         ORDER BY observed_at_utc DESC, card_id DESC
@@ -1398,7 +1694,7 @@ class DatabaseManager:
                 MAX(line_value)               AS max_line,
                 COUNT(DISTINCT lower(book))   AS n_books,
                 GROUP_CONCAT(DISTINCT book)   AS books,
-                MAX(observed_at_utc)          AS latest_observed_at
+                MAX(seen_at_utc)              AS latest_observed_at
             FROM latest_per_book
             WHERE rn = 1
             GROUP BY lower(player_name), lower(stat_type), lower(side)
@@ -1428,7 +1724,8 @@ class DatabaseManager:
         Also skips any row whose (line_value, odds) equals the most-recent
         stored values for the same (book, away, home, market, side, team):
         re-scraping the same game adds nothing, and a new row is written only
-        when the book moves the line or odds.
+        when the book moves the line or odds. A skipped re-scrape bumps the
+        current row's ``last_seen_at_utc`` (see ``insert_web_prop_cards``).
         """
         if not records:
             return {"inserted": 0, "attempted": 0, "skipped_unchanged": 0}
@@ -1439,12 +1736,13 @@ class DatabaseManager:
                 away_team, home_team, market_type, side, team,
                 line_value, odds_american,
                 parse_confidence, raw_text, parser_version, record_sha256,
-                sport
+                sport, last_seen_at_utc
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """
         payload = []
         skipped_unchanged = 0
+        seen_unchanged: dict = {}
         # (book, away, home, market, side, team) -> last (line, odds) we kept.
         latest_state = {}
         for rec in records:
@@ -1494,17 +1792,26 @@ class DatabaseManager:
             new_state = (self._norm_line(line_value), odds)
             if latest_state[key] is not None and latest_state[key] == new_state:
                 skipped_unchanged += 1
+                if row[3] > seen_unchanged.get(key, ""):
+                    seen_unchanged[key] = row[3]
                 continue
             latest_state[key] = new_state
-            payload.append(row)
+            payload.append(row + (row[3],))  # last_seen starts at observed
 
+        team_key_sql = (
+            "book = ? AND away_team = ? AND home_team = ? "
+            "AND market_type = ? AND side = ? AND team IS ?"
+        )
         if not payload:
+            self._bump_last_seen("web_team_lines", "line_id", team_key_sql, seen_unchanged)
+            self.conn.commit()
             return {"inserted": 0, "attempted": 0, "skipped_unchanged": skipped_unchanged}
 
         before = self.conn.total_changes
         self.conn.executemany(query, payload)
-        self.conn.commit()
         inserted = self.conn.total_changes - before
+        self._bump_last_seen("web_team_lines", "line_id", team_key_sql, seen_unchanged)
+        self.conn.commit()
         logger.info(
             "Inserted %s web_team_lines rows (%s skipped: line unchanged)",
             inserted,
@@ -1559,7 +1866,10 @@ class DatabaseManager:
             except (TypeError, ValueError):
                 hours = None
             if hours and hours > 0:
-                clauses.append("observed_at_utc >= datetime('now', ?)")
+                # Last SEEN, not last changed: stable lines stay in-window.
+                clauses.append(
+                    f"datetime({self.seen_at_sql()}) >= datetime('now', ?)"
+                )
                 params.append(f"-{hours} hours")
         where_sql = (" AND ".join(clauses)) if clauses else "1=1"
 
@@ -1572,7 +1882,8 @@ class DatabaseManager:
             WITH latest_per_book AS (
                 SELECT
                     away_team, home_team, market_type, side,
-                    book, line_value, odds_american, observed_at_utc,
+                    book, line_value, odds_american,
+                    {self.seen_at_sql()} AS seen_at_utc,
                     ROW_NUMBER() OVER (
                         PARTITION BY lower(away_team), lower(home_team),
                                      lower(market_type), lower(side), lower(book)
@@ -1583,7 +1894,7 @@ class DatabaseManager:
             )
             SELECT
                 away_team, home_team, market_type, side,
-                book, line_value, odds_american, observed_at_utc
+                book, line_value, odds_american, seen_at_utc
             FROM latest_per_book
             WHERE rn = 1
             ORDER BY away_team, home_team, market_type, side, book
@@ -1948,6 +2259,110 @@ class DatabaseManager:
             "attempted": int(len(payload)),
         }
 
+    def insert_mlb_prop_lines(self, records):
+        """Insert MLB prop-line observations with change-only semantics.
+
+        Each record: snapshot_id, source_url, source, book, observed_at_utc,
+        game_date, player_name, stat_type, stat_group, market_shape,
+        line_value, side, over_odds, under_odds, parser_version,
+        record_sha256. Beyond ``record_sha256`` uniqueness, a row is skipped
+        when its (line, over_odds, under_odds) equals the most-recently-stored
+        state for the same (book, player, stat, side, game_date) — re-scraping
+        an unchanged board adds nothing; a line OR price move lands a new row,
+        and the next slate's first observation always lands (game_date is part
+        of the key, so an identical price on a new day is not "unchanged").
+        """
+        if not records:
+            return {"inserted": 0, "attempted": 0, "skipped_unchanged": 0}
+
+        query = """
+            INSERT OR IGNORE INTO mlb_prop_lines (
+                sport, snapshot_id, source_url, source, book, observed_at_utc,
+                game_date, player_name, stat_type, stat_group, market_shape,
+                line_value, side, over_odds, under_odds, parser_version,
+                record_sha256
+            )
+            VALUES ('mlb', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """
+
+        def _odds(v):
+            return None if v is None else int(v)
+
+        payload = []
+        skipped_unchanged = 0
+        latest = {}
+        for rec in records:
+            try:
+                line_value = float(rec.get("line_value"))
+                over_odds = _odds(rec.get("over_odds"))
+                under_odds = _odds(rec.get("under_odds"))
+            except (TypeError, ValueError):
+                continue
+            snapshot_id = rec.get("snapshot_id")
+            row = (
+                int(snapshot_id) if snapshot_id is not None else None,
+                str(rec.get("source_url") or "").strip() or None,
+                str(rec.get("source", "")).strip(),
+                str(rec.get("book", "")).strip(),
+                str(rec.get("observed_at_utc", "")).strip(),
+                str(rec.get("game_date") or "").strip() or None,
+                str(rec.get("player_name", "")).strip(),
+                str(rec.get("stat_type", "")).strip().lower(),
+                str(rec.get("stat_group", "")).strip().lower(),
+                str(rec.get("market_shape", "")).strip().lower(),
+                line_value,
+                str(rec.get("side", "")).strip().lower(),
+                over_odds,
+                under_odds,
+                str(rec.get("parser_version", "")).strip(),
+                str(rec.get("record_sha256", "")).strip(),
+            )
+            if not all(row[i] for i in (2, 3, 4, 6, 7, 8, 9, 11, 14, 15)):
+                continue
+
+            # book, player, stat, side, game_date
+            key = (row[3], row[6], row[7], row[11], row[5])
+            if key not in latest:
+                prev = self.conn.execute(
+                    """
+                    SELECT line_value, over_odds, under_odds
+                    FROM mlb_prop_lines
+                    WHERE book = ? AND player_name = ? AND stat_type = ? AND side = ?
+                      AND game_date IS ?
+                    ORDER BY observed_at_utc DESC, mlb_prop_line_id DESC
+                    LIMIT 1
+                    """,
+                    key,
+                ).fetchone()
+                latest[key] = (
+                    None if prev is None
+                    else (self._norm_line(prev[0]), prev[1], prev[2])
+                )
+            state = (self._norm_line(line_value), over_odds, under_odds)
+            if latest[key] is not None and latest[key] == state:
+                skipped_unchanged += 1
+                continue
+            latest[key] = state
+            payload.append(row)
+
+        if not payload:
+            return {"inserted": 0, "attempted": 0,
+                    "skipped_unchanged": int(skipped_unchanged)}
+
+        before = self.conn.total_changes
+        self.conn.executemany(query, payload)
+        self.conn.commit()
+        inserted = self.conn.total_changes - before
+        logger.info(
+            "Inserted %s mlb_prop_lines rows (%s skipped: unchanged)",
+            inserted, skipped_unchanged,
+        )
+        return {
+            "inserted": int(inserted),
+            "attempted": int(len(payload)),
+            "skipped_unchanged": int(skipped_unchanged),
+        }
+
     def get_mlb_player_game_logs(self, player_id, stat_type, n_games=50):
         """Most-recent N MLB game-log values for a player+stat (sport='mlb')."""
         cur = self.conn.execute(
@@ -2100,6 +2515,26 @@ class DatabaseManager:
         """
         return pd.read_sql_query(query, self.conn, params=(start_date, end_date))
 
+    def _latest_main_line_values(self, where_sql: str, params) -> list:
+        """Each book's CURRENT main line for the filter: latest main-line row
+        per lower(book) (newest scraped_at, then line_id). Aggregating these —
+        not every historical row / alt rung — is what "the market line" means.
+        """
+        query = f"""
+            WITH ranked AS (
+                SELECT line_value,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY lower(book)
+                           ORDER BY scraped_at DESC, line_id DESC
+                       ) AS rn
+                FROM betting_lines
+                WHERE {where_sql} AND {self.main_line_sql()}
+            )
+            SELECT line_value FROM ranked WHERE rn = 1
+        """
+        return [r[0] for r in self.conn.execute(query, tuple(params)).fetchall()
+                if r and r[0] is not None]
+
     def get_market_line(self, player_id, game_date, stat_type, book=None, agg="median"):
         """
         Fetch market line for a player/stat/date, optionally scoped to one book.
@@ -2119,28 +2554,12 @@ class DatabaseManager:
         else:
             game_date = str(game_date)[:10]
 
+        clauses = ["player_id = ?", "game_date = ?", "stat_type = ?"]
+        params = [player_id, game_date, stat_type]
         if book:
-            query = """
-                SELECT line_value
-                FROM betting_lines
-                WHERE player_id = ?
-                  AND game_date = ?
-                  AND stat_type = ?
-                  AND book = ?
-            """
-            params = (player_id, game_date, stat_type, book)
-        else:
-            query = """
-                SELECT line_value
-                FROM betting_lines
-                WHERE player_id = ?
-                  AND game_date = ?
-                  AND stat_type = ?
-            """
-            params = (player_id, game_date, stat_type)
-
-        rows = [r[0] for r in self.conn.execute(
-            query, params).fetchall() if r and r[0] is not None]
+            clauses.append("lower(book) = lower(?)")
+            params.append(book)
+        rows = self._latest_main_line_values(" AND ".join(clauses), params)
         if not rows:
             return None
 
@@ -2200,28 +2619,13 @@ class DatabaseManager:
             return None
 
         placeholders = ", ".join(["?"] * len(spread_aliases))
+        clauses = ["player_id = ?", "game_date = ?",
+                   f"lower(stat_type) IN ({placeholders})"]
+        params = [player_id, game_date, *spread_aliases]
         if book:
-            query = f"""
-                SELECT line_value
-                FROM betting_lines
-                WHERE player_id = ?
-                  AND game_date = ?
-                  AND lower(stat_type) IN ({placeholders})
-                  AND book = ?
-            """
-            params = (player_id, game_date, *spread_aliases, book)
-        else:
-            query = f"""
-                SELECT line_value
-                FROM betting_lines
-                WHERE player_id = ?
-                  AND game_date = ?
-                  AND lower(stat_type) IN ({placeholders})
-            """
-            params = (player_id, game_date, *spread_aliases)
-
-        rows = [r[0] for r in self.conn.execute(
-            query, params).fetchall() if r and r[0] is not None]
+            clauses.append("lower(book) = lower(?)")
+            params.append(book)
+        rows = self._latest_main_line_values(" AND ".join(clauses), params)
         if not rows:
             return None
 

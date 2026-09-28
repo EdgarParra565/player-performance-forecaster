@@ -305,6 +305,8 @@ class WebhookPayloadEdgeTests(unittest.TestCase):
             "type": "checkout.session.completed",
             "data": {"object": {
                 "customer_email": "newpremium@example.com",
+                # Premium is granted only on a PAID checkout (W-SEC-2).
+                "payment_status": "paid",
                 "subscription": "sub_123",
                 "current_period_end": future,
             }},
@@ -321,6 +323,7 @@ class WebhookPayloadEdgeTests(unittest.TestCase):
             "type": "checkout.session.completed",
             "data": {"object": {
                 "customer_email": "<script>alert(1)</script>@evil.com",
+                "payment_status": "paid",
                 "subscription": "sub_x",
                 "current_period_end": int(time.time()) + 1000,
             }},

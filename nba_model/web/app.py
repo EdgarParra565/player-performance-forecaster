@@ -9,7 +9,9 @@ main pane re-renders every chart and the EV summary on selection change.
 
 from __future__ import annotations
 
+import logging
 import sys
+import uuid
 from pathlib import Path
 from typing import Optional
 
@@ -433,7 +435,7 @@ def _all_stats_overview(
                 n_games=n_games,
             )
         except Exception as exc:  # noqa: BLE001
-            st.error(f"{stat_type}: failed to load — {exc}")
+            _public_error(f"{stat_type}: failed to load", exc)
             continue
 
         st.markdown(f"### {stat_type}")
@@ -548,7 +550,7 @@ def _team_overview(
                 stat_type=stat_type, n_games=n_games,
             )
         except Exception as exc:  # noqa: BLE001
-            st.error(f"{stat_type}: failed to load - {exc}")
+            _public_error(f"{stat_type}: failed to load", exc)
             continue
 
         st.markdown(f"### {stat_type}")
@@ -1041,7 +1043,7 @@ def _admin_dashboard_view() -> None:
     try:
         stats = subscriptions.aggregate_stats()
     except Exception as exc:  # noqa: BLE001
-        st.error(f"Could not load subscription stats: {exc}")
+        _public_error("Could not load subscription stats", exc)
         return
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Premium", stats["premium"])
@@ -1134,17 +1136,11 @@ def _edge_scanner_view(db_path: str, user) -> None:
         st.info("Select at least one book in the sidebar to scan.")
         return
 
-    # Free-tier app-layer throttle: cap full-slate scans per session so a tight
-    # rerun loop can't hammer the DB. Premium is unthrottled.
-    if not is_premium:
-        from nba_model.web import throttle
-        if not throttle.session_rate_limit("edge_scan", max_calls=8,
-                                           window_seconds=60.0):
-            st.warning(
-                "Scan rate limit reached for the free tier (8 / minute). "
-                "Wait a moment or upgrade for unthrottled scans."
-            )
-            return
+    # App-layer scan throttle: caps full-slate scans per session so a tight
+    # rerun loop can't pin the CPU. Applies to EVERYONE but admins — with
+    # BILLING_ENABLED off every anonymous visitor is "premium".
+    if _scan_throttled("edge_scan", is_premium):
+        return
 
     # Model-mode capability check + graceful fallback (shared contract): a build
     # whose model layer hasn't shipped ``full`` degrades to ``chart_mean`` with a
@@ -1155,7 +1151,7 @@ def _edge_scanner_view(db_path: str, user) -> None:
             db_path, books=books, stat_types=stats or None,
         )
     except Exception as exc:  # noqa: BLE001
-        st.error(f"Edge scan failed: {exc}")
+        _public_error("Edge scan failed", exc)
         return
     # ``lines`` is now bound, so the chart_mean backstop below can safely retry.
     try:
@@ -1179,16 +1175,15 @@ def _edge_scanner_view(db_path: str, user) -> None:
             st.error(f"Edge scan failed: {exc2}")
             return
     except Exception as exc:  # noqa: BLE001
-        st.error(f"Edge scan failed: {exc}")
+        _public_error("Edge scan failed", exc)
         return
     if notice:
         st.caption(f":information_source: {notice}")
 
     # Free tier: restrict to the preview player set (same gate as other views).
     if not is_premium and not scored.empty:
-        preview = {p.casefold() for p in web_auth.PREVIEW_PLAYERS}
         scored = scored[
-            scored["player_name"].str.casefold().isin(preview)
+            scored["player_name"].map(web_auth.is_preview_player).astype(bool)
         ].reset_index(drop=True)
 
     ranked = es.top_edges(
@@ -1371,16 +1366,9 @@ def _cross_book_view(db_path: str, user) -> None:
         st.info("Select at least one book in the sidebar to compare.")
         return
 
-    # Free-tier throttle (same budget shape as the Edge Scanner).
-    if not is_premium:
-        from nba_model.web import throttle
-        if not throttle.session_rate_limit("cross_book_scan", max_calls=8,
-                                           window_seconds=60.0):
-            st.warning(
-                "Scan rate limit reached for the free tier (8 / minute). "
-                "Wait a moment or upgrade for unthrottled scans."
-            )
-            return
+    # Scan throttle (same budget shape as the Edge Scanner; admins exempt).
+    if _scan_throttled("cross_book_scan", is_premium):
+        return
 
     # Model-mode capability check + graceful fallback (shared contract).
     effective_mode, notice = cbv.resolve_model_mode(requested_mode, es)
@@ -1409,16 +1397,15 @@ def _cross_book_view(db_path: str, user) -> None:
             st.error(f"Cross-book scan failed: {exc2}")
             return
     except Exception as exc:  # noqa: BLE001
-        st.error(f"Cross-book scan failed: {exc}")
+        _public_error("Cross-book scan failed", exc)
         return
     if notice:
         st.caption(f":information_source: {notice}")
 
     # Free tier: restrict to the preview player set (same gate as the scanner).
     if not is_premium and not scored.empty:
-        preview = {p.casefold() for p in web_auth.PREVIEW_PLAYERS}
         scored = scored[
-            scored["player_name"].str.casefold().isin(preview)
+            scored["player_name"].map(web_auth.is_preview_player).astype(bool)
         ].reset_index(drop=True)
 
     # Keep the unfiltered frame for KPIs ("Pairs scanned" = the true scan size,
@@ -1453,9 +1440,8 @@ def _cross_book_view(db_path: str, user) -> None:
     # the same preview players as the line-shopping table — otherwise the free
     # tier would leak the full-slate arb feature and contradict the banner below.
     if not is_premium and not arbs.empty:
-        preview = {p.casefold() for p in web_auth.PREVIEW_PLAYERS}
         arbs = arbs[
-            arbs["player_name"].str.casefold().isin(preview)
+            arbs["player_name"].map(web_auth.is_preview_player).astype(bool)
         ].reset_index(drop=True)
 
     # ---- KPI row ----
@@ -1604,7 +1590,8 @@ def _game_results_view(db_path: str) -> None:
         teams = ["(all)"] + pc.list_team_codes(db_path)
         team_pick = st.selectbox("Team", teams, index=0)
     with c4:
-        n = int(st.number_input("Limit", min_value=10, max_value=2000,
+        n = int(st.number_input("Limit", min_value=10,
+                                max_value=iv.N_GAMES_HARD_CAP,  # validator cap
                                 value=100, step=10))
 
     # Validate inputs before hitting the DB so a malformed value shows a
@@ -1688,7 +1675,8 @@ def _player_browse_view(db_path: str) -> None:
             help="e.g. 30 to find games with the chosen stat ≥ 30.",
         )
     with c5:
-        n = int(st.number_input("Limit", min_value=10, max_value=5000,
+        n = int(st.number_input("Limit", min_value=10,
+                                max_value=iv.N_GAMES_HARD_CAP,  # validator cap
                                 value=200, step=50))
 
     try:
@@ -1873,6 +1861,10 @@ def _compare_players_view(
         "mean across all stored sportsbooks."
     )
     all_names = players_df["player_name"].dropna().astype(str).tolist()
+    # SECURITY (paywall): the picker must honour the free-tier preview set
+    # like every other view; it previously listed every player.
+    if not web_auth.current_user().is_premium:
+        all_names = [n for n in all_names if web_auth.is_preview_player(n)]
     if not all_names:
         st.warning("No players in the local DB to compare.")
         return
@@ -1899,6 +1891,8 @@ def _compare_players_view(
     datasets: list[pc.PlayerChartData] = []
     summary_rows: list[dict] = []
     for name in picks:
+        if not web_auth.gate_player(name):  # re-check server-side
+            continue
         pid, resolved = _resolve_player_id(players_df, name)
         try:
             d = pc.fetch_player_chart_data(
@@ -1909,7 +1903,7 @@ def _compare_players_view(
                 n_games=int(n_games),
             )
         except Exception as exc:  # noqa: BLE001
-            st.error(f"{name}: failed to load - {exc}")
+            _public_error(f"{name}: failed to load", exc)
             continue
         datasets.append(d)
         consensus = pc.compute_market_consensus(d)
@@ -2080,6 +2074,9 @@ def _single_prop_model_view(*, default_player: str, n_games_default: int) -> Non
         st.error(f"Invalid input: {exc}")
         return
 
+    if _outbound_throttled("single_prop_nba_api"):
+        return
+
     with st.spinner(f"Running model for {player} (NBA API)…"):
         try:
             result = run_single_prop(
@@ -2101,7 +2098,7 @@ def _single_prop_model_view(*, default_player: str, n_games_default: int) -> Non
                 sigma_severity=float(sigma_severity),
             )
         except Exception as exc:  # noqa: BLE001
-            st.error(f"Model failed: {exc}")
+            _public_error("Model failed", exc)
             return
 
     # KPI row
@@ -2154,6 +2151,77 @@ def _single_prop_model_view(*, default_player: str, n_games_default: int) -> Non
 # Manual lines import view — paste board / CSV / pipe rows, parse, save.
 # Saves are admin-gated to prevent random visitors from poisoning betting_lines.
 # ---------------------------------------------------------------------------
+_log = logging.getLogger("nba_model.web.app")
+
+
+def _public_error(message: str, exc: BaseException) -> None:
+    """Show a generic error to the visitor; log the real exception server-side.
+
+    Raw exception text can carry file paths, SQL, or DSNs, so it never reaches
+    the page. The short reference lets an operator find the log line.
+    """
+    ref = uuid.uuid4().hex[:8]
+    _log.error("%s [ref %s]", message, ref, exc_info=exc)
+    st.error(f"{message}. Something went wrong on our side (ref {ref}).")
+
+
+SCAN_BUDGET_FREE = 8        # scans / minute / session
+SCAN_BUDGET_PREMIUM = 30
+
+
+def _scan_throttled(key: str, is_premium: bool) -> bool:
+    """True (and warns) when this session is over its scan budget.
+
+    Premium gets a larger budget, not an exemption: in open-access mode
+    (BILLING_ENABLED off) every anonymous visitor is premium. Admins are
+    exempt. Budget is per client IP when Streamlit exposes it (behind a proxy
+    set STREAMLIT_TRUSTED_PROXY_HOPS), falling back to per session.
+    """
+    if web_auth.is_admin():
+        return False
+    from nba_model.web import throttle
+    budget = SCAN_BUDGET_PREMIUM if is_premium else SCAN_BUDGET_FREE
+    if throttle.rate_limit(key, max_calls=budget, window_seconds=60.0):
+        return False
+    st.warning(
+        f"Scan rate limit reached ({budget} / minute). Wait a moment and "
+        "try again."
+    )
+    return True
+
+
+# Outbound NBA API calls (Single prop model). stats.nba.com bans the SERVER's
+# IP, whoever triggered the calls, so there's a per-client budget AND a
+# process-wide ceiling. Admins are exempt.
+OUTBOUND_BUDGET_PER_CLIENT = 4   # per minute
+OUTBOUND_BUDGET_GLOBAL = 20      # per minute, all visitors combined
+
+
+def _outbound_throttled(key: str) -> bool:
+    """True (and warns) when this visitor or the whole server is over budget."""
+    if web_auth.is_admin():
+        return False
+    from nba_model.web import throttle
+    if not throttle.client_rate_limit("__global__", key, OUTBOUND_BUDGET_GLOBAL, 60.0):
+        st.warning(
+            "The live model is busy right now (shared NBA-data budget reached). "
+            "Try again in a minute."
+        )
+        return True
+    if not throttle.rate_limit(key, max_calls=OUTBOUND_BUDGET_PER_CLIENT, window_seconds=60.0):
+        st.warning(
+            f"Live-model limit reached ({OUTBOUND_BUDGET_PER_CLIENT} runs / minute). "
+            "Wait a moment and try again."
+        )
+        return True
+    return False
+
+
+def _manual_lines_save_allowed() -> bool:
+    """Manual-lines DB writes are admin-only, independent of BILLING_ENABLED."""
+    return web_auth.is_admin()
+
+
 def _manual_lines_import_view(*, db_path: str) -> None:
     from datetime import datetime, timezone
     from nba_model.model.manual_lines import parse_manual_lines_text
@@ -2165,8 +2233,11 @@ def _manual_lines_import_view(*, db_path: str) -> None:
         "the records before any database write."
     )
 
-    is_admin = web_auth.is_admin()
-    if not is_admin and web_auth.BILLING_ENABLED:
+    # SECURITY: admin-only REGARDLESS of BILLING_ENABLED (same hard gate as
+    # Operations). Open-access mode treats every visitor as premium, but it
+    # must not let anonymous visitors write into the shared betting_lines.
+    can_save = _manual_lines_save_allowed()
+    if not can_save:
         st.warning(
             ":lock: Saving to the database is **admin-only** to protect the "
             "shared `betting_lines` table from poisoning. You can still paste "
@@ -2203,7 +2274,7 @@ def _manual_lines_import_view(*, db_path: str) -> None:
         parse_btn = c_parse.form_submit_button("Parse", use_container_width=True)
         save_btn = c_save.form_submit_button(
             "Save to DB",
-            disabled=(web_auth.BILLING_ENABLED and not is_admin),
+            disabled=not can_save,
             use_container_width=True,
         )
 
@@ -2217,7 +2288,7 @@ def _manual_lines_import_view(*, db_path: str) -> None:
             default_book=default_book,
         )
     except Exception as exc:  # noqa: BLE001
-        st.error(f"Parse failed: {exc}")
+        _public_error("Parse failed", exc)
         return
 
     # SECURITY: reject any record that fails the betting-line plausibility
@@ -2263,7 +2334,8 @@ def _manual_lines_import_view(*, db_path: str) -> None:
                 st.text(d)
 
     if save_btn:
-        if web_auth.BILLING_ENABLED and not is_admin:
+        # Re-check server-side: a disabled button is only a UI hint.
+        if not _manual_lines_save_allowed():
             st.error("Saving is admin-only.")
             return
         if not plausible_records:
@@ -2291,7 +2363,7 @@ def _manual_lines_import_view(*, db_path: str) -> None:
                 f"(total rows now {after})."
             )
         except Exception as exc:  # noqa: BLE001
-            st.error(f"Save failed: {exc}")
+            _public_error("Save failed", exc)
 
 
 _GLOBAL_CSS = """
@@ -2397,6 +2469,17 @@ def _inject_global_css() -> None:
     st.markdown(_GLOBAL_CSS, unsafe_allow_html=True)
 
 
+def _is_known_player(name: str) -> bool:
+    """True if ``name`` is a player in the (default) DB. Pins come from the
+    ``?player=`` URL param, so only real names may be persisted."""
+    try:
+        names = _cached_players(DEFAULT_DB_PATH, "")["player_name"].dropna()
+    except Exception:  # noqa: BLE001 — no DB -> nothing is pinnable
+        return False
+    key = str(name or "").strip().casefold()
+    return bool(key) and key in {str(n).strip().casefold() for n in names}
+
+
 def _render_top_status_row(user) -> None:
     """Right-side top-bar cluster: ETL freshness + watchlist + account popovers."""
     st.markdown("<div class='top-status'>", unsafe_allow_html=True)
@@ -2408,14 +2491,16 @@ def _render_top_status_row(user) -> None:
     with cols[2]:
         with st.popover(":bookmark: Pin", use_container_width=False):
             cur_player = _qp_get(_QP_PLAYER, "")
-            if cur_player:
+            if cur_player and not _is_known_player(cur_player):
+                st.caption("Select a player first.")
+            elif cur_player:
                 if st.button(
                     f"Pin {cur_player} to watchlist",
                     key="wl_add_current_top",
                     disabled=(cur_player in wl.get()),
                     use_container_width=True,
                 ):
-                    wl.add(cur_player)
+                    wl.add(cur_player, is_known=_is_known_player)
                     st.rerun()
             else:
                 st.caption("Select a player first.")
@@ -2484,7 +2569,7 @@ def main() -> None:
     try:
         teams = ["(any)"] + _cached_teams(db_path)
     except Exception as exc:  # noqa: BLE001
-        st.error(f"Could not read teams from {db_path}: {exc}")
+        _public_error("Could not read the teams list", exc)
         return
 
     # ---- Primary nav (View mode = top-level pills) ----
@@ -2600,7 +2685,7 @@ def main() -> None:
     try:
         players_df = _cached_players(db_path, team_val)
     except Exception as exc:  # noqa: BLE001
-        st.error(f"Could not list players: {exc}")
+        _public_error("Could not list players", exc)
         return
     if players_df.empty:
         st.warning("No players in DB for that filter.")
@@ -2680,8 +2765,7 @@ def main() -> None:
         return
 
     if not user.is_premium:
-        preview_set = set(web_auth.PREVIEW_PLAYERS)
-        names = [n for n in names if n in preview_set]
+        names = [n for n in names if web_auth.is_preview_player(n)]
         if not names:
             st.warning(
                 "Free preview is limited to: "
@@ -2862,7 +2946,7 @@ def main() -> None:
             n_games=int(n_games),
         )
     except Exception as exc:  # noqa: BLE001
-        st.error(f"Failed to load player data: {exc}")
+        _public_error("Failed to load player data", exc)
         return
 
     st.subheader(f"{resolved_name} — {stat_type}")
@@ -3012,7 +3096,7 @@ def main() -> None:
             ev_df = pc.fetch_model_vs_fitted_ev(db_path, data)
         except Exception as exc:  # noqa: BLE001
             ev_df = None
-            st.error(f"Failed to build model-vs-fitted EV: {exc}")
+            _public_error("Failed to build model-vs-fitted EV", exc)
         if ev_df is not None:
             st.plotly_chart(
                 plc.build_model_vs_fitted_ev_figure(ev_df, data.stat_type),
@@ -3033,7 +3117,7 @@ def main() -> None:
             )
         except Exception as exc:  # noqa: BLE001
             snapshots = None
-            st.error(f"Failed to load line snapshots: {exc}")
+            _public_error("Failed to load line snapshots", exc)
         if snapshots is not None:
             st.plotly_chart(
                 plc.build_line_movement_figure(
@@ -3058,7 +3142,7 @@ def main() -> None:
             )
         except Exception as exc:  # noqa: BLE001
             ribbon = None
-            st.error(f"Failed to build line-vs-actual: {exc}")
+            _public_error("Failed to build line-vs-actual", exc)
         if ribbon is not None:
             st.plotly_chart(
                 plc.build_line_vs_actual_ribbon_figure(ribbon, data.stat_type),
@@ -3072,7 +3156,7 @@ def main() -> None:
             )
         except Exception as exc:  # noqa: BLE001
             clv = None
-            st.error(f"Failed to build CLV proxy: {exc}")
+            _public_error("Failed to build CLV proxy", exc)
         if clv is not None:
             st.plotly_chart(
                 plc.build_clv_proxy_figure(clv, data.stat_type),

@@ -118,6 +118,7 @@ CREATE TABLE IF NOT EXISTS user_subscriptions (
     stripe_subscription_id TEXT,
     current_period_end     TEXT,
     last_event_type        TEXT,
+    last_event_created     INTEGER,
     updated_at             TEXT NOT NULL DEFAULT (datetime('now')),
     created_at             TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -144,6 +145,12 @@ def _migrate_sqlite(conn: sqlite3.Connection) -> None:
     cols = {r[1] for r in conn.execute(
         "PRAGMA table_info(user_subscriptions)"
     ).fetchall()}
+    if "last_event_created" not in cols:
+        # Stripe `event.created` of the newest applied event; used to drop
+        # out-of-order deliveries (Stripe does not guarantee ordering).
+        conn.execute(
+            "ALTER TABLE user_subscriptions ADD COLUMN last_event_created INTEGER"
+        )
     if "created_at" not in cols:
         conn.execute(
             "ALTER TABLE user_subscriptions ADD COLUMN created_at TEXT"
@@ -241,15 +248,16 @@ def _sqlite_upsert(
     path: str,
     *,
     email: str, tier: str, stripe_customer_id, stripe_subscription_id,
-    current_period_end, last_event_type, now: str,
+    current_period_end, last_event_type, now: str, last_event_created=None,
 ) -> None:
     with _connect_sqlite(path) as conn:
         conn.execute(
             """
             INSERT INTO user_subscriptions (
                 email, tier, stripe_customer_id, stripe_subscription_id,
-                current_period_end, last_event_type, updated_at, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                current_period_end, last_event_type, updated_at, created_at,
+                last_event_created
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(email) DO UPDATE SET
                 tier                   = excluded.tier,
                 stripe_customer_id     = COALESCE(excluded.stripe_customer_id,
@@ -260,12 +268,15 @@ def _sqlite_upsert(
                                                   user_subscriptions.current_period_end),
                 last_event_type        = COALESCE(excluded.last_event_type,
                                                   user_subscriptions.last_event_type),
+                last_event_created     = COALESCE(excluded.last_event_created,
+                                                  user_subscriptions.last_event_created),
                 updated_at             = excluded.updated_at
                 -- created_at is intentionally NOT refreshed: it marks the
                 -- first sign-in time and anchors the trial window.
             """,
             (email, tier, stripe_customer_id, stripe_subscription_id,
-             current_period_end, last_event_type, now, now),
+             current_period_end, last_event_type, now, now,
+             last_event_created),
         )
 
 
@@ -322,6 +333,7 @@ CREATE TABLE IF NOT EXISTS user_subscriptions (
     stripe_subscription_id TEXT,
     current_period_end     TEXT,
     last_event_type        TEXT,
+    last_event_created     BIGINT,
     updated_at             TEXT NOT NULL DEFAULT (now()::text),
     created_at             TEXT NOT NULL DEFAULT (now()::text)
 );
@@ -340,6 +352,8 @@ CREATE TABLE IF NOT EXISTS stripe_events (
 _POSTGRES_MIGRATIONS = (
     "ALTER TABLE user_subscriptions "
     "ADD COLUMN IF NOT EXISTS created_at TEXT NOT NULL DEFAULT (now()::text)",
+    "ALTER TABLE user_subscriptions "
+    "ADD COLUMN IF NOT EXISTS last_event_created BIGINT",
 )
 
 # Postgres analog to SQLite's busy_timeout/synchronous tuning:
@@ -413,15 +427,16 @@ def _pg_upsert(
     dsn: str,
     *,
     email: str, tier: str, stripe_customer_id, stripe_subscription_id,
-    current_period_end, last_event_type, now: str,
+    current_period_end, last_event_type, now: str, last_event_created=None,
 ) -> None:
     with _connect_postgres(dsn) as conn, conn.cursor() as cur:
         cur.execute(
             """
             INSERT INTO user_subscriptions (
                 email, tier, stripe_customer_id, stripe_subscription_id,
-                current_period_end, last_event_type, updated_at, created_at
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                current_period_end, last_event_type, updated_at, created_at,
+                last_event_created
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (email) DO UPDATE SET
                 tier                   = EXCLUDED.tier,
                 stripe_customer_id     = COALESCE(EXCLUDED.stripe_customer_id,
@@ -432,11 +447,14 @@ def _pg_upsert(
                                                   user_subscriptions.current_period_end),
                 last_event_type        = COALESCE(EXCLUDED.last_event_type,
                                                   user_subscriptions.last_event_type),
+                last_event_created     = COALESCE(EXCLUDED.last_event_created,
+                                                  user_subscriptions.last_event_created),
                 updated_at             = EXCLUDED.updated_at
                 -- created_at intentionally NOT refreshed; anchors trial start.
             """,
             (email, tier, stripe_customer_id, stripe_subscription_id,
-             current_period_end, last_event_type, now, now),
+             current_period_end, last_event_type, now, now,
+             last_event_created),
         )
 
 
@@ -472,7 +490,8 @@ def _pg_lookup(dsn: str, normalized_email: str) -> Optional[dict]:
     with _connect_postgres(dsn) as conn, conn.cursor() as cur:
         cur.execute(
             "SELECT email, tier, stripe_customer_id, stripe_subscription_id, "
-            "current_period_end, last_event_type, updated_at, created_at "
+            "current_period_end, last_event_type, last_event_created, "
+            "updated_at, created_at "
             "FROM user_subscriptions WHERE email = %s",
             (normalized_email,),
         )
@@ -531,9 +550,14 @@ def upsert(
     stripe_subscription_id: Optional[str] = None,
     current_period_end: Optional[str] = None,
     last_event_type: Optional[str] = None,
+    last_event_created: Optional[int] = None,
     db_path: Optional[str] = None,
 ) -> None:
-    """Insert or update the subscription record for an email."""
+    """Insert or update the subscription record for an email.
+
+    ``last_event_created`` is the Stripe ``event.created`` (unix seconds) of
+    the event being applied; the webhook compares it to drop stale events.
+    """
     if tier not in {"free", "premium"}:
         raise ValueError(f"tier must be 'free' or 'premium', got {tier!r}")
     normalized_email = _validate_email(email)
@@ -551,6 +575,9 @@ def upsert(
         current_period_end=current_period_end,
         last_event_type=last_event_type,
         now=now,
+        last_event_created=(
+            int(last_event_created) if last_event_created is not None else None
+        ),
     )
 
 
@@ -590,6 +617,27 @@ def record_stripe_event(
     if backend == "postgres":
         return _pg_record_event(target, event_id, event_type, payload)
     return _sqlite_record_event(target, event_id, event_type, payload)
+
+
+def _sqlite_forget_event(path: str, event_id: str) -> None:
+    with _connect_sqlite(path) as conn:
+        conn.execute("DELETE FROM stripe_events WHERE event_id = ?", (event_id,))
+
+
+def _pg_forget_event(dsn: str, event_id: str) -> None:
+    with _connect_postgres(dsn) as conn, conn.cursor() as cur:
+        cur.execute("DELETE FROM stripe_events WHERE event_id = %s", (event_id,))
+
+
+def forget_stripe_event(event_id: str, db_path: Optional[str] = None) -> None:
+    """Un-record an event whose processing FAILED, so Stripe's retry is
+    applied instead of being dropped as a duplicate."""
+    backend = _selected_backend(db_path)
+    target = _resolved_target(db_path)
+    if backend == "postgres":
+        _pg_forget_event(target, event_id)
+    else:
+        _sqlite_forget_event(target, event_id)
 
 
 def lookup(email: str, db_path: Optional[str] = None) -> Optional[dict]:

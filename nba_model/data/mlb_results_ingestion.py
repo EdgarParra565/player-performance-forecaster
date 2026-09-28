@@ -232,7 +232,9 @@ def ingest_date_range(
     schedule = transform_schedule(fetch_schedule(start_date, end_date))
     all_rows: list[dict] = []
     for game in schedule:
-        if game.get("status") and game["status"] not in ("Final", "Live"):
+        # Final games only: insert_mlb_game_logs is INSERT OR IGNORE, so a
+        # mid-game ("Live") box score would freeze partial stats forever.
+        if game.get("status") != "Final":
             continue
         try:
             box = fetch_boxscore(game["game_pk"])

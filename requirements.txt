@@ -30,4 +30,5 @@ fastapi~=0.136
 uvicorn[standard]~=0.46
 authlib~=1.7
 httpx~=0.28              # only used by the webhook test suite (TestClient)
+boto3~=1.43              # flagship DB delivery via S3-compatible storage (api/db_sync.py)
 plotly~=6.7              # interactive distribution charts in the Streamlit app

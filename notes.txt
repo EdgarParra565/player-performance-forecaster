@@ -1,33 +1,42 @@
 # NBA Player Performance Forecaster - Working Notes
 
-Last updated: 2026-08-05
+Last updated: 2026-09-28
 
 Active tracker only: architecture, what's done, what's next. CLI runbooks,
 deployment, and security live in **README.md** and **docs/** — not duplicated here.
 
-Test baseline: **707 passing** (`.venv/bin/python3 -m pytest nba_model/tests -q`;
-Windows: `.venv\Scripts\python.exe -m pytest nba_model/tests -q`), plus **23 API
-tests** (`.venv/bin/python3 -m pytest api/tests -q`) and **14 frontend tests**
+Test baseline (2026-09-28, end of day): **891 passing** in nba_model/tests
+(`.venv/bin/python3 -m pytest nba_model/tests -q`; Windows:
+`.venv\Scripts\python.exe -m pytest nba_model/tests -q`; note `test_daily_etl.py`
+needs real network to stats.nba.com), **99 API tests**
+(`.venv/bin/python3 -m pytest api/tests -q`), and **99 frontend tests + clean tsc**
 (`cd frontend && npm run test`).
 
 ---
 
 ## Near-term objectives (NBA)
 
-1. **In-season data loop** — Mac Chrome `:9222` → hourly ETL → `publish_db.sh` → cloud app.
-   Hourly ETL now: web-text fetch → prop/team-line parsers → **VegasInsider ingestion
-   (fresh grid → `betting_lines`)** → nba_api refresh → priors → settle → report.
-   This is the gating item: WS10 validation and TRUE-arb detection are data-starved without it.
+1. **In-season data loop — LIVE (2026-09-28).** Autopilot running unattended on the
+   Mac: launchd-managed scraping Chrome (`:9222`, dedicated profile, KeepAlive) +
+   hourly ETL at :05 by the clock (+ keep-awake on AC) + session-health alerts
+   (macOS notifications; one alert per new login-needed). First unattended run
+   verified. Remaining slice: `publish_db.sh --to-object-store` → Fly/Tigris cloud
+   app, blocked only on the owner creating the Fly.io account (DEPLOYMENT.md §16).
 2. **Run WS10 validation** — market-line backtests, 4–8 week paper trade
    (`bet_slip` → `bet_log` → `calibration_report`), CLV review. Tooling is built;
-   only live data is missing. **Do not bet real money until this passes.**
-3. **More scrapers** — 10 of 20 books produce parsed rows (VegasInsider now feeds real
-   11-book odds into `betting_lines`). theScore/DraftKings/Fliff fetch paths are fixed but
-   NBA-offseason-empty — their extractors are the first preseason task. Remaining blocks
-   are external (mobile-only / paywalled / 21+), not code. See scraper follow-ups below.
-4. **Flagship UI** — Phases 1 + 2 shipped (5 views incl. Cross-book, Team Charts,
-   line-movement replay). Phase 3 (deploy/auth/WS10 surfaces) is the remaining slice —
-   see "New UI (flagship)" section at the bottom.
+   opening-week team lines are landing; player props start posting in October.
+   **Do not bet real money until this passes.**
+3. **More scrapers** — Caesars, Bovada, and FanDuel NBA promoted LIVE 2026-09-28
+   (opening-week team lines parsed hourly). theScore (futures-only), DK NBA
+   (nav shell from CA), VI NBA grid, and the DFS prop boards stay MECH until NBA
+   player props post (~Oct). Remaining blocks are external: geo-CA (BetMGM,
+   Underdog pick'em, possibly Pick6), age-21+ (BetRivers, HardRock), app-only /
+   paywalled. See blockers table + `data/config/blocked_books.txt`.
+4. **Flagship UI** — Phases 1–3 shipped: 8 views (incl. Parlay builder, Paper
+   Trades, Watchlist), redesigned design system, mobile pass, per-IP rate
+   limiting, optional access code, Docker verified (smoke 18/18 in-container).
+   DEPLOY-READY on Fly.io + Tigris — awaiting the owner's account login
+   (commands in DEPLOYMENT.md §16). See "New UI (flagship)" below.
 5. **Multi-sport** — MLB data layer is beta (off NBA consensus path). NFL scaffold parked.
    NBA deploy does not require shipping MLB/NFL web views.
 
@@ -129,6 +138,91 @@ save; web = Plotly, Tk = matplotlib; do not delete `sports/` scaffolding.
   (`sportsbook.thescore.bet`, old ENV/cert blocker cleared). Working URLs added to
   `web_text_urls.txt`. Blocked-with-proof: Fanatics/Sleeper/Dabble (app-only),
   BettingPros (paywalled), HardRock (21+), OddsShark (projections, not odds).
+- **Scraping autopilot (2026-09-28)** — goal: hourly loop runs indefinitely,
+  the only manual act is an occasional book re-login prompted by an alert.
+  Runbook: `scripts/scheduler/README.md` (+ README "Operational Runbook").
+  (a) `scripts/scheduler/scraping_chrome.sh` + `com.nba.scraping-chrome.plist`
+  (KeepAlive, ThrottleInterval 30, Aqua session): execs Chrome with
+  `--remote-debugging-port=9222` and a dedicated persistent profile
+  (`~/Library/Application Support/nba-scraping-chrome`; refuses the daily
+  profile path; waits instead of double-launching if :9222 is already served).
+  (b) `nba_model/data/session_health.py` + hourly `session_health` step: per-book
+  ok / login-needed / unreachable from the fresh captures via
+  `detect_login_wall`; top-level `report["session_health"]`; debounced alert
+  (state file `nba_model/data/artifacts/hourly/session_health_state.json`,
+  one alert per login episode, re-armed on `ok`, failed delivery retries).
+  Channels: `NBA_ALERT_WEBHOOK_URL` (new env default for `--alert-webhook-url`) +
+  macOS notification (`--no-macos-notify`). The step never fails the run.
+  (c) Tab hygiene: `close_target_tabs_via_cdp` (DevTools `/json/list` +
+  `/json/close`) closes every tab whose HOST matches a target — shared predicate
+  `_tab_matches_target` with the reuse loop — default ON in hourly
+  (`--no-close-stale-tabs`). (d) No logins / credentials / captcha handling.
+  Also: `hourly_update.sh` curl gate is warning-only and forwards
+  `--chrome-port/--chrome-host`. All verified with mocks / fake Chrome binary
+  (`tests/test_scraping_autopilot.py`, 30 tests).
+  **LIVE 2026-09-28** — all three LaunchAgents loaded on this Mac:
+  `com.nba.scraping-chrome` (Chrome 154, dedicated profile, KeepAlive relaunch
+  after kill ≈14s), `com.nba.hourly` (now `StartCalendarInterval` minute :05 —
+  `StartInterval` counts awake time only and never fired on the idle-sleeping
+  Mac), `com.nba.keep-awake` (`caffeinate -s`: no system sleep on AC; display
+  still sleeps; `launchctl bootout gui/$(id -u)/com.nba.keep-awake` to undo).
+  No `NBA_ALERT_WEBHOOK_URL` configured → alerts are macOS notifications (verified
+  delivered). Login pass: `scripts/scheduler/login_setup.sh` (+
+  `nba_model/data/login_setup.py`, 10 tests) opens one tab per auth book,
+  reads tab text passively, prints a 30s checklist, verifies in fresh tabs,
+  holds the hourly lock meanwhile. Non-auth blocks live in
+  `data/config/blocked_books.txt` (betmgm/underdog geo, betrivers/hardrockbet
+  age) → `blocked`, no alerts, no prompts. Owner status after the pass:
+  PrizePicks / ParlayPlay signed in + ok; Pick6 signed in but logged out again by
+  19:11Z (re-login pending); Underdog signed in but geo-blocked. First
+  scheduled unattended fire: 20:05:13Z → report `hourly_update_20260928_201000.json`
+  (exit 0, no alert). Verification details: "Parser verification matrix — LIVE
+  ACTIVATION PASS" below.
+- **Code review (2026-09-25)** — data/model half (api/, frontend/, web/ reviewed
+  separately). Full list in **review_findings_data.md**: 65 findings (4 critical,
+  33 major, 28 minor). Fixed 4 critical + 18 major, each with a regression test
+  (tests 742 → 778); 15 major PROPOSED (judgment calls), minors recorded only.
+  **2026-09-28 follow-up:** 6 more majors FIXED (team-priors keys + freshness,
+  `last_seen_at_utc`, betting_lines latest-row dedupe + book casing, alt-line
+  main-line tagging, CDP tab reuse via hygiene, hourly wrapper curl gate); 9
+  PROPOSED remain. **Live-DB cleanup DONE** (see "Live-DB cleanup" below).
+  Critical: the suite wrote into the LIVE DB (a module-level test script
+  inserted a fabricated LeBron game log `0022400001`; every `odds_poll_runs` row
+  is test mock data, and those rows feed the 24h odds-freshness guard). Now blocked by
+  `tests/conftest.py`. Live-DB cleanup done 2026-09-28. Other fixes:
+  hourly steps that RETURN `status='failed'` now fail the run and alert; the bulk
+  ingest no longer hides all-season failures; defense-adjustment sign; binomial
+  fit collapse; push mass on integer lines for discrete distributions; CLV only
+  at the pick's line; pushes excluded from backtest win rate and significance; the
+  significance flag is one-sided; |odds|<100 can't fake an arb; the `since_hours`
+  'T'-vs-space timestamp bug (9 sites); monthly diagnostics join; failed polls
+  no longer satisfy the freshness guard; current-season loader and `db_path`; Odds
+  API key redaction; MLB Final-only ingest; `mlb_prop_lines` key includes
+  game_date; VI grids: rejected headers no longer bleed, 3–5 digit odds only,
+  mid-row cutoff guard, linear label regex. Top PROPOSED items still open:
+  - UTC-vs-ET slate `game_date`
+  - `bet_log` / `predictions` dedupe
+  - `betting_lines` change-only rows vs `scraped_at` since-windows (new 2026-09-28)
+  (team priors, `last_seen_at_utc`, alt-line ladders, CDP tab reuse: FIXED 2026-09-28)
+
+- **Live-DB cleanup (2026-09-28, owner-approved)** — backup
+  `data/database/backups/nba_data_pre_cleanup_20260928T172053Z.db` (cp; sha256
+  identical, integrity ok), then one transaction: deleted the fabricated LeBron
+  game log (`game_id 0022400001`, player 2544; game_logs 91,735 → 91,734, his
+  real 2024-10-22 game `0022400062` kept) and all 600 test-mock `odds_poll_runs`
+  rows (600 → 0). Integrity ok after. The cloud copy keeps both rows until the
+  next `publish_db`. The new additive migrations (`last_seen_at_utc`,
+  `betting_lines.is_main_line` + ladder backfill, team_priors re-key) have NOT
+  run on the live file yet — they apply on the next DatabaseManager open (tested
+  on a copy: 0.05s; 337/337 ladders get exactly one main line; the 4 May priors
+  re-key to NYK/PHI, DET/CLE, OKC/LAL, SAS/MIN and are ignored as stale).
+- **Handoff to web/api agent (2026-09-28)** — schema additions readers can use:
+  `web_prop_cards/web_team_lines.last_seen_at_utc` (freshness = 
+  `COALESCE(last_seen_at_utc, observed_at_utc)`; `api/services.py:100` still uses
+  observed_at), `betting_lines.is_main_line` (filter
+  `COALESCE(is_main_line,1)=1` for "the" line; same rule as `api._main_line`,
+  now in `nba_model.model.odds.main_line_index`). Stored book names were NOT
+  rewritten (api tests assert "FanDuel").
 
 ---
 
@@ -146,7 +240,23 @@ save; web = Plotly, Tk = matplotlib; do not delete `sports/` scaffolding.
 
 ### Smaller follow-ups
 
-- [ ] MLB per-game player-props parser + park factors.
+- [~] MLB player-props parser + park factors (2026-09-25). **VegasInsider MLB
+      props: DONE** — `vegasinsider.extract_mlb_odds_rows` (authored on the REAL
+      2026-07-22 capture, snapshot 155) → `data/vegasinsider_mlb_props_ingestion.py`
+      → NEW sport-isolated table `mlb_prop_lines` (real odds, `source='vegasinsider'`,
+      registry-validated stat/line/odds, `stat_group` hitting/pitching/combined,
+      `market_shape` over_under/yes_no, change-only on line+price). Wired into
+      hourly + daily ETL (`vegasinsider_mlb_props_ingestion`, after the NBA VI
+      step). Live DB: 297 rows / 10 books / 38 players from snapshot 155 (K 81,
+      anytime-HR 55, TB 161, RBI 0); re-ingest 0-inserted. **Still open:** FanDuel/DK
+      per-game MLB prop pages — never captured (no stored snapshot; CDP down
+      2026-09-25), so `mlb_props.preprocess_mlb_props` stays fixture-only/unwired.
+      Park factors: `data/mlb_park_factors.py` exists (unvalidated TODO; `OAK`
+      key predates the Athletics' Sacramento move — MLB feeds may say `ATH`).
+      *Why not betting_lines/web_prop_cards:* `betting_lines.player_id` is an NBA
+      FK and its NBA readers (cross_book_arb, prop_board, line_comparison, ...)
+      never filter `sport`; `web_prop_cards` feeds api/ book+freshness counts —
+      either would leak MLB into NBA views.
 - [x] Migrate the scraper/fetch path (`web_text_ingestion`, browser/team-line
       parsers) to `logging_utils` (2026-08-05): all three now use
       `get_logger` + call `configure_logging(file_prefix=...)` in their CLI
@@ -201,44 +311,101 @@ Next steps (in order):
       without aborting the run). Counts (parsed/resolved/inserted/duplicate) land
       in the report under the step's `result`. Tests: stored-snapshot ingest +
       empty-grid + wiring/report-contract (test_vegasinsider_odds, +5).
-- [ ] **Preseason capture sprint (~Oct)** — re-fetch and author the deferred
+- [ ] **Preseason capture sprint (~Oct)** — *2026-09-25 attempt: BLOCKED — no
+      Chrome listening on `:9222` (curl exit 7, no `--remote-debugging-port`
+      process), so no fresh capture of theScore / DK-NBA / FD-NBA / VI-NBA / DFS
+      boards; all verdicts unchanged. Re-run once the debug Chrome is up (close
+      leftover book tabs first).* Scope: re-fetch and author the deferred
       extractors against real NBA content: theScore `team_line_extractor`,
       DraftKings NBA validation (scroll path), Fliff `prop_preprocess` (PP-style
       More/Less), VI grid re-validation; re-check the DFS boards
       (PrizePicks/Underdog/Pick6/ParlayPlay) per the SEASON blocker row.
-- [ ] **BetRivers re-login** (`:9222` Chrome) — still the one AUTH blocker; parser
-      already exists, needs a live-capture validation.
-- [ ] **VegasInsider MLB player-props page** (optional, in-season MLB value now) —
-      VI publishes a 60KB MLB props page, but the NBA over-cell grid parser reads
-      0 rows there (different layout). Would need its own extractor; only worth it
-      if MLB market lines become a priority before October.
+- [x] **BetRivers** — reclassified 2026-09-28 from AUTH to **age-blocked**
+      (21+; owner cannot hold an account). Parser + fixtures kept. See
+      `data/config/blocked_books.txt`.
+- [x] **VegasInsider MLB player-props page** (2026-09-25) — own extractor
+      (per-section book headers, bare yes-price + `0` cells, full-row-only
+      attribution, BetMGM excluded as self-inconsistent) → `mlb_prop_lines`. See
+      "Smaller follow-ups". VI SCRAPER now sets `max_text_chars=250_000` (new
+      raise-only `BookScraper.max_text_chars`) so the page isn't cut at 60K
+      mid-RBI. URL added to `data/config/web_text_urls.txt` (2026-09-28) so
+      hourly fetch refreshes it. MLB regular season ended ~2026-09-27;
+      postseason boards may still post.
 - [ ] **App-only books (Fanatics/Sleeper/Dabble) + HardRock (21+)** — unscrapeable on
       web. If their odds matter, the path is The Odds API bookmaker keys (see README
       "smaller or alternate books"), not scraping. Revisit HardRock later.
 
 ---
 
-## Scraper / season blockers (2026-07-22 snapshot)
+## Scraper / season blockers (2026-07-22 snapshot; live re-check 2026-09-28 from California)
 
 Re-run fetch→parse when blocker clears. NBA **offseason** = empty lobbies, not parser bugs.
 
 | Blocker | Books / action |
 |---------|----------------|
-| **AUTH** | BetRivers NBA — re-login in `:9222` Chrome; validate parser on live capture. |
+| ~~**AUTH** BetRivers~~ → **AGE-BLOCKED (2026-09-28, permanent)** | BetRivers sportsbook requires 21+ and the owner can't hold an account, so it is NOT a re-login task. Listed in `data/config/blocked_books.txt` (reported `blocked`, never alerted, never prompted by `login_setup.sh`). Not in `web_text_urls.txt`. Parser + fixtures kept as-is for the future. Live 2026-09-28: `ny.betrivers.com` lobby renders logged-out, then shows the login nav (1/4 content markers). |
+| **AGE-BLOCKED (21+)** | BetRivers (above), HardRockBet (account requires 21+). Both in `blocked_books.txt`. |
+| **GEO-BLOCKED (2026-09-28, owner in California)** | **BetMGM** — `sports.betmgm.com` redirects to the `nj.betmgm.com` geolocator ("Where are you playing from?"); BetMGM has no CA sportsbook, so the NJ/MA check never passes from here. New `where are you playing from?` wall phrase (parsers skip the picker). **Underdog** — signed in, but `app.underdogsports.com` shows "Pick'em is not available in your location" (after a "Trying to load your location…" interstitial; both are wall phrases now). Both in `blocked_books.txt`: reported `blocked`, no hourly alerts. Revisit if the owner's location changes (delete the line). Likely also why **DraftKings NBA** renders only its nav shell (no NBA grid) — recorded, not blocked (public page, no alert). |
 | ~~**ENV** ESPNBet~~ **CLEARED (2026-07-21)** | Rebranded **theScore Bet** (`sportsbook.thescore.bet`; `espnbet.com` kept as alias, book name stays `espnbet`). Loads cleanly over CDP — no cert/ENV error. NBA offseason renders FUTURES only (no game lines); team_line_extractor awaits in-season game capture. |
 | ~~**RENDER** DraftKings~~ **MLB LIVE-VERIFIED (2026-07-22)** | DK migrated its lobby grid to `event-cell` nodes — stale `sportsbook-outcome` selectors matched nothing so the fetcher skipped its content wait (nav-shell-only captures). Fixed: `event-cell` wait selector + `body.innerText` `js_extractor` (generic HTML-parse drops DK's virtualized grid). DK **MLB team lines now land 84 rows / 11 games** into `web_team_lines` (sport='mlb') via a new DK-order block regex (`extract_team_lines_dk`). DK NBA board is offseason-empty (futures only); its NBA extractor still awaits an in-season capture but its fetch is now robust (24.9KB fresh capture). |
 | **IFRAME** Fliff | Fetch path iframe-aware (`scrapers/fliff.py:extract_iframe_text`); domain `getfliff.com` (+`fliff.com` alias). Re-verified 2026-07-22: live capture = 3.3KB real board with a full **MLB/WNBA/MLS slate** — but the `channelId=-333` board shows **game moneylines**, not PP-style More/Less **player** props, so `prop_preprocess` still cannot be authored against real content. MECH-VERIFIED fetch only; parser deferred until a More/Less player board renders. |
 | **MOBILE-ONLY** Fanatics | betfanatics.com/sportsbook is marketing-only on the web (Download-App / promo banners, 0 line tokens) — real board is app-gated. Live-probed 2026-07-21. Blocked-with-proof; stub kept. |
 | **GATED/THIN** BettingPros | `/nba/odds/` + `/nba/odds/player-props/` render nav + a Premium/"Upgrade" wall; the grid is JS/subscription-gated and server-side-thin (2.5KB, stale cached date). Blocked-with-proof; stub kept. |
 | **PROJECTIONS** OddsShark | `/nba/computer-picks` is model predictions (computer picks / predicted scores), not real book line/odds — out of scope for `betting_lines`/`web_*`. Stub kept, documented. |
-| **MOBILE-ONLY (target-7)** | Sleeper (picks are app-only, not on web), Dabble (app-only), HardRockBet (account requires 21+). Marked blocked; stub configs kept. Revisit HardRockBet later. |
-| **Parser TODO** | MLB player props (per-game pages); MLB team-line live pairing edge case; park factors. |
+| **MOBILE-ONLY (target-7)** | Sleeper (picks are app-only, not on web), Dabble (app-only). Marked blocked; stub configs kept. (HardRockBet moved to AGE-BLOCKED.) |
+| ~~**ENV (2026-09-25)**~~ **CLEARED (2026-09-28)** | Scraping Chrome now kept alive by the `com.nba.scraping-chrome` LaunchAgent (dedicated profile; KeepAlive relaunch verified in ~14s); `com.nba.hourly` loaded; DFS logins done via `login_setup.sh` (PrizePicks, Pick6, ParlayPlay signed in; Underdog signed in but geo-blocked). |
+| **Parser TODO** | MLB per-game FD/DK player-prop pages (need a real capture); MLB team-line live pairing edge case; park-factor validation. VI MLB props **DONE (2026-09-25)** → `mlb_prop_lines`. |
 | **DONE (2026-07-21)** | **VegasInsider** — cross-book odds grid parser (`scrapers/vegasinsider.py:extract_odds_rows`) + `data/vegasinsider_odds_ingestion.py` → **real 11-book American odds into `betting_lines`** (`source='vegasinsider'`, over-only). 462 rows landed from the stored 2026-05-08 snapshot. First real-odds feed for `--use-market-lines` / cross-book line shopping. |
 
-10 of 20 scrapers still stub-only (VegasInsider parses real odds; DK MLB team
-lines now LIVE; theScore/Fliff/DK-NBA fetch paths fixed but NBA-offseason-empty).
+10 of 20 scrapers still stub-only. NBA team lines LIVE as of 2026-09-28: Caesars,
+Bovada, FanDuel (see matrix). theScore = futures only; DK-NBA = nav shell only
+from CA; DFS/VI NBA player-prop boards not posted yet.
 
 ---
+
+## Parser verification matrix — LIVE ACTIVATION PASS (2026-09-28, host in California)
+
+First real run of the autopilot: scraping Chrome + hourly LaunchAgents loaded,
+owner login pass done via `login_setup.sh`. **LIVE** = today's fresh CDP fetch
+parsed >0 rows into the live DB. Opening week (Oct 20–22) NBA game lines are
+posted; NBA player props are NOT posted anywhere yet.
+
+| Book (sport) | Verdict 2026-09-28 | Fresh fetch (chars / session) | Parse → live DB | Fixed this pass |
+|---|---|---|---|---|
+| caesars (nba) | **LIVE** (was MECH) | 8,674 / public lobby, 5 games | 30 rows / 5 games → `web_team_lines`; re-parse 0 inserted / 30 unchanged | — (parser was right; the hourly selection bug had kept it from ever running) |
+| bovada (nba) | **LIVE** (was MECH) | 9,393 / public, 17 games | 102 rows / 17 games; re-parse 0 / 102 unchanged | **YES** — new odds-first 2026 layout regex (`EVEN` = +100); legacy layout kept |
+| fanduel (nba) | **LIVE** (was MECH, fixture-only) | 11,120 / logged-out, 10 games | 60 rows / 10 games (19:13Z RunAtLoad hourly run); 20:05Z scheduled run re-saw all 60 unchanged | **YES** — full-name 2026 layout regex (ML between spread and total); URL added to `web_text_urls.txt` |
+| espnbet/theScore | MECH | 17,909 / loads clean, futures only | 0 (no game lines posted) | — |
+| draftkings (nba) | MECH | 21,803 / nav shell only, no NBA grid (DK Sportsbook not offered in CA — likely geo) | 0 | — |
+| vegasinsider (nba grid) | MECH | 15,469 / page loads, 0 "Odds Time" sections (props not posted) | 0 | — |
+| prizepicks | MECH (signed in) | 4,632 / board public, shows NFL — NBA board not posted | 0 NBA cards | — |
+| pick6 | MECH — **login-needed at 19:13Z** | 714 / "Log In To Submit" + "Something went wrong" (signed in at ~17:45Z, ok at 18:02Z, logged out by 19:11Z) | 0 | — (re-login: `login_setup.sh --books pick6`; may be a CA restriction) |
+| parlayplay | MECH (signed in) | 2,487 / no NBA board | 0 | — |
+| kalshi | MECH | 1,133–4,428 / render flaky (nav shell on 2 of 3 runs) | 0 new | now reports `unreachable`, not login-needed |
+| fliff | MECH (fetch only) | 336 / no player board | 0 | — |
+| underdog | **BLOCKED (GEO)** | 6,588 / signed in, "Pick'em is not available in your location" | skipped (wall) | URLs moved to `app.underdogsports.com` (old host 404s); geo phrases added |
+| betmgm | **BLOCKED (GEO)** | 1,357 / NJ geolocator "Where are you playing from?" | skipped (wall) | location-gate phrase added |
+| betrivers | **BLOCKED (AGE, permanent)** | not fetched hourly | parser + fixtures kept | removed from login prompts |
+
+Hourly passes: 17:30Z (pre-login baseline) · 18:02Z (kickstart) · 19:13Z (RunAtLoad
+after reload) — all exit 0, 16–17/16–17 fetched, 0 failed, tab hygiene ran
+(5 leftover tabs closed at 18:02Z), dedupe held (re-seen lines skipped, not
+re-inserted). 19:13Z: `reverse_engineering` produced the **first real team priors
+(12 games)** from the Caesars + Bovada + FanDuel consensus. **20:05Z — first
+scheduled, unattended fire** (`StartCalendarInterval`): exit 0, 17/17 fetched,
+alert marker ok (none sent), Pick6 still login-needed but NOT re-alerted
+(debounce), 192 team lines re-seen → 0 inserted and 192 `last_seen_at_utc`
+bumps (the change-only freshness fix confirmed on live data), 12 priors
+re-derived. Live DB over the session: snapshots 200 → 250, web_team_lines
+974 → 1,166 (+192 real opening-week rows), 16 team_priors (12 fresh).
+
+Live-only bugs found + fixed this pass (each with a test): hourly parsers read
+snapshots sorted by URL and capped at 20 (every alphabetically-late URL —
+sportsbook.*, www.bovada, www.vegasinsider — was NEVER parsed hourly); HTTP 404
+pages read as `ok`; BetMGM/Underdog geo gates read as content; generic-nav rule
+raised false re-login alerts for public books (Kalshi); zero-extraction parser
+runs raised "ETL partial" every hour; `StartInterval` never fired on the
+idle-sleeping Mac (switched to `StartCalendarInterval` :05 + keep-awake agent).
 
 ## Parser verification matrix (2026-07-22)
 
@@ -267,12 +434,18 @@ best stored snapshot/fixture (only live NBA content missing);
 | fanduel (nba) | **MECH** | 5,913 / futures only (2027 champ odds), 0 games | 6 rows from committed fixture | fixture-only (TODO real-capture stands) | — |
 | espnbet/theScore | **MECH** | 13,879 / loads clean, futures only, 0 games | 6 rows from committed fixture | fixture-only (TODO real-capture stands) | — |
 | betrivers | **BLOCKED (AUTH)** | 4,346 / **login-wall correctly detected** (1/4 markers) | 6 rows from committed fixture | login-walled — not counted as fetch proof | — (classification verified) |
+| vegasinsider (mlb props) | **MECH** (new 2026-09-25) | no fresh fetch (CDP down); best stored = sid 155, 2026-07-22, 60,000 chars (cap-truncated mid-RBI) | 297 rows (K 9×9, HR 11×5, TB 23×7, RBI 0/105 full rows) | +297 → `mlb_prop_lines` sport='mlb' (0→297); re-ingest +0; `betting_lines`/`web_prop_cards` unchanged | **YES** — new extractor + table + ingest + ETL wiring |
 | fliff | **MECH (fetch only)** | 3,310 / real board, live MLB/WNBA/MLS slate (moneylines, no More/Less props) | n/a — no player-prop content to author `prop_preprocess` against | — | — |
 
 Full hourly-style pass (all 16 `web_text_urls.txt` URLs): **16/16 fetched, 0
 failed**; both parsers ran clean, 4 login-walled snapshots skipped, 0 new inserts
 (offseason ⇒ no line movement, change-only dedupe working). Loop verified
 unattended.
+
+2026-09-25 re-check: NO fresh fetch possible (debug Chrome `:9222` down) — every
+row above keeps its 2026-07-22 verdict; nothing promoted to LIVE. VI under-odds
+check on stored pages: 0 `u<line>` cells on the NBA grid (sid 103) and the MLB
+props page (sid 155) — VI remains over-only, TRUE-arb still needs another source.
 
 Follow-ups surfaced (unchanged scope, recorded only): VegasInsider publishes an
 MLB player-props page (60KB, has MLB markets) but the NBA over-cell grid parser
@@ -323,11 +496,25 @@ real-data benchmarks used rolling mean as the line (model vs itself) — not boo
   `players.team` sparse, so team membership uses the `matchup` fallback.
 - Scraping host = dev Mac; dev box may be Windows (`DataLoader` sqlite leak on temp DB
   teardown — scanner `full` mode is DB-direct and unaffected).
-- **CDP tab hygiene** — the fetcher REUSES an existing Chrome tab already open on a
-  target URL, and existing-tab reuse skips navigation + content waits. Stale tabs
+- **CDP tab hygiene** — the fetcher REUSES an existing Chrome tab already open on the
+  target's DOMAIN (not the exact URL — see review_findings_data.md), and existing-tab reuse skips navigation + content waits. Stale tabs
   left open in the `:9222` Chrome therefore produce silently-stale captures (this
   masked the DK grid regression until 9 leftover tabs were closed on 2026-07-22).
-  Before an ETL/verification run, close leftover book tabs in the debug Chrome.
+  **2026-09-28: automated** — the hourly runner closes every open tab on a target
+  host before fetching (default ON; manual CLI: `--close-stale-tabs`). Only a tab
+  opened by hand DURING a run can still be reused.
+- **VI MLB partial rows** — visible-text flattening drops EMPTY VI cells, so most
+  MLB rows have fewer cells than the section's book header and cannot be
+  attributed positionally; they are dropped, never guessed (RBI = 0 rows; HR
+  11/409 full). Real fix: a VI `js_extractor` that emits a placeholder per empty
+  `<td>` — author against a live DOM on the next capture. BetMGM is excluded from
+  VI MLB rows (its cells are self-inconsistent with every other book: TB alt
+  lines, HR ~1.5x consensus). PrizePicks/Underdog carry VI's fixed -137 DFS price.
+  Open question: lone `0` tokens in HR rows (176/409 rows; mostly index 1-2) are
+  IGNORED, not counted as a column slot — counting them would gain 1 row but
+  misattribute a whole row if wrong. Settle from the live DOM on next capture.
+- MLB prop lines live ONLY in `mlb_prop_lines` (no player-id resolution yet —
+  `mlb_game_logs` is empty in the live DB); no web/api view reads them yet.
 - Hourly `predictions` NaN rows for NULL-in-window stats: fixed 2026-07-21 (root-fix in
   `build_history_from_games` + `_persist_predictions` guard + `delete_nonfinite_predictions`
   cleanup). Below the valid-games floor a row is intentionally skipped, not projected.
@@ -431,12 +618,179 @@ Deferred / follow-ups:
 - Cross-book CSV is client-side (mirrors the Streamlit download without adding a
   write/response path to the read-only API).
 
-### Phase 3 — later
+### Phase 2.5 — security, polish, deploy readiness (2026-09-28)
 
-- [ ] **Parlay builder** — multi-leg SGP with correlation, on top of the
-      existing parlay model helpers.
-- [ ] **Auth + deploy story** — Phase 1/2 are local-only, no auth. Reuse the
-      existing OIDC/Stripe tier model, add a deploy target (the API is
-      stateless + read-only, so it fronts the same published DB the cloud app uses).
-- [ ] **Watchlist / bet-slip surface** — read `bet_log` + calibration artifacts so
-      the WS10 paper-trade review happens in the flagship UI instead of CSVs.
+Full write-up: `review_findings_web.md` (fixed vs PROPOSED vs CROSS-BOUNDARY).
+
+- **Security fixes (prereqs for ANY public deploy):**
+  - Manual-lines "Save to DB" is admin-only regardless of BILLING_ENABLED.
+  - The webhook grants premium only for sub status active/trialing and for
+    checkout payment_status=paid.
+  - Admin identity is bound to OIDC iss+sub (`[auth].admin_identities`) or a
+    VERIFIED email (nOAuth). Unverified emails get no tier, prefill or portal.
+    See docs/SECURITY.md.
+  - Webhook reliability:
+    - a failed event is un-recorded and 5xx'd, so Stripe's retry applies it
+    - Customer.retrieve failures are retryable instead of a silent 200
+    - out-of-order events are ignored (`last_event_created` column)
+    - old-subscription cancels don't revoke the new subscription
+    - the limiter counts only rejected requests
+  - Streamlit:
+    - Compare-players paywall bypass closed
+    - the scan throttle applies in open mode (admins exempt)
+    - Jokić accent preview match
+    - atomic, locked watchlist writes
+    - Dockerfile now copies `sports/`
+- **API hardening:**
+  - Read-only preflight: empty or foreign files get a 503 and are never
+    schema-written.
+  - sqlite errors → 503.
+  - Input bounds:
+    - literal (non-regex) search
+    - player_id bounds
+    - NaN/inf rejected
+    - book-list caps
+    - season_type allowlist
+    - chartable stats only
+    - n_games ≥ 3
+  - The `name` param is no longer trusted.
+  - Line-movement collapses alt-line ladders to the main line (was fabricating
+    "drift").
+  - Null KPIs on empty windows; UTC-normalised timestamps.
+  - Health hides the DB path; CSP + security headers.
+- **UI redesign** ("super ugly" → deployable), before/after shots in
+  docs/screenshots/flagship/:
+  - self-hosted Inter + JetBrains Mono (`@fontsource`, no CDN) and a real type
+    scale
+  - 4/8 spacing, a Page/Card shell, layered surfaces, a neutral accent for
+    chrome, green/red reserved for EV and hit/miss
+  - ONE ECharts theme (chartTheme.ts) with escaped tooltips
+  - skeletons, focus rings, keyboard tables, combobox player search
+  - shared format helpers
+- **Frontend bug fixes:**
+  - replay scrubber crash
+  - date off-by-one (UTC parse) and naive-UTC freshness
+  - fuzzy deep-link loading the wrong player
+  - stale player A data under player B
+  - error boundary; errors surfaced
+  - no retry on 4xx
+  - URL-driven player/stat
+  - CSV formula-injection guard
+  - `npm audit fix` (react-router high)
+- **Deploy:**
+  - `Dockerfile.flagship` (node build → python) and a compose `flagship`
+    service on :8080; uvicorn serves /api + the SPA on one origin
+    (`FLAGSHIP_STATIC_DIR`)
+  - `python -m api.smoke_check`
+  - env and proxy docs in docs/DEPLOYMENT.md §15
+  - The production path was verified without Docker (the daemon was down here):
+    smoke 18/18, zero CSP violations. The image itself was not built.
+    *UPDATE 2026-09-28: image built (`nba-flagship:latest`) and the container
+    passed the strict smoke check 18/18 (verified via Docker Desktop).*
+- **Known gaps (documented):** the flagship has NO auth and NO rate limiting.
+  Front it with a TLS proxy/CDN with per-IP limits. Auth = Phase 3.
+  *UPDATE 2026-09-28 (Phase 3): both closed — per-IP in-app rate limiting
+  (20/min expensive endpoints, 240/min rest, spoof-safe client IP) and an
+  optional `FLAGSHIP_ACCESS_CODE` shared-secret gate. Real per-user auth stays
+  deferred with billing.*
+
+Test counts after 2.5: **nba_model 862** (778 + 28 web-security tests; the
+other +56 came from concurrent data-agent work), **api 47**, **frontend 66**.
+
+### Phase 3 — shipped (2026-09-28)
+
+OWNER DECISION (2026-09-28): Stripe/billing is FROZEN. The app deploys
+open-access (BILLING_ENABLED=0), and billing + real per-user auth get built
+only if it becomes popular. The webhook/auth security fixes from 2.5 stay in
+place. The Stripe PROPOSED minors are marked "deferred with billing" in
+review_findings_web.md.
+
+- [x] **Parlay builder** — `POST /api/parlay/price` (compute-only) plus a
+      `/parlay` view.
+  - Wraps fitted_prob_over → calibrate_correlations (legs aligned on shared
+    game dates) → covariance_matrix → simulate_multi_leg_sgp →
+    calculate_parlay_ev. Under legs use the sign flip.
+  - Shows per-leg P(hit) vs implied, the correlated joint vs the naive
+    independent product, fair/leg-product/book price, EV, and a correlation
+    heatmap.
+  - Seeded deterministic RNG; n_sims capped at 50k; legs are shareable in the
+    URL (`?legs=`).
+  - Carries the standing "model estimate — not validated for real money; WS10
+    gates unpassed" banner.
+- [x] **Paper trades** — `GET /api/paper-trades` (bet_log pending/settled,
+      W/L/P, CLV, est. units) and `GET /api/paper-trades/calibration`
+      (calibration_report reliability buckets + Brier; source bet_log |
+      predictions), plus a `/paper-trades` view.
+  - Live bet_log is empty (offseason). The empty state gives the bet_slip
+    command, verified live.
+  - The "Model predictions" calibration source already has 65k settled rows
+    (Brier 0.224).
+- [x] **Deploy hardening, no billing (W-DEP-1/2):**
+  - in-process per-IP rate limiter (`api/guards.py`: heavy 20/min for
+    edges/cross-book/parlay, read 240/min, 429 + Retry-After, XFF via
+    uvicorn --forwarded-allow-ips only)
+  - optional `FLAGSHIP_ACCESS_CODE` shared code with a UI prompt and a
+    brute-force brake
+  - generic Streamlit error messages (`_public_error`, details logged with a
+    ref)
+  - IP-keyed Streamlit scan throttle
+  - echarts 6.1 (prod `npm audit` clean)
+  - DEPLOYMENT.md §15 updated
+- [x] **Cleanups:**
+  - Streamlit Limit widgets capped at 200
+  - unused team/stat gate helpers deleted (open access)
+  - watchlist pins only known players, and anonymous keys expire after 90d
+  - Player Detail `?n=&roll=` URL state
+- [x] **Docker image build** — builds; `smoke_check --strict` passes in the
+      container (verified 2026-09-28, including the §16 object-storage boot
+      pull).
+- [ ] **Real auth** — deferred with billing. Reuse the OIDC tier model
+      (iss+sub admin binding already in auth.py) if the app takes off.
+- [ ] CROSS-BOUNDARY handoff to the data agent: a `db_manager` read-only
+      open mode (the API preflight works around schema-on-open).
+
+Test counts after Phase 3: **nba_model 887** (+7 web tests of mine; the rest
+came from concurrent data-agent work), **api 71**, **frontend 86**.
+Screenshots: docs/screenshots/flagship/after/ (1–7 plus 7b live-empty and
+8 access gate).
+
+### Phase 4 — deploy target, mobile, watchlist (2026-09-28)
+
+- [x] **Target: Fly.io + Tigris** (decision + rationale: DEPLOYMENT.md §16).
+      `fly.toml` scales one shared-cpu-1x/512 MB machine to zero when idle;
+      TLS is automatic; `Fly-Client-IP` keys the in-app rate limits.
+- [x] **DB delivery** — `api/db_sync.py`.
+  - Push (Mac): `scripts/publish_db.sh --to-object-store --skip-git`.
+    Credentials live in `~/.config/nba-flagship/storage.env` (chmod 600).
+    launchd job: `scripts/scheduler/com.nba.flagship-publish.plist` at :45
+    hourly.
+  - Pull (app): at boot and every 600 s, with an atomic swap.
+  - Rollback: `python -m api.db_sync rollback --steps 1`.
+  - Verified end to end in the container against a real S3 API (moto).
+- [ ] **OWNER STEP (account boundary)** — `brew install flyctl`,
+      `fly auth login`, then the §16 "Deploy" block (apps create → storage
+      create → secrets set FLAGSHIP_ACCESS_CODE → deploy). Then write
+      storage.env, run the first publish, and run
+      `python -m api.smoke_check --base-url https://<app>.fly.dev --strict
+      --access-code …`. Not done yet: no Fly account exists.
+- [x] **Mobile / responsive** — phone: bottom tab bar (Slate / Player /
+      Edges / Watch / More) plus a drawer; tablet: icon rail.
+  - 44px touch targets via `pointer-coarse`.
+  - Tables use a sticky first column inside horizontal scroll containers.
+  - Chart labels use `hideOverlap`.
+  - Audit: 0 overflow and 0 sub-44px targets on all 8 views at 375 and 768.
+  - Shots: docs/screenshots/flagship/mobile/{before,after}/.
+- [x] **Watchlist** (`/watchlist`) — star players or props from Player
+      Detail and the Slate / Edge / Cross-book tables.
+  - Shows the best current line and model edge per item from the
+    full-model board.
+  - Stored in localStorage (no server writes), survives refresh, syncs
+    across tabs, and is shareable via `?w=` (Add / Replace / Dismiss).
+- [x] **Leftovers:**
+  - Streamlit single-prop NBA-API throttle: 4/min per IP plus 20/min
+    process-wide.
+  - Operations child env scrubbed of billing / cloud secrets.
+  - vitest 4 (`npm audit` 0, including dev).
+
+Test counts after Phase 4: **nba_model 891**, **api 99**, **frontend 99**.
+

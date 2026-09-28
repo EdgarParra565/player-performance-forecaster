@@ -1,0 +1,55 @@
+# Fly.io config for the flagship (React SPA + read-only FastAPI, one origin).
+# Decision + DB delivery design: docs/DEPLOYMENT.md §16.
+#
+# First deploy (owner, after `fly auth login`):
+#   fly apps create <your-app-name>          # then set `app` below to match
+#   fly storage create --app <your-app-name> # Tigris bucket; sets BUCKET_NAME
+#                                            # + AWS_* secrets on the app
+#   fly secrets set FLAGSHIP_ACCESS_CODE="$(openssl rand -base64 24)"
+#   fly deploy
+app = "nba-props-flagship"
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile.flagship"
+
+[env]
+  PORT = "8080"
+  NBA_DB_PATH = "/data/nba_data.db"
+  API_DOCS = "0"
+  # Snapshot poller (api/db_sync.py). The Mac publishes at :45 hourly.
+  DB_SYNC_INTERVAL_SECONDS = "600"
+  DB_SYNC_PREFIX = "flagship/"
+  # Fly's edge proxy sets (and overwrites) Fly-Client-IP: key rate limits on it.
+  API_CLIENT_IP_HEADER = "Fly-Client-IP"
+  # DNS-rebinding defence: must list the public hostname(s). Update if you
+  # rename the app or add a custom domain (comma-separated).
+  API_TRUSTED_HOSTS = "nba-props-flagship.fly.dev"
+  API_RATE_HEAVY_PER_MIN = "20"
+  API_RATE_READ_PER_MIN = "240"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  # Scale to zero when idle (cost). The first request after idle boots the
+  # machine (~2-4 s, including a ~9 MB gz snapshot download from Tigris).
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+  processes = ["app"]
+
+  [http_service.concurrency]
+    type = "requests"
+    soft_limit = 25
+    hard_limit = 50
+
+  [[http_service.checks]]
+    grace_period = "30s"
+    interval = "30s"
+    method = "GET"
+    path = "/api/health"
+    timeout = "5s"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"

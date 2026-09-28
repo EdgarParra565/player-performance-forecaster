@@ -71,3 +71,8 @@ nba_model/tests/
 
 # Agent / build artifacts
 .claude/
+
+# Flagship UI: the SPA is rebuilt inside Dockerfile.flagship's node stage.
+frontend/node_modules/
+frontend/dist/
+api/tests/

@@ -252,8 +252,9 @@ and `~50 MB` for the webhook. Volume mounts:
 | Distribution overlays            | normal only                           | normal + poisson + neg-binomial |
 
 The matrix is enforced in `nba_model/web/auth.py` (`PREVIEW_PLAYERS`,
-`PREVIEW_TEAMS`, `PREVIEW_STATS`, `PREVIEW_MAX_GAMES`). Adjust there if you
-change the policy.
+`PREVIEW_STATS`, `PREVIEW_MAX_GAMES`) and only applies with
+`BILLING_ENABLED=1`. Billing is frozen: the app deploys open-access, and team
+charts are free for everyone. Adjust there if you change the policy.
 
 ## 9. Web app views (parity with the desktop UI)
 
@@ -263,7 +264,7 @@ selectable from the sidebar `View mode` radio:
 | View mode               | What it does                                       | Gating |
 |-------------------------|----------------------------------------------------|--------|
 | Player charts           | Per-player distribution + recent games + splits + hit-rate + custom-line probe | Free preview (Jokic/LeBron + points) / Premium full |
-| Team charts             | Per-team aggregate distributions, per-stat overview | Free preview (LAL/DEN) / Premium full |
+| Team charts             | Per-team aggregate distributions, per-stat overview | Free (all teams) |
 | Compare players         | Overlay 2–3 players' distributions for one stat   | Free / Premium |
 | All stats (overview)    | One page, every stat for a selected player        | Premium |
 | Single prop (model)     | Calls `run_single_prop` — same model the desktop "Single Prop" tab uses | Premium |
@@ -494,3 +495,286 @@ will keep the code paths clean.
 > is owned by Agent A. The Streamlit "Manual Lines Import" view and any
 > billing-flow docs you add should go under their own headings (e.g.
 > `## 15. Manual lines view (web)`) to avoid edit collisions.
+
+## 15. Flagship UI (React SPA + read-only API)
+
+The flagship terminal (`frontend/` + `api/`) deploys as **one process on one
+origin**: uvicorn serves `/api/*` and the Vite build. There's no CORS, no dev
+proxy and no separate web server. It sits alongside the Streamlit app and the
+webhook (§7a) rather than replacing them.
+
+> **Prerequisites for ANY public deploy (read first)**
+>
+> Note: `Dockerfile.flagship` builds and passes `smoke_check --strict` inside
+> the container, including the §16 object-storage boot pull. The production
+> target is Fly.io; see §16.
+> 1. The Streamlit security fixes in `review_findings_web.md` (W-SEC-1…3:
+>    manual-lines admin gate, webhook status gating, admin iss+sub binding)
+>    are in this tree. Keep them. Configure `[auth].admin_identities`
+>    (`docs/SECURITY.md` → "Admin identity binding").
+> 2. **There are no user accounts; real auth is deferred along with billing.**
+>    The owner froze Stripe/billing work on 2026-09-28: the app deploys
+>    open-access (`BILLING_ENABLED=0`), and per-user auth is built only if the
+>    app takes off. Until then there are two modes:
+>    - **Public** (default): `FLAGSHIP_ACCESS_CODE` unset. Everything the
+>      flagship serves (scored slate, cross-book, parlay pricing, paper
+>      trades) is readable by anyone.
+>    - **Private preview**: set `FLAGSHIP_ACCESS_CODE` to a long random
+>      string (e.g. `openssl rand -base64 24`) and share it. Every `/api/*`
+>      call except `/api/health` then needs `X-Access-Code`. The UI prompts
+>      once and stores the code in the browser's localStorage. This is a
+>      *shared secret*, not auth: anyone holding the code has full access,
+>      and rotating it (restart with a new value) logs everyone out. Wrong
+>      codes are brute-force limited per IP. Serve it over HTTPS only.
+> 3. **Rate limiting is built in** (per client IP, in-process; see
+>    below). The proxy limits in the Caddy/nginx example are defence in
+>    depth, not a requirement.
+
+### Build + run
+
+```bash
+# Container (multi-stage: node builds the SPA, python serves it)
+docker build -f Dockerfile.flagship -t nba-flagship .
+docker run --rm -p 8080:8080 \
+  -v "$(pwd)/data/database:/data:ro" \
+  -e NBA_DB_PATH=/data/nba_data.db \
+  -e API_TRUSTED_HOSTS=props.example.com \
+  nba-flagship
+
+# or via compose
+docker compose up flagship            # http://localhost:8080
+```
+
+Without Docker (same production path):
+
+```bash
+(cd frontend && npm ci && npm run build)
+FLAGSHIP_STATIC_DIR=$PWD/frontend/dist API_DOCS=0 \
+  .venv/bin/python3 -m uvicorn api.main:app --host 0.0.0.0 --port 8080 \
+  --no-server-header --proxy-headers --forwarded-allow-ips=127.0.0.1
+```
+
+### Environment
+
+| Var | Default | Purpose |
+|---|---|---|
+| `NBA_DB_PATH` | `<repo>/data/database/nba_data.db` (image: `/data/nba_data.db`) | SQLite DB to read. Mount it **read-only**; the API never writes, and it refuses (503) any file that lacks the core tables rather than letting the data layer create a schema in it. |
+| `FLAGSHIP_STATIC_DIR` | unset (image: `/app/frontend/dist`) | When set, serves the SPA: hashed `assets/*` get `immutable` caching, and client routes (`/player/2544`, `/edges`) fall back to `index.html`. |
+| `PORT` | `8080` (image) | Listen port. |
+| `API_DOCS` | `1` locally, `0` in the image | Swagger UI at `/api/docs`. It loads from a CDN, so keep it off in production (the CSP would block it anyway). |
+| `API_TRUSTED_HOSTS` | unset | CSV of allowed `Host` headers (DNS-rebinding defence). **Set this in production.** |
+| `API_EXPOSE_DB_PATH` | `0` | Include the absolute DB path in `/api/health` (local debugging only). |
+| `FORWARDED_ALLOW_IPS` | `127.0.0.1` | IPs uvicorn trusts for `X-Forwarded-*` (your proxy). |
+| `FLAGSHIP_ACCESS_CODE` | unset (open) | Optional shared access code (private-preview mode, see above). |
+| `API_RATE_LIMIT` | `1` | `0` disables the in-process limiter (trusted internal deploys only). |
+| `API_RATE_HEAVY_PER_MIN` | `20` | Per-IP budget for CPU-heavy calls: `/api/slate/edges`, `/api/cross-book`, `/api/parlay/*`. |
+| `API_RATE_READ_PER_MIN` | `240` | Per-IP budget for every other `/api/*` call (`/api/health` and static files are exempt). |
+| `API_RATE_AUTH_FAIL_PER_MIN` | `10` | Per-IP budget of WRONG access codes before a 429 lockout. |
+| `API_PROXY_TARGET` | `http://localhost:8000` | **Dev only**: where `npm run dev`'s Vite proxy sends `/api`. |
+
+Ports at a glance: Streamlit **8501**, webhook **8000** (compose), flagship
+**8080**, Vite dev **5173** (proxying to API dev on **8000**).
+
+Every response carries a strict CSP (`default-src 'self'`; no inline or
+third-party scripts, fonts or connections), `nosniff`, `X-Frame-Options: DENY`,
+`Referrer-Policy: no-referrer` and COOP. Fonts are self-hosted (`@fontsource`),
+so there are no external requests.
+
+### Rate limiting (built in)
+
+`api/guards.py` keeps a sliding 60-second window per client IP and returns
+`429` with `Retry-After` when a budget is exhausted (budgets in the table
+above). The client IP is `request.client.host`: behind a reverse proxy, run
+uvicorn with `--proxy-headers --forwarded-allow-ips=<proxy IP>` (the image
+does this via `FORWARDED_ALLOW_IPS`). Uvicorn then takes the client from
+X-Forwarded-For **only** when the request came from that proxy. Without it,
+every visitor shares the proxy's IP, and spoofed X-Forwarded-For headers
+from elsewhere are ignored. Budgets are per process: with N replicas, each
+IP gets N× the budget, so also rate-limit at the proxy/CDN if you scale out.
+
+The Streamlit app throttles scans per client IP as well
+(`STREAMLIT_TRUSTED_PROXY_HOPS` = number of proxies in front of it, default 0,
+which uses the socket peer).
+
+### Reverse proxy (TLS + rate limit, defence in depth) — Caddy example
+
+```caddy
+props.example.com {
+    encode zstd gzip
+    # Per-IP limit on the expensive scan endpoints (caddy-ratelimit plugin).
+    rate_limit {
+        zone scans {
+            match { path /api/slate/edges* /api/cross-book* }
+            key {remote_host}
+            events 30
+            window 1m
+        }
+    }
+    reverse_proxy 127.0.0.1:8080
+}
+```
+
+With nginx, use `limit_req_zone $binary_remote_addr zone=scans:10m rate=30r/m;`
+plus `limit_req zone=scans burst=10;` on `location ~ ^/api/(slate/edges|cross-book)`.
+
+### Smoke check
+
+```bash
+python -m api.smoke_check --base-url http://localhost:8080          # local
+python -m api.smoke_check --base-url https://props.example.com --strict
+python -m api.smoke_check --base-url https://props.example.com --strict \
+  --access-code "$FLAGSHIP_ACCESS_CODE"   # private-preview mode
+```
+
+The smoke check verifies:
+- health (DB present, no path leak)
+- the SPA shell on `/` and on a client route
+- the core read endpoints
+- that bad input gives a 4xx, never a 500
+- the CSP and nosniff headers
+- (`--strict`) that API docs are off
+- when the server has an access code, that anonymous API calls get 401
+
+It exits non-zero on any failure, so it can gate a deploy.
+
+## 16. Flagship production target: Fly.io + Tigris (decision, 2026-09-28)
+
+**Decision:** deploy the flagship (`Dockerfile.flagship`) to **Fly.io**, as
+one small machine that scales to zero when idle. The nightly/hourly SQLite
+snapshot goes through **Tigris**, Fly's S3-compatible object storage. The Mac
+pushes a snapshot; the app pulls it and swaps it in atomically.
+
+### Why Fly.io (vs Railway / a small VPS)
+
+| Need | Fly.io + Tigris | Railway | Small VPS (e.g. €4 Hetzner) |
+|---|---|---|---|
+| DB refresh path | `fly storage create` makes the bucket **and** injects its credentials into the app (one account, one command). The Mac uploads with boto3, and the app pulls on boot and every 10 min. | Needs a volume plus a push channel you build yourself (no bundled storage), or a third-party bucket and a second account | `rsync` to the box is simplest, but you own the box |
+| TLS | Automatic on `*.fly.dev` (and custom domains via `fly certs add`) | Automatic | You configure Caddy/nginx and renewals |
+| Ops burden (student) | Containers only; no OS to patch | Low | OS patching, firewall, SSH hardening, backups, all yours |
+| Cost at this traffic | Pay-as-you-go. A shared-cpu-1x/512 MB machine that auto-stops when idle, plus a small bucket, should cost cents to a few dollars a month. **Check fly.io/docs/about/pricing before relying on this**; I couldn't verify current prices from here. | ~$5/mo plan after the trial | ~€4/mo flat |
+| In-app per-IP rate limits | Yes. Fly's proxy sets `Fly-Client-IP` and overwrites any client value, and `API_CLIENT_IP_HEADER=Fly-Client-IP` keys the limiter on it | Yes, via X-Forwarded-For | Yes, via your proxy |
+
+The app shape is read-only API + static SPA + one 65 MB file (9 MB gzipped)
+that changes at most hourly. It fits a pull-from-object-storage design, and
+Fly is the only option here where storage, credentials and TLS come from a
+single CLI with no server to maintain.
+
+### DB delivery design
+
+```
+Mac (launchd :45 hourly)                     Tigris bucket                          Fly machine
+publish_db.sh --to-object-store --skip-git   flagship/
+  └ api.db_sync push                          snapshots/nba_data-<UTC>.db.gz   ◄── boot: db_sync pull (before uvicorn)
+      1. refuse if ETL holds a write lock      snapshots/…db.gz.json (sha256)  ◄── every 600 s: background poll
+      2. sqlite .backup → consistent snapshot  latest.json  ← pointer, written LAST   1. latest.json sha == local marker? done
+      3. quick_check + required tables                                                2. download .gz → temp in /data
+      4. sha256 unchanged? → no upload                                                3. gunzip + sha256 verify
+      5. upload .gz + metadata                                                        4. quick_check + required tables
+      6. repoint latest.json                                                          5. fsync + os.replace (atomic)
+      7. prune: keep newest 7                                                         6. write sha marker
+```
+
+- **Zero-downtime-ish:** `os.replace` is atomic on the same filesystem, and
+  the API opens a connection per request. In-flight requests finish on the
+  old inode while new requests read the new file. Verified in the container:
+  60/60 requests returned 200 during a live swap.
+- **Never serves a bad file:** a sha mismatch, corrupt SQLite, missing tables
+  or an oversize payload (>1 GB) is rejected and the current file stays live.
+  Temp files are always cleaned up.
+- **The API stays read-only:** there is no upload endpoint. The only writer on
+  the box is the pull, and it only writes `/data`.
+- **Rollback:** `python -m api.db_sync list` then
+  `python -m api.db_sync rollback --steps 1` (or `--to <key>`). The app swaps
+  it in on its next poll, within 10 min; to force it immediately, run
+  `fly machine restart`.
+- **Cold start:** with scale-to-zero, the first request after idle boots the
+  machine and pulls about 9 MB from Tigris in the same region. That takes a
+  few seconds, and only on the first request.
+
+### Mac-side credentials
+
+After `fly storage create`, the command prints the bucket credentials. Put a
+**write** key for the bucket in `~/.config/nba-flagship/storage.env`:
+
+```bash
+mkdir -p ~/.config/nba-flagship
+cat > ~/.config/nba-flagship/storage.env <<'ENV'
+BUCKET_NAME=<bucket name from fly storage create>
+AWS_ACCESS_KEY_ID=<key id>
+AWS_SECRET_ACCESS_KEY=<secret>
+AWS_ENDPOINT_URL_S3=https://fly.storage.tigris.dev
+AWS_REGION=auto
+ENV
+chmod 600 ~/.config/nba-flagship/storage.env   # publish_db.sh refuses anything looser
+```
+
+Test once by hand (`--dry-run` first), then install the launchd job:
+
+```bash
+scripts/publish_db.sh --to-object-store --skip-git --dry-run
+scripts/publish_db.sh --to-object-store --skip-git
+python -m api.db_sync list          # (source the env file first)
+
+cp scripts/scheduler/com.nba.flagship-publish.plist ~/Library/LaunchAgents/
+# replace ABSOLUTE_PATH_TO_REPO with this checkout's path, then:
+launchctl load -w ~/Library/LaunchAgents/com.nba.flagship-publish.plist
+```
+
+**Cadence:** the job runs at :45 every hour, 40 minutes after the hourly ETL
+(`com.nba.hourly` runs at :05). An unchanged DB uploads nothing. A DB still
+being written exits 3 and retries at the next :45. For nightly-only, add
+`<key>Hour</key><integer>4</integer>` to the plist's `StartCalendarInterval`.
+
+### Deploy (owner steps at the account boundary)
+
+```bash
+brew install flyctl                      # once
+fly auth login                           # browser login — OWNER ONLY
+fly apps create nba-props-flagship       # or another name; then update `app`
+                                         # and API_TRUSTED_HOSTS in fly.toml
+fly storage create --app nba-props-flagship   # Tigris bucket + app secrets
+fly secrets set --app nba-props-flagship \
+  FLAGSHIP_ACCESS_CODE="$(openssl rand -base64 24)"   # recommended ON for now
+fly deploy                               # builds Dockerfile.flagship remotely
+```
+
+Then publish the first snapshot from the Mac (above) and check the live site:
+
+```bash
+python -m api.smoke_check --base-url https://nba-props-flagship.fly.dev --strict \
+  --access-code "<the code you set>"
+curl -s https://nba-props-flagship.fly.dev/api/health   # db_sync should be updated/unchanged
+```
+
+### Operations
+
+| Task | Command |
+|---|---|
+| Logs (including `db_sync: swapped in …` lines) | `fly logs` |
+| Status / machines | `fly status` |
+| Roll back the **code** | `fly releases` then `fly deploy --image <previous image ref>` |
+| Roll back the **data** | `python -m api.db_sync rollback --steps 1` |
+| Rotate the access code | `fly secrets set FLAGSHIP_ACCESS_CODE=…` (restarts; everyone re-enters it) |
+| Go fully public | `fly secrets unset FLAGSHIP_ACCESS_CODE` |
+| Keep one machine warm (no cold start) | `min_machines_running = 1` in fly.toml, then `fly deploy` (costs more) |
+| Custom domain | `fly certs add props.example.com`, then add it to `API_TRUSTED_HOSTS` |
+
+### Environment added for §16
+
+| Var | Where | Purpose |
+|---|---|---|
+| `BUCKET_NAME`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_ENDPOINT_URL_S3`, `AWS_REGION` | Fly secrets (set by `fly storage create`); Mac `storage.env` | Tigris / S3 access |
+| `DB_SYNC_INTERVAL_SECONDS` | fly.toml (`600`) | Poll cadence; `0` = boot-time pull only |
+| `DB_SYNC_PREFIX` | fly.toml (`flagship/`) | Key prefix inside the bucket |
+| `DB_SYNC_KEEP` | Mac env (default 7) | Snapshots retained for rollback |
+| `DB_SYNC_LOCAL_DIR` | tests / shared-mount setups | Directory-backed store instead of S3 |
+| `API_CLIENT_IP_HEADER` | fly.toml (`Fly-Client-IP`) | Rate-limit key from the platform's overwritten header. **Only behind a proxy that always sets it.** |
+
+**Verified locally (2026-09-28):** the built image, pointed at a local S3 API
+(moto) with the real DB pushed by `publish_db.sh --to-object-store`:
+- downloaded the snapshot on boot and passed `smoke_check --strict` (19/19
+  with the access code, 18/18 without)
+- swapped in a new snapshot live with no failed requests
+- rolled back live
+
+The Fly account step itself has not happened yet.

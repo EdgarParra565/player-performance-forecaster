@@ -1,0 +1,13 @@
+# Books that can't be scraped from this host for a NON-auth reason.
+# The hourly session_health step reports them as "blocked" (never alerts), and
+# scripts/scheduler/login_setup.sh never prompts for them. If a blocked book's
+# page ever reads as real content again, the report shows it "ok" and lists it
+# under "blocked_but_ok" so you know the block lifted.
+#
+# Format: <book> <kind> <note...>      kinds: geo-blocked | age-blocked | app-only
+# Delete a line to put the book back into login prompts + alerts.
+
+betmgm      geo-blocked  Owner in California (2026-09-28 internship); BetMGM has no CA sportsbook, NJ/MA geolocation never passes. Revisit if location changes.
+betrivers   age-blocked  Sportsbook requires 21+; owner can't hold an account (2026-09-28). Parser + fixtures kept for the future.
+hardrockbet age-blocked  Account requires 21+.
+underdog    geo-blocked  Signed in 2026-09-28, but app.underdogsports.com shows "Pick'em is not available in your location" from California. Revisit if location changes.

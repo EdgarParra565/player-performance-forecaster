@@ -20,6 +20,9 @@ from __future__ import annotations
 import json
 import os
 import re
+import tempfile
+import threading
+import time
 import uuid
 from pathlib import Path
 from typing import Callable, Optional
@@ -42,41 +45,104 @@ def _store_path() -> str:
     return os.environ.get("WATCHLIST_STORE_PATH", DEFAULT_STORE)
 
 
-def _load_all() -> dict:
-    path = Path(_store_path())
+# One process-wide lock serialises read-modify-write cycles between
+# Streamlit sessions (threads in the same server process).
+_STORE_LOCK = threading.Lock()
+MAX_ITEM_LEN = 80
+# Anonymous (open-launch) keys expire after this many days without a save,
+# so one-off visitors don't grow the store forever. Signed-in keys never expire.
+ANON_TTL_DAYS = int(os.environ.get("WATCHLIST_ANON_TTL_DAYS", "90") or 90)
+_SEEN_KEY = "__seen__"
+
+
+class _CorruptStore(Exception):
+    """The store exists but can't be parsed — never overwrite it."""
+
+
+def _read_store(path: Path) -> dict:
     if not path.exists():
         return {}
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise _CorruptStore(str(path)) from exc
+    return data if isinstance(data, dict) else {}
+
+
+def _load_all() -> dict:
+    try:
+        return _read_store(Path(_store_path()))
+    except _CorruptStore:
         return {}
 
 
 def _save_all(payload: dict) -> None:
+    """Atomic write: temp file in the same dir + os.replace, so a reader
+    never sees a half-written file (which used to parse as {} and then get
+    saved back over EVERY user's list)."""
     path = Path(_store_path())
-    path.parent.mkdir(parents=True, exist_ok=True)
     try:
-        path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-        # File-mode 0600 so multi-tenant hosts can't read other users' lists.
-        if os.name == "posix":
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(prefix=".watchlists.", dir=str(path.parent))
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh, indent=2)
+            # File-mode 0600 so multi-tenant hosts can't read other users' lists.
+            if os.name == "posix":
+                os.chmod(tmp, 0o600)
+            os.replace(tmp, path)
+        except BaseException:
             try:
-                os.chmod(path, 0o600)
+                os.unlink(tmp)
             except OSError:
                 pass
+            raise
     except OSError:
         pass
 
 
 def _load_for(key: str) -> list[str]:
     """Stored items for a watchlist key (email or ``anon:<token>``)."""
+    if key == _SEEN_KEY:
+        return []
     return list(_load_all().get(key, []))
 
 
-def _save_for(key: str, items: list[str]) -> None:
-    """Persist items for a key, enforcing the MAX_ITEMS cap."""
-    payload = _load_all()
-    payload[key] = list(items)[:MAX_ITEMS]
-    _save_all(payload)
+def _prune_expired_anon(payload: dict, now: float) -> None:
+    """Drop ``anon:*`` keys not saved within ANON_TTL_DAYS (in place).
+
+    ``__seen__`` maps key -> last-save epoch seconds. Legacy anon keys with no
+    stamp get one now (a grace period) instead of being deleted outright."""
+    seen = payload.setdefault(_SEEN_KEY, {})
+    cutoff = now - ANON_TTL_DAYS * 86_400
+    for key in [k for k in payload if isinstance(k, str) and k.startswith("anon:")]:
+        stamp = seen.get(key)
+        if stamp is None:
+            seen[key] = now
+        elif stamp < cutoff:
+            payload.pop(key, None)
+            seen.pop(key, None)
+    for key in [k for k in seen if k not in payload]:
+        seen.pop(key, None)
+
+
+def _save_for(key: str, items: list[str], now: Optional[float] = None) -> None:
+    """Persist items for a key, enforcing the MAX_ITEMS / length caps."""
+    if key == _SEEN_KEY:
+        return
+    clean = [str(i)[:MAX_ITEM_LEN] for i in items if str(i).strip()][:MAX_ITEMS]
+    with _STORE_LOCK:
+        try:
+            payload = _read_store(Path(_store_path()))
+        except _CorruptStore:
+            # Keep the damaged file for recovery rather than clobbering
+            # everyone's pins with a single-key payload.
+            return
+        payload[key] = clean
+        now = time.time() if now is None else now
+        payload.setdefault(_SEEN_KEY, {})[key] = now
+        _prune_expired_anon(payload, now)
+        _save_all(payload)
 
 
 # ---------------------------------------------------------------------------
@@ -181,9 +247,13 @@ def get() -> list[str]:
     return list(stored)
 
 
-def add(player_name: str) -> bool:
+def add(player_name: str, is_known: Optional[Callable[[str], bool]] = None) -> bool:
+    """Pin a player. ``is_known`` (the app passes a DB-backed check) rejects
+    names that aren't real players — the pin value comes from a URL param."""
     name = str(player_name or "").strip()
-    if not name:
+    if not name or len(name) > MAX_ITEM_LEN:
+        return False
+    if is_known is not None and not is_known(name):
         return False
     current = get()
     if name in current:

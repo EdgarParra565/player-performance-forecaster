@@ -6,23 +6,19 @@ interface OddsBadgeProps {
   dfs?: boolean;
 }
 
-// American odds pill. Favorites (negative) read neutral; plus-money leans faint
-// green to catch the eye, matching a sportsbook's own emphasis.
+// American odds pill, always signed (+110 / -110). Plus-money gets a brighter
+// face to catch the eye (as a sportsbook does) but stays neutral — price is
+// not EV, so it never borrows the +EV green.
 export function OddsBadge({ odds, dfs }: OddsBadgeProps) {
-  if (odds === null || odds === undefined || Number.isNaN(odds)) {
-    return (
-      <span className="tnum rounded border border-line px-1.5 py-0.5 text-[11px] text-faint">
-        {dfs ? "DFS" : "—"}
-      </span>
-    );
+  const base = "tnum inline-flex h-6 min-w-12 items-center justify-center rounded-md border px-2 text-caption";
+  if (odds === null || odds === undefined || !Number.isFinite(odds)) {
+    return <span className={`${base} border-line text-faint`}>{dfs ? "DFS" : "—"}</span>;
   }
   const plus = odds > 0;
   return (
     <span
-      className={`tnum rounded border px-1.5 py-0.5 text-[11px] ${
-        plus
-          ? "border-pos-dim/50 text-pos"
-          : "border-line-strong text-muted"
+      className={`${base} ${
+        plus ? "border-line-strong bg-surface-3 text-fg" : "border-line bg-surface-2 text-muted"
       }`}
     >
       {fmtOdds(odds)}

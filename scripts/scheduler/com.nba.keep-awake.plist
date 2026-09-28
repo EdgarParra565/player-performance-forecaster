@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+    Optional LaunchAgent: keep the scraping Mac from SYSTEM-sleeping while it
+    is on AC power, so the hourly loop and the scraping Chrome keep running.
+
+    `caffeinate -s` only holds a "prevent system sleep" assertion on AC power:
+    the display still sleeps/locks normally, and on battery the Mac sleeps as
+    usual. No sudo, no pmset changes. Undo with:
+
+        launchctl bootout gui/$(id -u)/com.nba.keep-awake
+
+    Install:
+        cp scripts/scheduler/com.nba.keep-awake.plist ~/Library/LaunchAgents/
+        launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.nba.keep-awake.plist
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.nba.keep-awake</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/caffeinate</string>
+        <string>-s</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>60</integer>
+</dict>
+</plist>

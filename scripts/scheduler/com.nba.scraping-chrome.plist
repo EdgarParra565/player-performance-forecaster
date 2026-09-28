@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+    launchd LaunchAgent that keeps the dedicated SCRAPING Chrome alive
+    (CDP on :9222, dedicated persistent profile — NOT the daily Chrome profile).
+
+    Install (per-user, no sudo; see scripts/scheduler/README.md):
+
+        sed "s|/ABSOLUTE_PATH_TO_REPO|$(pwd)|g" \
+            scripts/scheduler/com.nba.scraping-chrome.plist \
+            > ~/Library/LaunchAgents/com.nba.scraping-chrome.plist
+        launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.nba.scraping-chrome.plist
+
+    Stop (KeepAlive relaunches Chrome on quit, so unload the agent instead):
+
+        launchctl bootout gui/$(id -u)/com.nba.scraping-chrome
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.nba.scraping-chrome</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/ABSOLUTE_PATH_TO_REPO/scripts/scheduler/scraping_chrome.sh</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/ABSOLUTE_PATH_TO_REPO</string>
+
+    <!-- Start at login and relaunch whenever Chrome exits (crash, Cmd-Q). -->
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- At most one relaunch per 30s so a crash loop can't spin the CPU. -->
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <!-- Chrome needs the logged-in GUI session (window server). -->
+    <key>LimitLoadToSessionType</key>
+    <string>Aqua</string>
+    <key>ProcessType</key>
+    <string>Interactive</string>
+
+    <key>StandardOutPath</key>
+    <string>/ABSOLUTE_PATH_TO_REPO/nba_model/data/logs/scraping_chrome_stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/ABSOLUTE_PATH_TO_REPO/nba_model/data/logs/scraping_chrome_stderr.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>CHROME_PORT</key>
+        <string>9222</string>
+    </dict>
+</dict>
+</plist>

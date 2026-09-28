@@ -4,7 +4,8 @@
 export interface Health {
   status: string;
   version: string;
-  db_path: string;
+  db_path: string | null; // only with API_EXPOSE_DB_PATH=1
+  access_code_required: boolean;
   db_exists: boolean;
   last_game_date: string | null;
   freshest_scrape_utc: string | null;
@@ -261,4 +262,129 @@ export interface TeamChartResponse {
   derived_reference_line: number | null;
   derived_reference_label: string | null;
   notes: string[];
+}
+
+// --- Parlay builder (POST /api/parlay/price) --------------------------------
+
+export type LegSide = "over" | "under";
+
+export interface ParlayLegInput {
+  player_id: number;
+  player_name: string; // display only; the API resolves the canonical name
+  stat: string;
+  line: number;
+  side: LegSide;
+  odds: number;
+}
+
+export interface ParlayLegPriced {
+  player_id: number;
+  player_name: string;
+  stat: string;
+  line: number;
+  side: string;
+  odds: number;
+  n_games: number;
+  mu: number;
+  sigma: number;
+  p_over: number;
+  p_hit: number;
+  implied_prob: number;
+  ev: number;
+}
+
+export interface ParlayResponse {
+  legs: ParlayLegPriced[];
+  n_games: number;
+  n_sims: number;
+  n_joint_games: number;
+  correlation_fallback: boolean;
+  joint_prob: number;
+  joint_prob_se: number;
+  independent_prob: number;
+  correlation_lift: number | null;
+  combined_decimal: number;
+  combined_american: number | null;
+  offered_american: number | null;
+  offered_is_custom: boolean;
+  implied_prob: number | null;
+  fair_american: number | null;
+  ev_joint: number | null;
+  ev_independent: number | null;
+  correlation: { labels: string[]; matrix: number[][] };
+  disclaimer: string;
+}
+
+// --- Paper trades (bet_log) + calibration ------------------------------------
+
+export interface PaperTradeRow {
+  log_id: number;
+  created_at_utc: string | null;
+  game_date: string | null;
+  player_id: number | null;
+  player_name: string;
+  stat_type: string;
+  book: string | null;
+  line: number | null;
+  side: string;
+  model_prob: number | null;
+  implied_prob: number | null;
+  edge: number | null;
+  model_mode: string | null;
+  stake_units: number | null;
+  status: string;
+  settled_at_utc: string | null;
+  actual_value: number | null;
+  clv_delta: number | null;
+  est_profit_units: number | null;
+}
+
+export interface PaperTradeSummary {
+  total: number;
+  pending: number;
+  won: number;
+  lost: number;
+  push: number;
+  void: number;
+  win_rate: number | null;
+  n_clv: number;
+  mean_clv: number | null;
+  positive_clv_rate: number | null;
+  est_units: number | null;
+}
+
+export interface PaperTradesResponse {
+  status_filter: string;
+  rows: PaperTradeRow[];
+  summary: PaperTradeSummary;
+}
+
+export interface ReliabilityBucket {
+  stat_type: string;
+  bucket: number;
+  bucket_low: number;
+  bucket_high: number;
+  n: number;
+  mean_pred: number;
+  realized_rate: number;
+  calibration_gap: number;
+}
+
+export interface BrierRow {
+  stat_type: string;
+  n: number;
+  brier_score: number;
+  mean_pred: number;
+  realized_rate: number;
+}
+
+export interface CalibrationResponse {
+  source: string;
+  stat: string;
+  n_buckets: number;
+  n_settled: number;
+  stats_available: string[];
+  reliability: ReliabilityBucket[];
+  brier: BrierRow | null;
+  brier_by_stat: BrierRow[];
 }

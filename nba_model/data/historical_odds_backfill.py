@@ -66,7 +66,9 @@ def _latest_web_prop_lines(
     where = ["line_value IS NOT NULL"]
     params: list = []
     if lookback_hours is not None:
-        where.append("observed_at_utc >= datetime('now', ?)")
+        where.append(
+            "datetime(COALESCE(last_seen_at_utc, observed_at_utc)) >= datetime('now', ?)"
+        )
         params.append(f"-{float(lookback_hours)} hours")
     if books:
         placeholders = ",".join("?" * len(books))

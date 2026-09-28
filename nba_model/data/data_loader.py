@@ -1,13 +1,22 @@
 """Load NBA game logs with DB, file cache, and NBA API."""
 import json
 import time
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional
 
 import pandas as pd
 from nba_api.stats.endpoints import playergamelogs
 from nba_api.stats.static import players
 
 from nba_model.data.database.db_manager import DatabaseManager
+
+
+def current_nba_season(reference_time: Optional[datetime] = None) -> str:
+    """NBA season string ("2026-27") for a UTC time; seasons roll over in October."""
+    ts = reference_time or datetime.now(timezone.utc)
+    start_year = ts.year if ts.month >= 10 else ts.year - 1
+    return f"{start_year}-{str(start_year + 1)[-2:]}"
 
 
 class DataLoader:
@@ -25,7 +34,8 @@ class DataLoader:
             raise ValueError(f"Player '{player_name}' not found")
         return player_dict[0]['id']
 
-    def load_player_data(self, player_name, n_games=50, force_refresh=False):
+    def load_player_data(self, player_name, n_games=50, force_refresh=False,
+                         season: Optional[str] = None):
         """
         Load player game logs with multi-tier caching:
         1. Check database
@@ -63,8 +73,10 @@ class DataLoader:
         print(f"Fetching fresh data from NBA API for {player_name}...")
         time.sleep(0.6)  # Rate limiting
 
+        # Was hard-coded to '2024-25', so every refresh re-fetched a stale
+        # season and current-season logs never arrived via this path.
         gamelog = playergamelogs.PlayerGameLogs(
-            season_nullable='2024-25',
+            season_nullable=season or current_nba_season(),
             player_id_nullable=player_id
         )
         df = gamelog.get_data_frames()[0]

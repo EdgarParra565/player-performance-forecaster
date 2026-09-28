@@ -28,7 +28,7 @@ from nba_model.data.data_loader import DataLoader
 from nba_model.data.database.db_manager import DatabaseManager
 from nba_model.model.feature_engineering import add_rolling_stats
 from nba_model.model.odds import american_to_implied_prob, expected_value
-from nba_model.model.probability import prob_over_distribution
+from nba_model.model.probability import prob_over_distribution, prob_push_distribution
 from nba_model.model.simulation import blend_team_prior, get_default_distribution
 
 
@@ -88,8 +88,15 @@ def _fetch_betting_lines_for_game(
     home_team: Optional[str] = None,
     away_team: Optional[str] = None,
     books: Optional[Sequence[str]] = None,
+    latest_main_only: bool = True,
 ) -> pd.DataFrame:
-    """Fetch betting lines joined with player metadata for a single date."""
+    """Fetch betting lines joined with player metadata for a single date.
+
+    ``latest_main_only`` (default): one row per (player, book, stat) — the
+    book's newest MAIN line (alt-line rungs and superseded scrapes dropped),
+    so the board / hourly recompute score the current line, not an arbitrary
+    rung or a stale earlier line. ``False`` returns every stored row.
+    """
     stat_types = sorted({_normalize_stat_type(s) for s in stat_types if s})
     if not stat_types:
         raise ValueError("At least one stat_type must be provided")
@@ -114,29 +121,42 @@ def _fetch_betting_lines_for_game(
             params.append(home_team or away_team)
 
         if books:
-            books_norm = [str(b).strip() for b in books if str(b).strip()]
+            books_norm = [str(b).strip().lower() for b in books if str(b).strip()]
             if books_norm:
                 book_placeholders = ",".join("?" * len(books_norm))
-                clauses.append(f"bl.book IN ({book_placeholders})")
+                clauses.append(f"lower(bl.book) IN ({book_placeholders})")
                 params.extend(books_norm)
+        if latest_main_only:
+            clauses.append("COALESCE(bl.is_main_line, 1) = 1")
 
         where_sql = " AND ".join(clauses)
+        latest_filter = "WHERE rn = 1" if latest_main_only else ""
         sql = f"""
-            SELECT
-                bl.game_date,
-                bl.player_id,
-                p.name as player_name,
-                p.team,
-                bl.book,
-                bl.stat_type,
-                bl.line_value,
-                bl.over_odds,
-                bl.under_odds
-            FROM betting_lines bl
-            JOIN players p
-              ON p.player_id = bl.player_id
-            WHERE {where_sql}
-            ORDER BY p.team, p.name, bl.stat_type, bl.book, bl.line_value
+            WITH ranked AS (
+                SELECT
+                    bl.game_date,
+                    bl.player_id,
+                    p.name as player_name,
+                    p.team,
+                    bl.book,
+                    bl.stat_type,
+                    bl.line_value,
+                    bl.over_odds,
+                    bl.under_odds,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY bl.player_id, lower(bl.book),
+                                     lower(bl.stat_type)
+                        ORDER BY bl.scraped_at DESC, bl.line_id DESC
+                    ) AS rn
+                FROM betting_lines bl
+                JOIN players p
+                  ON p.player_id = bl.player_id
+                WHERE {where_sql}
+            )
+            SELECT game_date, player_id, player_name, team, book, stat_type,
+                   line_value, over_odds, under_odds
+            FROM ranked {latest_filter}
+            ORDER BY team, player_name, stat_type, book, line_value
         """
 
         df = pd.read_sql_query(sql, db.conn, params=params)
@@ -352,9 +372,20 @@ def _build_board_lines(
         implied_over_prob = american_to_implied_prob(over_odds) if over_odds is not None else None
         implied_under_prob = american_to_implied_prob(under_odds) if under_odds is not None else None
 
-        ev_over = expected_value(prob_over, over_odds) if over_odds is not None else None
-        prob_under = max(0.0, 1.0 - prob_over)
-        ev_under = expected_value(prob_under, under_odds) if under_odds is not None else None
+        # Discrete families (rebounds -> poisson) put mass ON an integer line:
+        # that push is neither an over nor an under win.
+        prob_push = prob_push_distribution(
+            line_value, mu, sigma, distribution, sample_size=int(rolling_window),
+        )
+        ev_over = (
+            expected_value(prob_over, over_odds, push_prob=prob_push)
+            if over_odds is not None else None
+        )
+        prob_under = max(0.0, 1.0 - prob_over - prob_push)
+        ev_under = (
+            expected_value(prob_under, under_odds, push_prob=prob_push)
+            if under_odds is not None else None
+        )
 
         lines.append(
             BoardLine(

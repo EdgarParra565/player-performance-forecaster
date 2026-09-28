@@ -1,665 +1,338 @@
-import { useEffect, useMemo, useRef, useState } from "react";
-import { useParams, useSearchParams } from "react-router-dom";
-import type { EChartsOption } from "echarts";
-import {
-  useMeta,
-  usePlayerDetail,
-  usePlayerSearch,
-} from "../api/hooks";
-import type { BookLineRow, PlayerDetail as PlayerDetailData } from "../api/types";
+import { useEffect, useMemo } from "react";
+import { useNavigate, useParams, useSearchParams } from "react-router-dom";
+import { useMeta, usePlayerDetail, usePlayerSearch } from "../api/hooks";
+import type { BookLineRow } from "../api/types";
 import { StatCard } from "../components/StatCard";
 import { EChart } from "../components/EChart";
 import { LineMovementPanel } from "../components/LineMovementPanel";
 import { DataTable, type Column } from "../components/DataTable";
 import { EmptyState } from "../components/EmptyState";
-import { Loading, ErrorState } from "../components/Loading";
-import { Delta } from "../components/Delta";
+import { ErrorState, errorMessage } from "../components/Loading";
+import { ChartSkeleton, KpiRowSkeleton } from "../components/Skeleton";
+import { Card, KpiGrid, Page } from "../components/Page";
+import { Delta, SideTag } from "../components/Delta";
 import { ProbabilityBar } from "../components/ProbabilityBar";
 import { OddsBadge } from "../components/OddsBadge";
-import { CHART, axis, gridTight, tooltipStyle } from "../components/chartBase";
-import {
-  fmtAgo,
-  fmtNum,
-  fmtPct,
-  fmtSigned,
-  fmtSignedPct,
-  statLabel,
-} from "../lib/format";
+import { NumberField, Segmented } from "../components/controls";
+import { PlayerPicker } from "../components/PlayerPicker";
+import { StarButton } from "../components/StarButton";
+import { distributionOption, hitRateOption, performanceOption } from "../charts/playerCharts";
+import { DASH, fmtAgo, fmtEv, fmtInt, fmtLine, fmtNum, fmtPct, fmtSignedPct, statLabel } from "../lib/format";
+import { clampInt, nameKey } from "../lib/rows";
 
-interface Selected {
-  id: number;
-  name: string;
+// --- Per-book line table ----------------------------------------------------
+
+const BOOK_COLUMNS: Column<BookLineRow>[] = [
+  {
+    key: "book",
+    header: "Book",
+    render: (r) => <span className="font-medium text-fg">{r.book}</span>,
+    sortable: true,
+    sortValue: (r) => r.book,
+  },
+  {
+    key: "line",
+    header: "Line",
+    align: "right",
+    render: (r) => <span className="tnum text-fg">{fmtLine(r.line)}</span>,
+    sortable: true,
+    sortValue: (r) => r.line,
+  },
+  {
+    key: "odds",
+    header: "Over / Under",
+    align: "right",
+    render: (r) => (
+      <span className="inline-flex gap-1">
+        <OddsBadge odds={r.over_odds} dfs={r.is_dfs} />
+        <OddsBadge odds={r.under_odds} dfs={r.is_dfs} />
+      </span>
+    ),
+  },
+  {
+    key: "p_over",
+    header: "P(over)",
+    align: "right",
+    width: "150px",
+    render: (r) => <ProbabilityBar value={r.p_over} marker={r.breakeven} />,
+    sortable: true,
+    sortValue: (r) => r.p_over,
+  },
+  {
+    key: "hit",
+    header: "Hit rate",
+    align: "right",
+    render: (r) => <span className="tnum text-muted">{fmtPct(r.hit_rate)}</span>,
+    sortable: true,
+    sortValue: (r) => r.hit_rate,
+  },
+  { key: "side", header: "Best side", render: (r) => <SideTag side={r.best_side} /> },
+  {
+    key: "edge",
+    header: "Edge",
+    align: "right",
+    render: (r) => <Delta value={r.model_edge} format={fmtSignedPct} strong />,
+    sortable: true,
+    sortValue: (r) => r.model_edge,
+  },
+  {
+    // EV of the SAME side the edge refers to (EV-over next to a best-side
+    // edge read as contradictory green/red).
+    key: "ev",
+    header: "EV / unit",
+    align: "right",
+    render: (r) => <Delta value={bestSideEv(r)} format={fmtEv} />,
+    sortable: true,
+    sortValue: (r) => bestSideEv(r),
+  },
+];
+
+function bestSideEv(r: BookLineRow): number | null {
+  return r.best_side === "under" ? r.ev_under : r.ev_over;
 }
 
-// --- Player search picker -------------------------------------------------
+// --- Name deep-link resolution ---------------------------------------------
 
-function PlayerPicker({
-  selected,
-  onSelect,
-}: {
-  selected: Selected | null;
-  onSelect: (s: Selected) => void;
-}) {
-  const [query, setQuery] = useState("");
-  const [open, setOpen] = useState(false);
-  const boxRef = useRef<HTMLDivElement>(null);
-  const { data, isFetching } = usePlayerSearch(query);
+// `/player?name=X` (from edge / cross-book rows) resolves ONLY on an exact
+// (accent/case-insensitive) name match — a fuzzy rows[0] fallback silently
+// loaded a different player's EV.
+function NameResolver({ name, stat }: { name: string; stat: string }) {
+  const navigate = useNavigate();
+  const { data, isLoading, isError, error } = usePlayerSearch(name);
+  const rows = useMemo(() => data?.rows ?? [], [data]);
+  const exact = rows.find((r) => nameKey(r.player_name) === nameKey(name));
 
   useEffect(() => {
-    function onClick(e: MouseEvent) {
-      if (boxRef.current && !boxRef.current.contains(e.target as Node)) {
-        setOpen(false);
-      }
-    }
-    document.addEventListener("mousedown", onClick);
-    return () => document.removeEventListener("mousedown", onClick);
-  }, []);
+    if (exact) navigate(`/player/${exact.player_id}?stat=${encodeURIComponent(stat)}`, { replace: true });
+  }, [exact, navigate, stat]);
 
-  const rows = data?.rows ?? [];
-
+  if (isLoading || exact) return <KpiGrid cols={6}><KpiRowSkeleton count={6} /></KpiGrid>;
+  if (isError) return <ErrorState message={errorMessage(error, "Player lookup failed.")} />;
   return (
-    <div ref={boxRef} className="relative w-72">
-      <input
-        value={query}
-        onChange={(e) => {
-          setQuery(e.target.value);
-          setOpen(true);
-        }}
-        onFocus={() => setOpen(true)}
-        placeholder={selected ? selected.name : "Search players…"}
-        className="tnum w-full rounded border border-line bg-panel-2 px-3 py-1.5 text-sm text-fg placeholder:text-faint focus:border-line-strong focus:outline-none"
+    <Card>
+      <EmptyState
+        title={`No exact match for “${name}”.`}
+        hint={rows.length ? "Did you mean one of these?" : "Search for the player above."}
       />
-      {open && (query.length > 0 || rows.length > 0) && (
-        <div className="panel absolute z-30 mt-1 max-h-80 w-full overflow-auto p-1">
-          {isFetching && !rows.length && (
-            <div className="px-3 py-2 text-xs text-faint">Searching…</div>
-          )}
-          {!isFetching && !rows.length && (
-            <div className="px-3 py-2 text-xs text-faint">No matches.</div>
-          )}
-          {rows.map((r) => (
+      {rows.length > 0 && (
+        <div className="flex flex-wrap justify-center gap-2 pb-6">
+          {rows.slice(0, 8).map((r) => (
             <button
+              type="button"
               key={r.player_id}
-              onClick={() => {
-                onSelect({ id: r.player_id, name: r.player_name });
-                setQuery("");
-                setOpen(false);
-              }}
-              className="flex w-full items-center justify-between rounded px-3 py-1.5 text-left text-sm text-muted hover:bg-panel-3 hover:text-fg"
+              onClick={() => navigate(`/player/${r.player_id}?stat=${encodeURIComponent(stat)}`)}
+              className="h-8 rounded-full border border-line bg-surface-2 px-3 text-label text-muted hover:border-line-strong hover:text-fg pointer-coarse:h-11"
             >
-              <span>
-                {r.player_name}
-                {r.team && (
-                  <span className="tnum ml-2 text-[11px] text-faint">
-                    {r.team}
-                  </span>
-                )}
-              </span>
-              {r.n_books > 0 && (
-                <span className="tnum text-[11px] text-pos">
-                  {r.n_books}b
-                </span>
-              )}
+              {r.player_name}
+              {r.team && <span className="tnum ml-2 text-faint">{r.team}</span>}
             </button>
           ))}
         </div>
       )}
-    </div>
+    </Card>
   );
 }
 
-// --- Charts ---------------------------------------------------------------
+// --- View -------------------------------------------------------------------
 
-function PerformanceChart({ d }: { d: PlayerDetailData }) {
-  const consensus = d.kpis.market_consensus_line;
-  const dates = d.series.map((p) =>
-    p.game_date ? p.game_date.slice(5, 10) : "",
-  );
-  const values = d.series.map((p) => p.value);
-  const rolling = d.series.map((p) => p.rolling_mean);
-
-  const option: EChartsOption = {
-    grid: { ...gridTight, top: 20 },
-    tooltip: {
-      trigger: "axis",
-      ...tooltipStyle,
-      formatter: (params: unknown) => {
-        const arr = params as Array<{ dataIndex: number }>;
-        const i = arr[0]?.dataIndex ?? 0;
-        const p = d.series[i];
-        const opp = p.opponent ? ` vs ${p.opponent}` : "";
-        return `${p.game_date?.slice(0, 10) ?? ""}${opp}<br/>${statLabel(
-          d.stat_type,
-        )} <b>${fmtNum(p.value, 0)}</b> · roll ${fmtNum(p.rolling_mean)}`;
-      },
-    },
-    xAxis: { type: "category", data: dates, boundaryGap: true, ...axis() },
-    yAxis: { type: "value", scale: true, ...axis() },
-    series: [
-      {
-        name: "value",
-        type: "bar",
-        data: values.map((v) => ({
-          value: v,
-          itemStyle: {
-            color:
-              consensus != null
-                ? v >= consensus
-                  ? CHART.pos
-                  : CHART.neg
-                : CHART.info,
-            opacity: 0.55,
-          },
-        })),
-        barWidth: "62%",
-      },
-      {
-        name: "rolling",
-        type: "line",
-        data: rolling,
-        smooth: true,
-        showSymbol: false,
-        lineStyle: { color: CHART.warn, width: 1.75 },
-        z: 3,
-        ...(consensus != null
-          ? {
-              markLine: {
-                symbol: "none",
-                label: {
-                  position: "insideStartTop",
-                  color: CHART.muted,
-                  fontFamily: CHART.fontMono,
-                  fontSize: 10,
-                  formatter: `book mean ${fmtNum(consensus)}`,
-                },
-                lineStyle: { color: CHART.muted, type: "dashed", width: 1 },
-                data: [{ yAxis: consensus }],
-              },
-            }
-          : {}),
-      },
-    ],
-  };
-  return <EChart option={option} height={280} />;
+function parsePlayerId(raw: string | undefined): number | null {
+  if (!raw || !/^\d+$/.test(raw)) return null;
+  const n = Number(raw);
+  return n >= 1 && n <= 2 ** 31 - 1 ? n : null;
 }
-
-function DistributionChart({ d }: { d: PlayerDetailData }) {
-  const bars = d.histogram.map((b) => [(b.x0 + b.x1) / 2, b.count]);
-  const fitted = d.fitted.map((p) => [p.x, p.y]);
-  const consensus = d.kpis.market_consensus_line;
-
-  const bookMarks = d.book_lines
-    .filter((b) => b.line != null)
-    .map((b) => ({
-      xAxis: b.line as number,
-      lineStyle: { color: CHART.info, type: "dotted" as const, width: 1 },
-      label: {
-        show: false as const,
-      },
-    }));
-
-  const option: EChartsOption = {
-    grid: { ...gridTight, top: 20 },
-    tooltip: {
-      trigger: "axis",
-      axisPointer: { type: "shadow" },
-      ...tooltipStyle,
-    },
-    xAxis: { type: "value", scale: true, ...axis({ name: statLabel(d.stat_type) }) },
-    yAxis: { type: "value", ...axis({ name: "games" }) },
-    series: [
-      {
-        name: "count",
-        type: "bar",
-        data: bars,
-        itemStyle: { color: CHART.lineStrong },
-        barWidth: "96%",
-        markLine: bookMarks.length
-          ? {
-              symbol: "none",
-              data: [
-                ...bookMarks,
-                ...(consensus != null
-                  ? [
-                      {
-                        xAxis: consensus,
-                        lineStyle: {
-                          color: CHART.warn,
-                          type: "dashed" as const,
-                          width: 1.25,
-                        },
-                        label: {
-                          show: true,
-                          color: CHART.warn,
-                          fontFamily: CHART.fontMono,
-                          fontSize: 10,
-                          formatter: "mean",
-                        },
-                      },
-                    ]
-                  : []),
-              ],
-            }
-          : undefined,
-      },
-      {
-        name: "fitted normal",
-        type: "line",
-        data: fitted,
-        smooth: true,
-        showSymbol: false,
-        lineStyle: { color: CHART.pos, width: 2 },
-        areaStyle: { color: CHART.pos, opacity: 0.06 },
-        z: 3,
-      },
-    ],
-  };
-  return <EChart option={option} height={260} />;
-}
-
-function HitRateChart({ books }: { books: BookLineRow[] }) {
-  const withLines = books.filter((b) => b.hit_rate != null);
-  if (!withLines.length) {
-    return <EmptyState compact title="No book lines to compare." />;
-  }
-  const names = withLines.map((b) => b.book);
-  const rates = withLines.map((b) => b.hit_rate as number);
-  const option: EChartsOption = {
-    grid: { left: 78, right: 40, top: 8, bottom: 24 },
-    tooltip: {
-      ...tooltipStyle,
-      formatter: (p: unknown) => {
-        const item = p as { name: string; value: number };
-        return `${item.name}<br/>over rate <b>${fmtPct(item.value)}</b>`;
-      },
-    },
-    xAxis: {
-      type: "value",
-      min: 0,
-      max: 1,
-      ...axis(),
-      axisLabel: {
-        color: CHART.muted,
-        fontFamily: CHART.fontMono,
-        fontSize: 10,
-        formatter: (v: number) => `${Math.round(v * 100)}%`,
-      },
-    },
-    yAxis: {
-      type: "category",
-      data: names,
-      ...axis(),
-      axisLabel: { color: CHART.muted, fontSize: 10 },
-    },
-    series: [
-      {
-        type: "bar",
-        data: rates.map((v) => ({
-          value: v,
-          itemStyle: { color: v >= 0.5 ? CHART.pos : CHART.neg, opacity: 0.7 },
-        })),
-        barWidth: "58%",
-        markLine: {
-          symbol: "none",
-          data: [{ xAxis: 0.5 }],
-          lineStyle: { color: CHART.muted, type: "dashed", width: 1 },
-          label: { show: false },
-        },
-      },
-    ],
-  };
-  return <EChart option={option} height={Math.max(120, names.length * 34)} />;
-}
-
-// --- Per-book line table --------------------------------------------------
-
-function BookLinesTable({ books }: { books: BookLineRow[] }) {
-  if (!books.length) {
-    return (
-      <EmptyState
-        compact
-        title="No book lines for this stat."
-        hint="Scraped prop lines appear here once the books post this player+stat."
-      />
-    );
-  }
-  const columns: Column<BookLineRow>[] = [
-    {
-      key: "book",
-      header: "Book",
-      render: (r) => <span className="text-fg">{r.book}</span>,
-      sortable: true,
-      sortValue: (r) => r.book,
-    },
-    {
-      key: "line",
-      header: "Line",
-      align: "right",
-      render: (r) => <span className="tnum">{fmtNum(r.line)}</span>,
-      sortable: true,
-      sortValue: (r) => r.line,
-    },
-    {
-      key: "odds",
-      header: "O / U",
-      align: "right",
-      render: (r) => (
-        <span className="inline-flex gap-1">
-          <OddsBadge odds={r.over_odds} dfs={r.is_dfs} />
-          <OddsBadge odds={r.under_odds} dfs={r.is_dfs} />
-        </span>
-      ),
-    },
-    {
-      key: "p_over",
-      header: "P(over)",
-      align: "right",
-      render: (r) => (
-        <div className="w-28">
-          <ProbabilityBar value={r.p_over} marker={r.breakeven} />
-        </div>
-      ),
-      sortable: true,
-      sortValue: (r) => r.p_over,
-    },
-    {
-      key: "hit",
-      header: "Hit%",
-      align: "right",
-      render: (r) => <span className="tnum text-muted">{fmtPct(r.hit_rate, 0)}</span>,
-      sortable: true,
-      sortValue: (r) => r.hit_rate,
-    },
-    {
-      key: "edge",
-      header: "Edge",
-      align: "right",
-      render: (r) => <Delta value={r.model_edge} format={fmtSignedPct} strong />,
-      sortable: true,
-      sortValue: (r) => r.model_edge,
-    },
-    {
-      key: "ev",
-      header: "EV·o",
-      align: "right",
-      render: (r) => <Delta value={r.ev_over} format={fmtSigned} />,
-      sortable: true,
-      sortValue: (r) => r.ev_over,
-    },
-  ];
-  return (
-    <DataTable
-      columns={columns}
-      rows={books}
-      rowKey={(r) => r.book}
-      initialSort={{ key: "edge", dir: "desc" }}
-    />
-  );
-}
-
-// --- Controls -------------------------------------------------------------
-
-function StatSegmented({
-  stats,
-  value,
-  onChange,
-}: {
-  stats: string[];
-  value: string;
-  onChange: (s: string) => void;
-}) {
-  return (
-    <div className="flex flex-wrap gap-1 rounded border border-line bg-panel p-1">
-      {stats.map((s) => (
-        <button
-          key={s}
-          onClick={() => onChange(s)}
-          className={`tnum rounded px-2.5 py-1 text-[11px] transition-colors ${
-            s === value
-              ? "bg-panel-3 text-fg"
-              : "text-muted hover:text-fg"
-          }`}
-        >
-          {statLabel(s)}
-        </button>
-      ))}
-    </div>
-  );
-}
-
-function NumberControl({
-  label,
-  value,
-  onChange,
-  min,
-  max,
-}: {
-  label: string;
-  value: number;
-  onChange: (n: number) => void;
-  min: number;
-  max: number;
-}) {
-  return (
-    <label className="flex items-center gap-2 text-[11px] text-faint">
-      {label}
-      <input
-        type="number"
-        value={value}
-        min={min}
-        max={max}
-        onChange={(e) => {
-          const n = Number(e.target.value);
-          if (!Number.isNaN(n)) onChange(Math.min(max, Math.max(min, n)));
-        }}
-        className="tnum w-16 rounded border border-line bg-panel-2 px-2 py-1 text-fg focus:border-line-strong focus:outline-none"
-      />
-    </label>
-  );
-}
-
-// --- View -----------------------------------------------------------------
 
 export function PlayerDetail() {
-  const routeParams = useParams();
-  const [search] = useSearchParams();
+  const navigate = useNavigate();
+  const params = useParams();
+  const [search, setSearch] = useSearchParams();
   const meta = useMeta();
 
-  const [selected, setSelected] = useState<Selected | null>(() => {
-    const id = routeParams.playerId ? Number(routeParams.playerId) : NaN;
-    if (!Number.isNaN(id)) return { id, name: search.get("name") ?? "" };
-    return null;
-  });
-  const [stat, setStat] = useState(search.get("stat") ?? "points");
-  const [nGames, setNGames] = useState(25);
-  const [rollingWindow, setRollingWindow] = useState(5);
-
-  // Deep-link by name (from the dashboard's edge table): resolve to an id.
+  // URL is the source of truth: back/forward and shared links just work.
+  const playerId = parsePlayerId(params.playerId);
+  const stat = search.get("stat") ?? "points";
   const nameParam = search.get("name");
-  const nameSearch = usePlayerSearch(nameParam ?? "");
-  useEffect(() => {
-    if (selected || !nameParam) return;
-    const rows = nameSearch.data?.rows ?? [];
-    const match =
-      rows.find(
-        (r) => r.player_name.toLowerCase() === nameParam.toLowerCase(),
-      ) ?? rows[0];
-    if (match) setSelected({ id: match.player_id, name: match.player_name });
-  }, [nameParam, nameSearch.data, selected]);
+  const nGames = clampInt(search.get("n"), 3, 200, 25);
+  const rollingWindow = clampInt(search.get("roll"), 1, 60, 5);
+
+  function setParam(key: string, value: string) {
+    setSearch(
+      (prev) => {
+        const next = new URLSearchParams(prev);
+        next.set(key, value);
+        return next;
+      },
+      { replace: true },
+    );
+  }
+  const setStat = (s: string) => setParam("stat", s);
+  const setNGames = (n: number) => setParam("n", String(n));
+  const setRollingWindow = (n: number) => setParam("roll", String(n));
 
   const detail = usePlayerDetail(
-    selected
-      ? {
-          playerId: selected.id,
-          name: selected.name || undefined,
-          stat,
-          n_games: nGames,
-          rolling_window: rollingWindow,
-        }
-      : null,
+    playerId !== null ? { playerId, stat, n_games: nGames, rolling_window: rollingWindow } : null,
   );
-
-  const stats = useMemo(() => meta.data?.stats ?? ["points"], [meta.data]);
   const d = detail.data;
 
-  return (
-    <div className="space-y-5">
-      <div className="flex flex-wrap items-end justify-between gap-4">
-        <div>
-          <h1 className="text-lg font-semibold text-fg">
-            {d ? d.player_name : selected?.name || "Player Detail"}
-          </h1>
-          <p className="mt-0.5 text-xs text-faint">
-            Recent form, distribution, and per-book pricing.
-          </p>
-        </div>
-        <PlayerPicker selected={selected} onSelect={setSelected} />
-      </div>
+  const stats = useMemo(() => meta.data?.stats ?? ["points"], [meta.data]);
+  const statOptions = stats.map((s) => ({ key: s, label: statLabel(s) }));
 
-      {!selected && (
-        <div className="panel">
+  const perf = useMemo(() => (d && d.n_games ? performanceOption(d) : null), [d]);
+  const dist = useMemo(() => (d && d.n_games ? distributionOption(d) : null), [d]);
+  const hit = useMemo(
+    () => (d && d.book_lines.some((b) => b.hit_rate != null) ? hitRateOption(d.book_lines) : null),
+    [d],
+  );
+  const stale = detail.isPlaceholderData;
+
+  return (
+    <Page
+      eyebrow={d ? `Player · ${statLabel(d.stat_type)}` : "Player"}
+      title={
+        d ? (
+          <span className="inline-flex items-center gap-2">
+            {d.player_name}
+            <StarButton size="md" item={{ kind: "player", player_name: d.player_name, player_id: d.player_id }} />
+          </span>
+        ) : (
+          nameParam || "Player Detail"
+        )
+      }
+      description="Recent form, distribution, and per-book pricing."
+      actions={
+        <PlayerPicker
+          onSelect={(r) =>
+            navigate(`/player/${r.player_id}?stat=${encodeURIComponent(stat)}&n=${nGames}&roll=${rollingWindow}`)
+          }
+        />
+      }
+    >
+      {playerId === null && nameParam && <NameResolver name={nameParam} stat={stat} />}
+
+      {playerId === null && !nameParam && (
+        <Card>
           <EmptyState
             title="Search for a player to begin."
-            hint="Type a name above. The flagship view charts recent-N performance with a rolling mean and book-line overlay, a fitted distribution, and every book's P(over) / EV."
+            hint="Charts recent-N performance with a rolling mean and book-line overlay, a fitted distribution, and every book's P(over) / EV."
           />
-        </div>
+        </Card>
       )}
 
-      {selected && detail.isError && (
-        <ErrorState message="Failed to load player detail." />
-      )}
-
-      {selected && detail.isLoading && !d && <Loading rows={8} />}
-
-      {selected && d && (
+      {playerId !== null && (
         <>
-          <div className="flex flex-wrap items-center justify-between gap-3">
-            <StatSegmented stats={stats} value={stat} onChange={setStat} />
+          <div className="flex flex-wrap items-center justify-between gap-4">
+            <div className="flex items-center gap-2">
+              <Segmented label="Stat" options={statOptions} value={stat} onChange={setStat} />
+              {d && (
+                <StarButton
+                  size="md"
+                  item={{ kind: "prop", player_name: d.player_name, player_id: d.player_id, stat: d.stat_type }}
+                />
+              )}
+            </div>
             <div className="flex items-center gap-4">
-              <NumberControl
-                label="games"
-                value={nGames}
-                onChange={setNGames}
-                min={1}
-                max={200}
-              />
-              <NumberControl
-                label="roll"
-                value={rollingWindow}
-                onChange={setRollingWindow}
-                min={1}
-                max={60}
-              />
+              <NumberField label="Games" value={nGames} onChange={setNGames} min={3} max={200} />
+              <NumberField label="Rolling" value={rollingWindow} onChange={setRollingWindow} min={1} max={60} />
             </div>
           </div>
 
-          {d.n_games === 0 ? (
-            <div className="panel">
+          {detail.isError && <ErrorState message={errorMessage(detail.error, "Failed to load player detail.")} />}
+
+          {detail.isLoading && (
+            <>
+              <KpiGrid cols={6}>
+                <KpiRowSkeleton count={6} />
+              </KpiGrid>
+              <div className="panel">
+                <ChartSkeleton height={280} />
+              </div>
+            </>
+          )}
+
+          {d && d.n_games === 0 && (
+            <Card>
               <EmptyState
-                title="No game logs for this player+stat."
+                title="No game logs for this player + stat."
                 hint="Pick another stat or player; this combination has no history in the DB yet."
               />
-            </div>
-          ) : (
-            <>
-              <div className="grid grid-cols-2 gap-3 lg:grid-cols-6">
-                <StatCard
-                  label={`${statLabel(stat)} mean`}
-                  value={fmtNum(d.kpis.mu)}
-                  sub={`last ${d.n_games} games`}
-                />
+            </Card>
+          )}
+
+          {d && d.n_games > 0 && (
+            <div className={`space-y-6 transition-opacity ${stale ? "opacity-60" : ""}`} aria-busy={stale}>
+              <KpiGrid cols={6}>
+                <StatCard label={`${statLabel(d.stat_type)} mean`} value={fmtNum(d.kpis.mu)} sub={`last ${d.n_games} games`} />
                 <StatCard label="Std dev" value={fmtNum(d.kpis.sigma)} sub="σ" />
-                <StatCard
-                  label="Book mean"
-                  value={fmtNum(d.kpis.market_consensus_line)}
-                  sub="consensus line"
-                />
-                <StatCard
-                  label="Books"
-                  value={d.kpis.n_books}
-                  sub="posting a line"
-                />
+                <StatCard label="Book mean" value={fmtLine(d.kpis.market_consensus_line)} sub="consensus line" />
+                <StatCard label="Books" value={fmtInt(d.kpis.n_books)} sub="posting a line" />
                 <StatCard
                   label="+EV sides"
-                  value={d.kpis.positive_ev_sides}
+                  value={fmtInt(d.kpis.positive_ev_sides)}
                   tone={d.kpis.positive_ev_sides > 0 ? "pos" : "default"}
                   accent={d.kpis.positive_ev_sides > 0}
                   sub="model vs price"
                 />
                 <StatCard
                   label="Lines age"
-                  value={
-                    d.last_line_scraped_utc
-                      ? fmtAgo(d.last_line_scraped_utc)
-                      : "—"
-                  }
+                  value={d.last_line_scraped_utc ? fmtAgo(d.last_line_scraped_utc) : DASH}
                   sub="freshest book"
                 />
+              </KpiGrid>
+
+              <Card title={`Last ${d.n_games} games`} meta={`rolling mean · ${d.rolling_window}-game window`}>
+                {perf && (
+                  <EChart
+                    option={perf}
+                    height={300}
+                    ariaLabel={`${d.player_name} ${statLabel(d.stat_type)} over the last ${d.n_games} games`}
+                  />
+                )}
+              </Card>
+
+              <Card title="Per-book lines" meta="P(over) vs break-even · edge & EV on the best side" flush>
+                {d.book_lines.length ? (
+                  <DataTable
+                    columns={BOOK_COLUMNS}
+                    rows={d.book_lines}
+                    rowKey={(r) => `${r.book}-${r.line}`}
+                    initialSort={{ key: "edge", dir: "desc" }}
+                  />
+                ) : (
+                  <EmptyState
+                    compact
+                    title="No book lines for this stat."
+                    hint="Scraped prop lines appear here once the books post this player + stat."
+                  />
+                )}
+              </Card>
+
+              <div className="grid grid-cols-1 gap-6 xl:grid-cols-2">
+                <Card title="Distribution" meta="fitted normal · dotted = book lines">
+                  {dist && <EChart option={dist} height={300} ariaLabel="Distribution with fitted normal" />}
+                </Card>
+                <Card title="Over-rate vs each book line" meta="dashed = 50%">
+                  {hit ? (
+                    <EChart option={hit} height={300} ariaLabel="Over rate per book" />
+                  ) : (
+                    <EmptyState compact title="No book lines to compare." />
+                  )}
+                </Card>
               </div>
 
-              <section className="panel">
-                <div className="border-b border-line px-4 py-2.5">
-                  <h2 className="eyebrow">
-                    Recent {d.n_games} · {statLabel(stat)} with rolling mean
-                  </h2>
-                </div>
-                <div className="px-2 py-2">
-                  <PerformanceChart d={d} />
-                </div>
-              </section>
-
-              <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
-                <section className="panel">
-                  <div className="border-b border-line px-4 py-2.5">
-                    <h2 className="eyebrow">
-                      Distribution · fitted normal + book lines
-                    </h2>
-                  </div>
-                  <div className="px-2 py-2">
-                    <DistributionChart d={d} />
-                  </div>
-                </section>
-
-                <section className="panel">
-                  <div className="border-b border-line px-4 py-2.5">
-                    <h2 className="eyebrow">Per-book lines · P(over) / EV</h2>
-                  </div>
-                  <BookLinesTable books={d.book_lines} />
-                </section>
-              </div>
-
-              <section className="panel">
-                <div className="border-b border-line px-4 py-2.5">
-                  <h2 className="eyebrow">
-                    Historical over-rate vs each book line
-                  </h2>
-                </div>
-                <div className="px-2 py-3">
-                  <HitRateChart books={d.book_lines} />
-                </div>
-              </section>
-
-              <section className="panel">
-                <div className="flex items-center justify-between border-b border-line px-4 py-2.5">
-                  <h2 className="eyebrow">Line movement · snapshot replay</h2>
-                  <span className="text-[11px] text-faint">
-                    per-book drift · ▶ to animate
-                  </span>
-                </div>
-                <LineMovementPanel playerId={selected.id} stat={stat} />
-              </section>
+              <Card title="Line movement" meta="snapshot replay · per-book drift" flush>
+                <LineMovementPanel key={`${playerId}-${stat}`} playerId={playerId} stat={stat} />
+              </Card>
 
               {d.notes.length > 0 && (
-                <div className="text-[11px] text-faint">
+                <ul className="space-y-1 text-label text-faint">
                   {d.notes.map((n, i) => (
-                    <div key={i}>· {n}</div>
+                    <li key={i}>{n}</li>
                   ))}
-                </div>
+                </ul>
               )}
-            </>
+            </div>
           )}
         </>
       )}
-    </div>
+    </Page>
   );
 }

@@ -62,6 +62,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 # desktop UI are deliberately excluded - they aren't reachable from the web
 # routes and just inflate the image.
 COPY nba_model ./nba_model
+# app.py imports the top-level `sports` registry (`from sports import ...`).
+COPY sports ./sports
 COPY setup.py ./
 
 # Optional default data dir; real data is meant to be volume-mounted on top

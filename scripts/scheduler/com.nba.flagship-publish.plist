@@ -1,0 +1,68 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+    launchd plist: push the DB snapshot to the deployed flagship
+    (docs/DEPLOYMENT.md §16). Runs `publish_db.sh --to-object-store --skip-git`,
+    which snapshots + validates + uploads, then repoints latest.json. The app
+    polls every DB_SYNC_INTERVAL_SECONDS and swaps the file in atomically.
+
+    Cadence: minute :45 of every hour, 40 minutes after the hourly ETL
+    (com.nba.hourly fires at :05). Cheap when idle: an unchanged DB uploads
+    nothing, and a DB still being written (ETL overran) exits 3 and retries
+    next hour. For a nightly-only refresh, add <key>Hour</key><integer>4</integer>
+    to StartCalendarInterval.
+
+    Credentials: ~/.config/nba-flagship/storage.env (chmod 600), sourced by
+    publish_db.sh. See DEPLOYMENT.md §16 "Mac-side credentials".
+
+    Install (per-user):
+        cp scripts/scheduler/com.nba.flagship-publish.plist ~/Library/LaunchAgents/
+        # replace ABSOLUTE_PATH_TO_REPO with `pwd` of this checkout
+        launchctl unload -w ~/Library/LaunchAgents/com.nba.flagship-publish.plist 2>/dev/null
+        launchctl load   -w ~/Library/LaunchAgents/com.nba.flagship-publish.plist
+    Inspect:
+        launchctl list | grep com.nba.flagship-publish
+        tail -f nba_model/data/logs/flagship_publish.log
+    Stop:
+        launchctl unload -w ~/Library/LaunchAgents/com.nba.flagship-publish.plist
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.nba.flagship-publish</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/ABSOLUTE_PATH_TO_REPO/scripts/publish_db.sh</string>
+        <string>--to-object-store</string>
+        <string>--skip-git</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/ABSOLUTE_PATH_TO_REPO</string>
+
+    <!-- Wall-clock calendar fire (not StartInterval, which only counts awake
+         time on a sleeping Mac). A fire missed during sleep runs on wake. -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Minute</key>
+        <integer>45</integer>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <false/>
+    <key>KeepAlive</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>/ABSOLUTE_PATH_TO_REPO/nba_model/data/logs/flagship_publish.log</string>
+    <key>StandardErrorPath</key>
+    <string>/ABSOLUTE_PATH_TO_REPO/nba_model/data/logs/flagship_publish.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+</dict>
+</plist>

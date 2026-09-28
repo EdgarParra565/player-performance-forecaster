@@ -112,7 +112,7 @@ def run_batch_backtest(
         """
         params = [start_date, end_date, *stat_types]
         if market_book:
-            query += " AND book = ?"
+            query += " AND lower(book) = lower(?)"
             params.append(market_book)
         with DatabaseManager() as db:
             matching_lines = db.conn.execute(query, params).fetchone()[0]
@@ -192,7 +192,8 @@ def run_batch_backtest(
                         continue
 
                     wins = int(metrics.get("wins", 0))
-                    bets = int(metrics.get("bets_made", 0))
+                    # Graded bets only: pushes are neither wins nor losses.
+                    bets = wins + int(metrics.get("losses", 0))
                     sig = win_rate_significance_summary(
                         wins=wins,
                         bets=bets,

@@ -66,15 +66,13 @@ def trial_active(created_at, now=None, trial_days: int = TRIAL_DAYS) -> bool:
         now = now.replace(tzinfo=timezone.utc)
     return now < start + timedelta(days=int(trial_days))
 
-# Players + teams a NOT-logged-in or free-tier user is allowed to view in
-# preview mode. Keep this short and high-profile so the app is still useful
+# Players a NOT-logged-in or free-tier user is allowed to view in preview
+# mode. (Team charts are a free surface for everyone; the old team/stat gate
+# helpers were never wired up and were removed in the open-access pass.) Keep this short and high-profile so the app is still useful
 # as a teaser without giving away the marquee. Only used when BILLING_ENABLED.
 PREVIEW_PLAYERS: tuple[str, ...] = (
     "Nikola Jokic",
     "LeBron James",
-)
-PREVIEW_TEAMS: tuple[str, ...] = (
-    "LAL", "DEN",
 )
 PREVIEW_STATS: tuple[str, ...] = ("points",)
 PREVIEW_MAX_GAMES = 5
@@ -107,35 +105,130 @@ def is_authenticated() -> bool:
     return bool(getattr(user, "is_logged_in", False))
 
 
-def _admin_emails() -> set[str]:
-    """Emails listed in [auth.admins] of secrets.toml are forced to premium."""
+def _auth_secrets() -> dict:
     try:
-        emails = st.secrets.get("auth", {}).get("admins", [])
+        section = st.secrets.get("auth", {})
     except (AttributeError, FileNotFoundError):
-        emails = []
+        return {}
+    return section or {}
+
+
+def _admin_emails() -> set[str]:
+    """Emails listed in [auth].admins of secrets.toml (legacy allowlist).
+
+    SECURITY: only honoured when the signed-in identity's email is VERIFIED
+    (see ``_verified_email``). Prefer ``[auth].admin_identities``.
+    """
+    emails = _auth_secrets().get("admins", []) or []
     return {str(e).strip().lower() for e in emails if e}
 
 
-def is_admin() -> bool:
-    """True if the current user's email is in the admins allowlist.
+def _admin_identities() -> set[tuple[str, str]]:
+    """(issuer, subject) pairs from ``[auth].admin_identities``.
 
-    Used to gate developer-only UI surfaces (e.g. the DB path override) so a
-    free-tier visitor can't aim the app at an arbitrary SQLite file.
+    Each entry is either an inline table ``{ iss = "...", sub = "..." }`` or a
+    ``"<iss>|<sub>"`` string. ``iss`` + ``sub`` together are the only OIDC
+    claims that are globally unique and not user-editable, so this is the
+    preferred way to bind admin rights to a person.
+    """
+    out: set[tuple[str, str]] = set()
+    for entry in _auth_secrets().get("admin_identities", []) or []:
+        iss = sub = None
+        if isinstance(entry, str) and "|" in entry:
+            iss, sub = entry.split("|", 1)
+        else:
+            try:
+                iss, sub = entry.get("iss"), entry.get("sub")
+            except AttributeError:
+                continue
+        if iss and sub:
+            out.add((str(iss).strip(), str(sub).strip()))
+    return out
+
+
+def _trusted_email_issuers() -> set[str]:
+    """Issuers whose ``email`` claim is trusted without ``email_verified``.
+
+    Microsoft Entra ID tokens carry no ``email_verified`` claim, and in the
+    multi-tenant (``/common``) configuration ANY tenant admin can set a user's
+    email to an arbitrary address (the "nOAuth" pattern). Only list a
+    single-tenant issuer you control here, e.g.
+    ``https://login.microsoftonline.com/<your-tenant-id>/v2.0``.
+    """
+    issuers = _auth_secrets().get("trusted_email_issuers", []) or []
+    return {str(i).strip().rstrip("/") for i in issuers if i}
+
+
+def _claim(user, name: str):
+    """Read an OIDC claim off ``st.user`` (attribute- or mapping-style)."""
+    val = getattr(user, name, None)
+    if val is None:
+        try:
+            val = user[name]
+        except (KeyError, TypeError, AttributeError):
+            val = None
+    return val
+
+
+def _is_true(val) -> bool:
+    return val is True or str(val).strip().lower() == "true"
+
+
+def _verified_email(user) -> Optional[str]:
+    """The signed-in user's email, ONLY if the IdP asserts it is verified.
+
+    Accepted when the token carries ``email_verified: true`` (Google) or the
+    token's issuer is explicitly listed in ``[auth].trusted_email_issuers``.
+    Otherwise returns None — an unverified email must never unlock admin,
+    premium, or a Stripe customer-portal session.
+    """
+    email = str(_claim(user, "email") or "").strip().lower()
+    if not email:
+        return None
+    if _is_true(_claim(user, "email_verified")):
+        return email
+    iss = str(_claim(user, "iss") or "").strip().rstrip("/")
+    if iss and iss in _trusted_email_issuers():
+        return email
+    return None
+
+
+def is_admin() -> bool:
+    """True if the signed-in identity is an allowlisted admin.
+
+    Used to gate developer-only UI surfaces (DB path override, Operations,
+    manual-lines saves) so a visitor can't reach them.
+
+    SECURITY: matching on the ``email`` claim alone allowed admin takeover via
+    a multi-tenant Microsoft account with an attacker-chosen email. Admin is
+    now granted only when either
+      1. the token's (``iss``, ``sub``) pair is in ``[auth].admin_identities``, or
+      2. the email is in ``[auth].admins`` AND is verified (``_verified_email``).
+    See docs/SECURITY.md → "Admin identity binding".
     """
     user = _streamlit_user()
     if user is None or not getattr(user, "is_logged_in", False):
         return False
-    email = getattr(user, "email", "") or ""
-    return str(email).strip().lower() in _admin_emails()
+    iss = str(_claim(user, "iss") or "").strip()
+    sub = str(_claim(user, "sub") or "").strip()
+    if iss and sub and (iss, sub) in _admin_identities():
+        return True
+    email = _verified_email(user)
+    return bool(email) and email in _admin_emails()
 
 
-def tier_for(email: Optional[str]) -> str:
+def tier_for(email: Optional[str], *, admin: bool = False) -> str:
     """Resolve a user's current tier.
+
+    ``email`` must be a VERIFIED email (``current_user`` passes
+    ``_verified_email``); ``admin`` is the caller's ``is_admin()`` result.
+    The admin premium override is identity-bound — it no longer keys off the
+    email string, which an attacker could claim.
 
     Order of precedence:
         0. BILLING_ENABLED is False (the launch default) -> everyone is premium
-        1. anonymous -> free
-        2. email in [auth.admins] -> premium (override for the dev/owner)
+        1. admin (identity-bound, see ``is_admin``) -> premium
+        2. anonymous / no verified email -> free
         3. ENABLE_TRIAL=1 and the email is within TRIAL_DAYS of first sign-in
            -> premium (anchors `created_at` on first call when no row exists)
         4. subscriptions table entry with active premium -> premium
@@ -143,11 +236,11 @@ def tier_for(email: Optional[str]) -> str:
     """
     if not BILLING_ENABLED:
         return TIER_PREMIUM
+    if admin:
+        return TIER_PREMIUM
     if not email:
         return TIER_FREE
     email_lower = email.strip().lower()
-    if email_lower in _admin_emails():
-        return TIER_PREMIUM
     if TRIAL_ENABLED:
         row = subscriptions.lookup(email_lower)
         if row is None:
@@ -172,13 +265,15 @@ def current_user() -> CurrentUser:
     if user is None or not getattr(user, "is_logged_in", False):
         return CurrentUser(is_authenticated=False, email=None, name=None,
                            tier=TIER_FREE)
-    email = getattr(user, "email", None)
+    # Only a verified email is trusted for tier lookup, checkout prefill and
+    # the Stripe customer portal (portal sessions are keyed by email).
+    email = _verified_email(user)
     name = getattr(user, "name", None) or email
     return CurrentUser(
         is_authenticated=True,
-        email=str(email).strip() if email else None,
+        email=email,
         name=str(name) if name else None,
-        tier=tier_for(email),
+        tier=tier_for(email, admin=is_admin()),
     )
 
 
@@ -212,6 +307,20 @@ def render_user_card(sidebar=True) -> None:
         return
     container = st.sidebar if sidebar else st
     user = current_user()
+    if user.is_authenticated and not user.email and not user.is_premium:
+        with container:
+            st.warning(
+                "Signed in, but your identity provider did not return a "
+                "verified email, so billing can't be linked to this account. "
+                "Sign in with Google, or ask the operator to trust your "
+                "organisation's tenant."
+            )
+            if hasattr(st, "logout"):
+                container.button(
+                    "Sign out", on_click=st.logout, key="logout_btn",
+                    use_container_width=True,
+                )
+        return
     if user.is_authenticated:
         with container:
             st.markdown(
@@ -293,29 +402,23 @@ def paywall(feature: str, allow_preview: bool = True) -> None:
         )
 
 
+def _name_key(name: str) -> str:
+    import unicodedata
+    folded = unicodedata.normalize("NFKD", str(name or ""))
+    return "".join(c for c in folded if not unicodedata.combining(c)).casefold().strip()
+
+
+_PREVIEW_KEYS = frozenset(_name_key(p) for p in PREVIEW_PLAYERS)
+
+
+def is_preview_player(player_name: str) -> bool:
+    """Accent/case-insensitive preview check: the DB stores "Nikola Jokić",
+    the allowlist says "Nikola Jokic" — an exact match silently dropped him."""
+    return _name_key(player_name) in _PREVIEW_KEYS
+
+
 def gate_player(player_name: str) -> bool:
     """Return True if the given player is viewable for the current user."""
     if current_user().is_premium:
         return True
-    return player_name.strip() in PREVIEW_PLAYERS
-
-
-def gate_team(team_code: str) -> bool:
-    """Return True if the given team is viewable for the current user."""
-    if current_user().is_premium:
-        return True
-    return team_code.strip().upper() in PREVIEW_TEAMS
-
-
-def cap_n_games(n: int) -> int:
-    """Cap last-N-games at the preview limit for non-premium users."""
-    if current_user().is_premium:
-        return int(n)
-    return min(int(n), PREVIEW_MAX_GAMES)
-
-
-def allowed_stats() -> tuple[str, ...]:
-    """Stat list non-premium users can pick from."""
-    if current_user().is_premium:
-        return ()  # caller substitutes the full list
-    return PREVIEW_STATS
+    return is_preview_player(player_name)

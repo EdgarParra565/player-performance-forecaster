@@ -694,6 +694,18 @@ def _run_vegasinsider_step(db_path: str) -> dict:
     return ingest_vegasinsider_odds(db_path=db_path)
 
 
+def _run_vegasinsider_mlb_props_step(db_path: str) -> dict:
+    """Ingest the freshest stored VegasInsider MLB props grid into ``mlb_prop_lines``.
+
+    Mirrors the hourly MLB VI step (same contract as ``_run_vegasinsider_step``).
+    """
+    from nba_model.data.vegasinsider_mlb_props_ingestion import (
+        ingest_vegasinsider_mlb_props,
+    )
+
+    return ingest_vegasinsider_mlb_props(db_path=db_path)
+
+
 def _run_reverse_engineering_step(
     db_path: str,
     source: str,
@@ -873,7 +885,22 @@ def run_daily_etl(
         seasons_to_pull = bulk_results_seasons or [season]
 
         def _bulk_results_step():
-            return ingest_all(seasons=seasons_to_pull, db_path=db_path)
+            result = ingest_all(seasons=seasons_to_pull, db_path=db_path)
+            # ingest_all swallows each season's exception into
+            # {"season", "error"}; surface that instead of reporting success.
+            season_rows = [
+                s for part in ("games", "player_logs")
+                for s in ((result.get(part) or {}).get("seasons") or [])
+            ]
+            errors = [s for s in season_rows if s.get("error")]
+            if season_rows and len(errors) == len(season_rows):
+                raise RuntimeError(
+                    "bulk results ingest failed for every season: "
+                    + "; ".join(f"{s['season']}: {s['error']}" for s in errors)
+                )
+            if errors:
+                result["status"] = "partial_success"
+            return result
 
         bulk_step = run_with_retry(
             step_name="bulk_results_ingest",
@@ -943,6 +970,9 @@ def run_daily_etl(
             and min_hours_between_polls > 0
             and isinstance(hours_since_recent_poll, (int, float))
             and float(hours_since_recent_poll) < min_hours_between_polls
+            # Only a SUCCESSFUL recent poll makes a re-poll redundant; after a
+            # failed one the next run must retry, not report "reused".
+            and str(recent_poll.get("last_status") or "").lower() == "success"
         )
 
         if should_skip_for_freshness:
@@ -1105,6 +1135,22 @@ def run_daily_etl(
         steps["vegasinsider_ingestion"] = run_with_retry(
             step_name="vegasinsider_ingestion",
             func=lambda: _run_vegasinsider_step(db_path=db_path),
+            retries=max(0, retries),
+            retry_delay_seconds=retry_delay_seconds,
+            retry_backoff=retry_backoff,
+        )
+
+    # VegasInsider MLB props -> mlb_prop_lines (sport-isolated table). Same
+    # gating and 0-row semantics as the NBA VI step above.
+    if not web_text_urls:
+        steps["vegasinsider_mlb_props_ingestion"] = {
+            "status": "skipped",
+            "reason": "No web text URLs provided.",
+        }
+    else:
+        steps["vegasinsider_mlb_props_ingestion"] = run_with_retry(
+            step_name="vegasinsider_mlb_props_ingestion",
+            func=lambda: _run_vegasinsider_mlb_props_step(db_path=db_path),
             retries=max(0, retries),
             retry_delay_seconds=retry_delay_seconds,
             retry_backoff=retry_backoff,

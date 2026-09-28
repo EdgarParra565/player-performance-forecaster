@@ -14,6 +14,39 @@ from scipy.stats import (
 )
 
 
+_MAX_BINOMIAL_TRIALS = 5000
+
+# Integer-support families: at an integer line these put real mass ON the
+# line (a push), so P(under) != 1 - P(over).
+DISCRETE_DISTRIBUTIONS = frozenset({
+    "poisson", "binomial", "bernoulli_trials",
+    "negative_binomial", "negativebinomial", "neg_binomial", "nbinom", "negbin",
+})
+
+
+def prob_push_distribution(
+    line: float,
+    mu: float,
+    sigma: float,
+    distribution: str = "normal",
+    sample_size: int | None = None,
+) -> float:
+    """P(X == line): the push probability for a prop at ``line``.
+
+    Non-zero only for integer-support (discrete) distributions at an integer
+    line; continuous families and half-point lines never push. Computed as
+    P(X > line - 1) - P(X > line) so it shares the exact fit (and fallbacks)
+    of ``prob_over_distribution``.
+    """
+    dist = str(distribution or "normal").strip().lower()
+    x = float(line)
+    if dist not in DISCRETE_DISTRIBUTIONS or not float(x).is_integer():
+        return 0.0
+    at_or_above = prob_over_distribution(x - 1.0, mu, sigma, dist, sample_size)
+    above = prob_over_distribution(x, mu, sigma, dist, sample_size)
+    return float(max(0.0, at_or_above - above))
+
+
 def prob_over(line: float, mu: float, sigma: float) -> float:
     """
     Closed-form probability of going over the line
@@ -72,8 +105,14 @@ def prob_over_distribution(
         if mean <= 1e-9:
             return float(1.0 if x < 0 else 0.0)
         variance = max(std * std, 1e-6)
-        p = float(np.clip(1.0 - (variance / mean), 1e-4, 0.999))
-        n_trials = int(np.clip(np.ceil(mean / p), 1, 5000))
+        p_raw = 1.0 - (variance / mean)
+        if p_raw <= max(1e-4, mean / _MAX_BINOMIAL_TRIALS):
+            # Binomial moments need var < mean, and a tiny p would need more
+            # than the trial cap (shifting the fitted mean). Fall back to the
+            # count model that fits: NB (var > mean) or Poisson (var ~ mean).
+            return prob_over_distribution(x, mean, std, "negative_binomial")
+        p = min(p_raw, 0.999)
+        n_trials = int(max(1, np.ceil(mean / p)))
         k = int(np.floor(x))
         return float(1.0 - binom.cdf(k, n=n_trials, p=p))
 

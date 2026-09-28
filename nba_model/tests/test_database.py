@@ -1,17 +1,21 @@
-"""Manual database smoke script for verifying SQLite insert/query behavior."""
+"""SQLite insert/query smoke test for DatabaseManager (temp DB only).
 
-from nba_model.data.database.db_manager import DatabaseManager
+This used to be a module-level script: pytest imported it at collection time,
+so every suite run opened the LIVE data/database/nba_data.db and inserted a
+fabricated LeBron game log (game_id 0022400001, 28/8/10 on 2024-10-22). It now
+runs against a throwaway DB; tests/conftest.py fails any test that opens the
+live DB path again.
+"""
+
+import tempfile
+import unittest
+from pathlib import Path
+
 import pandas as pd
 
-# Initialize database
-db = DatabaseManager()
+from nba_model.data.database.db_manager import DatabaseManager
 
-# Test insert player
-db.insert_player(2544, "LeBron James", "LAL", "F")
-print("✓ Player inserted")
-
-# Test insert game logs
-sample_data = pd.DataFrame({
+_SAMPLE_GAME = {
     'player_id': [2544],
     'game_id': ['0022400001'],
     'game_date': ['2024-10-22'],
@@ -37,15 +41,29 @@ sample_data = pd.DataFrame({
     'steals': [2],
     'blocks': [1],
     'turnovers': [3],
-    'plus_minus': [12]
-})
+    'plus_minus': [12],
+}
 
-db.insert_game_logs(sample_data)
-print("✓ Game log inserted")
 
-# Test query
-games = db.get_player_games(2544, n_games=5)
-print(f"✓ Retrieved {len(games)} games")
-print(games[['game_date', 'points', 'assists', 'rebounds']])
+class DatabaseSmokeTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.db_path = str(Path(self._tmp.name) / "nba.db")
 
-db.close()
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_insert_player_game_log_and_query(self):
+        db = DatabaseManager(db_path=self.db_path)
+        try:
+            db.insert_player(2544, "LeBron James", "LAL", "F")
+            db.insert_game_logs(pd.DataFrame(_SAMPLE_GAME))
+            games = db.get_player_games(2544, n_games=5)
+        finally:
+            db.close()
+        self.assertEqual(len(games), 1)
+        self.assertEqual(int(games.iloc[0]['points']), 28)
+
+
+if __name__ == "__main__":
+    unittest.main()

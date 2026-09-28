@@ -43,7 +43,7 @@ def load_prediction_actuals(
         LEFT JOIN players pl ON pl.player_id = p.player_id
         LEFT JOIN game_logs gl
             ON gl.player_id = p.player_id
-           AND gl.game_date = p.game_date
+           AND DATE(gl.game_date) = DATE(p.game_date)
         WHERE p.prob_over IS NOT NULL
           AND p.line_value IS NOT NULL
           AND p.predicted_mean IS NOT NULL

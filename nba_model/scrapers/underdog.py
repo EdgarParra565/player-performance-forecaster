@@ -62,6 +62,12 @@ SCRAPER = BookScraper(
             "sign in to continue",
             "enter your email",
             "forgot password",
+            # Geo gate (live 2026-09-28, signed in from California): the
+            # board is replaced by this notice. Not an auth wall, but the page
+            # has no props, so parsers must skip it.
+            "not available in your location",
+            # ...and the interstitial shown while that geo check runs.
+            "trying to load your location",
         ),
         authenticated=(
             "higher",

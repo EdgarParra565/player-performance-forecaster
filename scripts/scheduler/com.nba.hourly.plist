@@ -38,11 +38,17 @@
     <key>WorkingDirectory</key>
     <string>/ABSOLUTE_PATH_TO_REPO</string>
 
-    <!-- Fire every 3600s. Idempotent — the runner takes an fcntl lock and
-         the second invocation exits 75 (EX_TEMPFAIL) if a previous run is
-         still in flight. -->
-    <key>StartInterval</key>
-    <integer>3600</integer>
+    <!-- Fire at minute :05 of every hour (wall clock). NOT StartInterval:
+         that timer only counts AWAKE time, so on a Mac that idle-sleeps it
+         effectively never fires (live 2026-09-28: 0 fires in 1.5h). A
+         calendar fire missed during sleep runs once on the next wake.
+         Idempotent — the runner takes an fcntl lock and a second invocation
+         exits 75 (EX_TEMPFAIL) if a previous run is still in flight. -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Minute</key>
+        <integer>5</integer>
+    </dict>
 
     <!-- Fire once at load so we don't wait an hour for the first tick. -->
     <key>RunAtLoad</key>
@@ -64,6 +70,13 @@
         <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
         <key>CHROME_PORT</key>
         <string>9222</string>
+        <!-- Optional: Slack/Discord/generic webhook for failure + "re-login
+             needed" alerts (hourly_update reads $NBA_ALERT_WEBHOOK_URL). A
+             macOS notification also fires on a new re-login need. -->
+        <!--
+        <key>NBA_ALERT_WEBHOOK_URL</key>
+        <string>https://hooks.example.com/REPLACE_ME</string>
+        -->
     </dict>
 </dict>
 </plist>

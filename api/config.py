@@ -32,3 +32,7 @@ def get_db_path() -> str:
 
 def db_exists(db_path: str | None = None) -> bool:
     return Path(db_path or get_db_path()).is_file()
+
+# Tables every endpoint depends on. Used by the read-only preflight in
+# main.py AND by db_sync to validate a downloaded snapshot before swapping.
+REQUIRED_TABLES = frozenset({"games", "game_logs", "players"})

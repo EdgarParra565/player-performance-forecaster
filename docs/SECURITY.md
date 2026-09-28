@@ -38,7 +38,10 @@ will respond within 72 hours.
 ```
 
 We trust:
-- The OIDC providers (Google, Microsoft) to verify email ownership.
+- The OIDC providers to authenticate the (`iss`, `sub`) identity. We trust an
+  `email` claim ONLY when the token asserts `email_verified: true` (Google) or
+  the issuer is an operator-listed single tenant — see
+  [Admin identity binding](#admin-identity-binding-noauth).
 - Stripe's HMAC + timestamp on webhook payloads.
 - The local OS file system + the secrets store provided by the host
   (Streamlit Cloud secrets UI, Render env vars).
@@ -58,7 +61,8 @@ We do **not** trust:
 | `paywall(feature)` is called inside the dispatch even when the sidebar UI already filtered the choice (defense in depth) | `app.py` `_team_overview`, `_parlay_view`, `_all_stats_overview` branches |
 | Free-tier player allowlist (`PREVIEW_PLAYERS`) enforced both in the dropdown filter AND in `gate_player()` at fetch time | `auth.py` |
 | Non-admin users cannot change `db_path` (UI input is hidden); production reads only the bundled SQLite file | `app.py` |
-| Admin override is allowlist-based on email (read from `[auth].admins` in encrypted secrets), not on a self-claimable cookie | `auth.is_admin`, `auth._admin_emails` |
+| Admin is bound to OIDC `iss`+`sub` (`[auth].admin_identities`) or to a **verified** email in `[auth].admins` — never to the raw email claim (nOAuth). See [Admin identity binding](#admin-identity-binding-noauth) | `auth.is_admin`, `auth._verified_email` |
+| Manual-lines "Save to DB", Operations, Admin dashboard and the `db_path` override are admin-only **regardless of `BILLING_ENABLED`** (open-access mode makes everyone premium, never admin); each re-checks server-side, not just by hiding/disabling UI | `app._manual_lines_save_allowed`, `app.main` dispatch |
 
 ### A02 - Cryptographic failures
 
@@ -84,8 +88,9 @@ We do **not** trust:
 |---|---|
 | Webhook handler is **idempotent on `event_id`** so Stripe retries (and attacker replays inside the tolerance window) are no-ops | `subscriptions.record_stripe_event` |
 | Subscription state is "fail closed": invalid email or missing record returns `free`, never `premium` | `subscriptions.tier_for` |
+| Webhook grants premium on the object's **status**, not the event type: `customer.subscription.{created,updated}` → premium only for `active`/`trialing` (past_due / unpaid / incomplete / canceled / paused / unknown → free); `checkout.session.completed` → premium only when `payment_status == "paid"` | `webhook_app.tier_for_event` |
 | Premium expiration is enforced by checking `current_period_end` on every read, not by a background job | `subscriptions.tier_for` |
-| Free tier limits are enforced by the data layer (cap N games, restrict stat list), not just by hiding UI | `auth.cap_n_games`, `auth.allowed_stats` |
+| Free-tier limits (preview players, `PREVIEW_STATS`, `PREVIEW_MAX_GAMES`) are re-checked in each view's fetch path, not just by hiding UI. Only relevant with `BILLING_ENABLED=1`; the app currently deploys open-access | `auth.gate_player`, `app.py` view dispatch |
 
 ### A05 - Security misconfiguration
 
@@ -121,6 +126,7 @@ We do **not** trust:
 | `st.logout` clears the session client-side **and** invalidates the cookie | Streamlit native |
 | App never inspects passwords or stores them | by design |
 | Email is treated as an opaque identifier; we never display admin lists in error messages | `auth.is_admin`, `paywall` |
+| Unverified email claims are dropped (`CurrentUser.email=None`) so they can't inherit a paying user's tier, prefill checkout, or open that user's Stripe portal | `auth.current_user`, `auth._verified_email` |
 
 ### A08 - Software + data integrity failures
 
@@ -145,6 +151,39 @@ We do **not** trust:
 | `db_path` is locked to a hardcoded value for non-admin users; admins are project-owner-allowlisted only | `app.py` |
 | No `requests.get()` or `urllib.urlopen()` accepts URLs derived from end-user input on the web side | grep-audited |
 | Path inputs (e.g. inventory output) only appear in the desktop UI / CLI, never the web app | `nba_model/data/audit_db.py` |
+
+## Admin identity binding (nOAuth)
+
+**Requirement:** admin rights (and any premium entitlement looked up by email)
+must be bound to an identity the attacker cannot choose.
+
+Microsoft Entra ID multi-tenant apps (`/common` metadata URL) accept tokens
+from *any* tenant, and a tenant admin can set a user's `email` attribute to an
+arbitrary unverified address. Matching `[auth].admins` against the raw `email`
+claim therefore let anyone with a throwaway tenant become admin (Operations
+console runs host subprocesses; manual-lines writes `betting_lines`). Fixed
+2026-09-28 (`review_findings_web.md`, W-SEC-3).
+
+`auth.is_admin()` now returns True only when:
+
+1. the token's (`iss`, `sub`) pair is listed in `[auth].admin_identities`
+   (**preferred**; `sub` is issuer-scoped, immutable, never re-assigned), or
+2. the email is in `[auth].admins` **and** is verified — `email_verified: true`
+   in the token (Google sets this) or the token `iss` is listed in
+   `[auth].trusted_email_issuers` (list only a single tenant you control:
+   `https://login.microsoftonline.com/<tenant-id>/v2.0`).
+
+```toml
+[auth]
+admin_identities = [
+  { iss = "https://accounts.google.com", sub = "112233445566778899" },
+]
+admins = ["owner@example.com"]          # honoured only for verified emails
+trusted_email_issuers = []              # e.g. your single Entra tenant issuer
+```
+
+To find your `iss` / `sub`: sign in once and read them off `st.user` (e.g. a
+temporary `st.write(st.user.to_dict())` on a local run — do not deploy that).
 
 ## Data retention + GDPR / CCPA
 
@@ -218,7 +257,9 @@ build.
 
 - [ ] `cookie_secret` is a 32+ byte random string, **not** the placeholder.
 - [ ] OAuth client secrets are pasted into the host's encrypted secrets UI, never committed.
+- [ ] Admin is configured via `[auth].admin_identities` (`iss` + `sub`) — or `[auth].admins` with a Google (verified-email) account only. Never rely on a Microsoft `/common` email match.
 - [ ] `[auth].admins` lists ONLY the project owner's email (not a shared mailbox).
+- [ ] If Microsoft login is enabled, `[auth.microsoft].server_metadata_url` is single-tenant OR you accept that Microsoft users without a verified email resolve to free tier.
 - [ ] Stripe `webhook_secret` matches the value in the Stripe dashboard for the deployed endpoint.
 - [ ] `WEBHOOK_TRUSTED_HOSTS` env var is set to the public hostname of the webhook app.
 - [ ] Stripe is in **live mode**; old test-mode webhook endpoints have been deleted from the dashboard.
@@ -290,3 +331,10 @@ future change reintroducing any of them will fail CI.
   WAF in front.
 - **Stripe Customer Portal** is not yet wired - users can't self-serve cancel
   in-app today; they'd need to email us. Adding this is on the follow-up list.
+- **Flagship UI/API (`api/`, `frontend/`) has no per-user auth** (deferred
+  with billing). It is read-only (parlay pricing is compute-only), sends a
+  strict CSP and security headers, bounds every input, and refuses to write
+  the DB. It also rate-limits per client IP in-process (`api/guards.py`).
+  `FLAGSHIP_ACCESS_CODE` offers an optional shared-secret private mode with a
+  per-IP brute-force brake. That is not identity: anyone holding the code has
+  full access. See `DEPLOYMENT.md` §15.

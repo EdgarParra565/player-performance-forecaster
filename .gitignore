@@ -61,3 +61,20 @@ data/database/subscriptions.db
 
 # Claude AI agent artifacts
 .claude/
+
+# Local Codex / Cursor agent config (MCP servers, session state)
+.codex/
+
+# SQLite live DB is already ignored via *.db; keep backups + sidecars out too
+data/database/backups/
+*.db-wal
+*.db-shm
+*.db-journal
+
+# Object-storage credentials (publish_db --to-object-store)
+storage.env
+**/.config/nba-flagship/
+
+# Flagship UI screenshot dumps (local evidence only; app does not load them)
+docs/screenshots/
+

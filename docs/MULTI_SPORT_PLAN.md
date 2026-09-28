@@ -121,8 +121,9 @@ Story"-shaped namespace pollution).
 
 ### 6. Free-tier preview list per sport
 
-Currently `auth.PREVIEW_PLAYERS = ("Nikola Jokic", "LeBron James")` and
-`auth.PREVIEW_TEAMS = ("LAL", "DEN")`. Each sport will want its own pair.
+Currently `auth.PREVIEW_PLAYERS = ("Nikola Jokic", "LeBron James")` (the
+team preview list was removed — team charts are free). Each sport will want its
+own list. Only matters once billing is re-enabled.
 
 **Action:** make these dicts keyed by sport — `PREVIEW_PLAYERS["nfl"] =
 ("Patrick Mahomes", "Christian McCaffrey")` etc.

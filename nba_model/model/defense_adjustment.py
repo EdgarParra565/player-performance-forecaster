@@ -19,7 +19,9 @@ def adjust_mu_for_defense(
     Returns:
         Defense-adjusted expected value.
     """
-    diff = league_avg_def_rating - opponent_def_rating
+    # DRtg = points allowed per 100 possessions: a HIGHER rating is a WORSE
+    # defense, so it must RAISE the expectation (and a lower one lower it).
+    diff = opponent_def_rating - league_avg_def_rating
     adjustment = diff * sensitivity / 10
 
     return mu + adjustment

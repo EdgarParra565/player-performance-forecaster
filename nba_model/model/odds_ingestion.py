@@ -4,6 +4,7 @@ import argparse
 from collections import Counter
 import logging
 import os
+import re
 import time
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
@@ -167,6 +168,15 @@ def validate_betting_line_records(records: List[dict]) -> Tuple[List[dict], dict
     return valid_records, summary
 
 
+_API_KEY_RE = re.compile(r"(apiKey=)[^&\s'\"]+", flags=re.IGNORECASE)
+
+
+def _redact_api_key(text: str) -> str:
+    """Mask ``apiKey=...`` query values: requests embeds the full URL (query
+    string included) in exception text, which is logged and reported."""
+    return _API_KEY_RE.sub(r"\1***", str(text))
+
+
 def _get_json(
     url: str,
     params: dict,
@@ -188,8 +198,10 @@ def _get_json(
             return response.json()
         except requests.HTTPError as exc:
             snippet = exc.response.text[:500] if getattr(exc, "response", None) is not None else ""
-            last_exc = requests.HTTPError(f"{exc} | response={snippet}")
-        except (requests.RequestException, ValueError) as exc:
+            last_exc = requests.HTTPError(_redact_api_key(f"{exc} | response={snippet}"))
+        except requests.RequestException as exc:
+            last_exc = type(exc)(_redact_api_key(str(exc)))
+        except ValueError as exc:
             last_exc = exc
 
         if attempt < attempts:

@@ -104,6 +104,11 @@ SCRAPER = BookScraper(
             "register",
             "create account",
             "sign in",
+            # Location gate (live 2026-09-28): sports.betmgm.com shows a state
+            # picker instead of the board until a location is chosen once in
+            # the scraping profile. Not a credential wall, but the board is
+            # unreadable until the owner picks a state.
+            "where are you playing from?",
         ),
         authenticated=(
             "spread",

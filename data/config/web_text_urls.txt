@@ -16,12 +16,14 @@
 # PrizePicks NBA board (auth required)
 https://app.prizepicks.com/board/nba
 
-# Underdog NBA pick'em (2026 rebrand: underdogsports.com)
-https://underdogsports.com/pick-em/higher-lower/all/NBA
-https://underdogsports.com/pick-em/higher-lower/all/NBA?filter_id=8d718cf2-1487-401e-88f7-f9f799e85871&filter_type=PickemStat
-https://underdogsports.com/pick-em/higher-lower/all/NBA?filter_id=590e7c83-99fc-419f-bdd8-78bb0a691f8b&filter_type=PickemStat
-https://underdogsports.com/pick-em/higher-lower/all/NBA?filter_id=0d33e7f2-6601-486b-9f9e-cbe268d8fc88&filter_type=PickemStat
-https://underdogsports.com/pick-em/higher-lower/all/NBA?filter_id=e3bc1aaa-7964-4a84-bcfa-2d92a4d477a2&filter_type=PickemStat
+# Underdog NBA pick'em (2026 rebrand). Board lives on app.underdogsports.com —
+# underdogsports.com/pick-em/... 404s (live 2026-09-28). Geo-blocked from CA:
+# see data/config/blocked_books.txt.
+https://app.underdogsports.com/pick-em/higher-lower/all/NBA
+https://app.underdogsports.com/pick-em/higher-lower/all/NBA?filter_id=8d718cf2-1487-401e-88f7-f9f799e85871&filter_type=PickemStat
+https://app.underdogsports.com/pick-em/higher-lower/all/NBA?filter_id=590e7c83-99fc-419f-bdd8-78bb0a691f8b&filter_type=PickemStat
+https://app.underdogsports.com/pick-em/higher-lower/all/NBA?filter_id=0d33e7f2-6601-486b-9f9e-cbe268d8fc88&filter_type=PickemStat
+https://app.underdogsports.com/pick-em/higher-lower/all/NBA?filter_id=e3bc1aaa-7964-4a84-bcfa-2d92a4d477a2&filter_type=PickemStat
 
 # DraftKings Pick6 NBA props
 https://pick6.draftkings.com/?sport=NBA
@@ -47,6 +49,10 @@ https://sportsbook.draftkings.com/leagues/basketball/nba
 # theScore Bet (ESPN BET rebrand) NBA — team lines when in-season (futures-only offseason)
 https://sportsbook.thescore.bet/sport/basketball/organization/united-states/competition/nba
 
+# FanDuel sportsbook NBA (added 2026-09-28: renders real game lines logged-out;
+# parsed by scrapers/fanduel.py 2026 full-name layout)
+https://sportsbook.fanduel.com/navigation/nba
+
 # Bovada NBA
 https://www.bovada.lv/sports/basketball/nba
 
@@ -59,3 +65,8 @@ https://kalshi.com/markets/nba
 # Parsed by scrapers/vegasinsider.py + data/vegasinsider_odds_ingestion.py.
 # In-season only; the board is empty in the offseason.
 https://www.vegasinsider.com/nba/odds/player-props/
+
+# VegasInsider MLB player-props grid (real multi-book odds → mlb_prop_lines).
+# Parsed by scrapers/vegasinsider.py extract_mlb_odds_rows. Over-only; postseason
+# boards may still post after the regular season.
+https://www.vegasinsider.com/mlb/odds/player-props/

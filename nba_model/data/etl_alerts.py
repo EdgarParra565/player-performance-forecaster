@@ -34,6 +34,13 @@ def _step_states(report: dict) -> list[str]:
                 status = str(v.get("status") or "").lower()
                 if status:
                     states.append(status)
+                # Hourly steps nest the step's own summary under "result";
+                # a step that returned status 'failed' must still alert.
+                result = v.get("result")
+                if isinstance(result, dict):
+                    nested = str(result.get("status") or "").lower()
+                    if nested:
+                        states.append(nested)
     return states
 
 
@@ -115,3 +122,66 @@ def maybe_send_alert(
         return {"sent": True, "status_code": code, "alert": marker}
     except Exception as exc:  # noqa: BLE001 — alerting is best-effort
         return {"sent": False, "reason": f"post_failed: {exc}", "alert": marker}
+
+
+def send_session_alert(
+    books: list[str],
+    webhook_url: Optional[str],
+    *,
+    poster: Optional[Callable] = None,
+) -> dict:
+    """POST a "book re-login needed" alert for ``books`` to ``webhook_url``.
+
+    Returns ``{"sent", "status_code"|"reason"}``; a non-2xx response counts as
+    NOT sent so the caller's debounce can retry next tick. Never raises.
+    """
+    if not books:
+        return {"sent": False, "reason": "no_books"}
+    if not webhook_url:
+        return {"sent": False, "reason": "no_webhook"}
+    payload = {
+        "text": (
+            "Scraper re-login needed: " + ", ".join(books)
+            + " — sign in again in the scraping Chrome (:9222 profile)."
+        ),
+        "severity": "warning",
+        "kind": "session",
+        "books": list(books),
+    }
+    try:
+        if poster is None:
+            import requests
+            poster = requests.post
+        resp = poster(webhook_url, json=payload, timeout=10)
+    except Exception as exc:  # noqa: BLE001 — alerting is best-effort
+        return {"sent": False, "reason": f"post_failed: {exc}"}
+    code = getattr(resp, "status_code", None)
+    if isinstance(code, int) and not 200 <= code < 300:
+        return {"sent": False, "reason": f"http_{code}", "status_code": code}
+    return {"sent": True, "status_code": code}
+
+
+def notify_macos(title: str, message: str, *, runner: Optional[Callable] = None) -> dict:
+    """Best-effort macOS Notification Center banner via ``osascript``.
+
+    No-op off macOS. ``runner`` is injected for tests (defaults to
+    ``subprocess.run``). Never raises.
+    """
+    import sys
+
+    if runner is None:
+        if sys.platform != "darwin":
+            return {"sent": False, "reason": "not_macos"}
+        import subprocess
+        runner = subprocess.run
+
+    def _q(text: str) -> str:
+        return str(text).replace("\\", "\\\\").replace('"', '\\"')
+
+    script = f'display notification "{_q(message)}" with title "{_q(title)}"'
+    try:
+        proc = runner(["osascript", "-e", script], capture_output=True, timeout=10)
+    except Exception as exc:  # noqa: BLE001
+        return {"sent": False, "reason": f"osascript_failed: {exc}"}
+    rc = getattr(proc, "returncode", 0)
+    return {"sent": rc == 0, "returncode": rc}

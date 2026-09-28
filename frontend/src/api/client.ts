@@ -1,5 +1,6 @@
-// Thin fetch wrapper. All requests go to the Vite dev proxy at `/api`, which
-// forwards to the FastAPI service on :8000.
+// Thin fetch wrapper. All requests go to `/api` (Vite dev proxy locally,
+// same origin in production).
+import { getAccessCode, signalAccessRequired } from "../lib/access";
 
 export class ApiError extends Error {
   status: number;
@@ -29,9 +30,27 @@ export async function apiGet<T>(
   path: string,
   params?: Record<string, unknown>,
 ): Promise<T> {
-  const res = await fetch(`/api${path}${buildQuery(params)}`, {
-    headers: { Accept: "application/json" },
-  });
+  return handle<T>(await fetch(`/api${path}${buildQuery(params)}`, { headers: headers() }));
+}
+
+export async function apiPost<T>(path: string, body: unknown): Promise<T> {
+  return handle<T>(
+    await fetch(`/api${path}`, {
+      method: "POST",
+      headers: { ...headers(), "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+  );
+}
+
+function headers(): Record<string, string> {
+  const h: Record<string, string> = { Accept: "application/json" };
+  const code = getAccessCode();
+  if (code) h["X-Access-Code"] = code;
+  return h;
+}
+
+async function handle<T>(res: Response): Promise<T> {
   if (!res.ok) {
     let detail = res.statusText;
     try {
@@ -40,6 +59,7 @@ export async function apiGet<T>(
     } catch {
       /* non-JSON error body */
     }
+    if (res.status === 401) signalAccessRequired();
     throw new ApiError(res.status, detail);
   }
   return (await res.json()) as T;

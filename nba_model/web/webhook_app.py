@@ -127,6 +127,17 @@ class IPRateLimiter:
             bucket.append(now)
             return True
 
+    def blocked(self, key: str, now: float) -> bool:
+        """True if ``key`` is over the limit, WITHOUT recording a hit."""
+        with self._lock:
+            bucket = self._buckets.get(key)
+            if not bucket:
+                return False
+            cutoff = now - self.window
+            while bucket and bucket[0] < cutoff:
+                bucket.popleft()
+            return len(bucket) >= self.max_requests
+
     def gc(self, now: float) -> None:
         """Drop empty buckets so memory doesn't grow unbounded over weeks."""
         with self._lock:
@@ -238,8 +249,18 @@ def _safe_get(obj, key, default=None):
         return default
 
 
+class EmailLookupError(RuntimeError):
+    """Stripe Customer lookup failed transiently; the event must be retried."""
+
+
 def _email_from_event(obj) -> Optional[str]:
-    """Pull a customer email from the most likely fields on the event object."""
+    """Pull a customer email from the most likely fields on the event object.
+
+    Returns None only when the event genuinely carries no customer. A FAILED
+    ``Customer.retrieve`` (network, auth, missing STRIPE_SECRET_KEY) raises
+    ``EmailLookupError`` so the caller can 503 and let Stripe retry, instead
+    of acknowledging and silently dropping e.g. a cancellation.
+    """
     email = _safe_get(obj, "customer_email") or _safe_get(
         _safe_get(obj, "customer_details", {}) or {}, "email",
     )
@@ -251,10 +272,22 @@ def _email_from_event(obj) -> Optional[str]:
     try:
         stripe.api_key = _stripe_api_key()
         cust = stripe.Customer.retrieve(customer_id)
-        return str(_safe_get(cust, "email") or "").strip().lower() or None
-    except Exception as exc:  # pragma: no cover
-        logger.warning("Could not retrieve customer %s: %s", customer_id, exc)
-        return None
+    except Exception as exc:  # noqa: BLE001 — any failure means "retry later"
+        # Type only: exception text can echo request details.
+        logger.warning("webhook: customer lookup failed (%s)", type(exc).__name__)
+        raise EmailLookupError(type(exc).__name__) from exc
+    return str(_safe_get(cust, "email") or "").strip().lower() or None
+
+
+def _event_subscription_id(obj) -> Optional[str]:
+    """The ``sub_...`` id an event refers to (never an invoice / session id)."""
+    sub = _safe_get(obj, "subscription")
+    if isinstance(sub, str) and sub:
+        return sub
+    oid = _safe_get(obj, "id")
+    if isinstance(oid, str) and oid.startswith("sub_"):
+        return oid
+    return None
 
 
 def alert_payment_failed(email, *, poster=None) -> dict:
@@ -284,6 +317,44 @@ def alert_payment_failed(email, *, poster=None) -> dict:
         return {"sent": False, "reason": f"post_failed: {type(exc).__name__}"}
 
 
+# Stripe subscription statuses that entitle the customer to premium. Every
+# other status (past_due, unpaid, incomplete, incomplete_expired, canceled,
+# paused, or anything Stripe adds later) fails closed to free.
+ENTITLED_SUBSCRIPTION_STATUSES = frozenset({"active", "trialing"})
+
+
+def tier_for_event(event_type: str, obj) -> Optional[str]:
+    """Map a verified Stripe event to the tier it implies, or None (no change).
+
+    SECURITY: ``customer.subscription.updated`` also fires on transitions INTO
+    past_due / unpaid / incomplete, and ``checkout.session.completed`` fires
+    for sessions whose payment is still pending (async methods) — so premium
+    is granted only on the object's actual status, never on the event type
+    alone.
+    """
+    if event_type == "checkout.session.completed":
+        # 'unpaid' (async payment pending) and 'no_payment_required' make no
+        # change here; the subscription.created/updated event that follows
+        # carries the authoritative status (incl. 'trialing').
+        if str(_safe_get(obj, "payment_status") or "") == "paid":
+            return "premium"
+        return None
+    if event_type in {
+        "customer.subscription.created",
+        "customer.subscription.updated",
+    }:
+        status = str(_safe_get(obj, "status") or "").strip().lower()
+        return "premium" if status in ENTITLED_SUBSCRIPTION_STATUSES else "free"
+    if event_type == "invoice.paid":
+        return "premium"
+    if event_type in {
+        "customer.subscription.deleted",
+        "invoice.payment_failed",
+    }:
+        return "free"
+    return None
+
+
 @app.get("/healthz")
 def healthz() -> dict:
     """Liveness probe. Intentionally returns no app version or build info to
@@ -306,14 +377,23 @@ def _tolerance_seconds() -> int:
 async def stripe_webhook(request: Request) -> dict:
     # 0. Rate-limit per source IP before doing any work. Stripe retries on
     #    429 with exponential backoff so this is safe to enforce.
+    #    Only REJECTED requests (bad/missing signature, bad payload, oversize,
+    #    slow body) count toward the bucket: behind a proxy every request can
+    #    share one key, and counting valid Stripe deliveries let an unsigned
+    #    flood starve real events with 429s.
     import time
     now = time.time()
-    if not _rate_limiter.allow(_client_key(request), now):
-        logger.warning("webhook: rate-limited %s", _client_key(request))
+    client_key = _client_key(request)
+    if _rate_limiter.blocked(client_key, now):
+        logger.warning("webhook: rate-limited %s", client_key)
         raise HTTPException(
             status_code=429, detail="too many requests",
             headers={"Retry-After": str(int(_rate_limit_window))},
         )
+
+    def _reject(status: int, detail: str) -> HTTPException:
+        _rate_limiter.allow(client_key, now)
+        return HTTPException(status_code=status, detail=detail)
     # Periodic GC of the in-memory bucket dict so long-lived processes don't
     # accumulate stale per-IP entries.
     if int(now) % 60 == 0:
@@ -332,7 +412,7 @@ async def stripe_webhook(request: Request) -> dict:
             total += len(chunk)
             if total > MAX_BODY_BYTES:
                 # 413 = Content Too Large / Request Entity Too Large.
-                raise HTTPException(status_code=413, detail="payload too large")
+                raise _reject(413, "payload too large")
             chunks.append(chunk)
         return b"".join(chunks)
 
@@ -344,12 +424,12 @@ async def stripe_webhook(request: Request) -> dict:
     except asyncio.TimeoutError:
         logger.warning("webhook: body read timeout from %s",
                        _client_key(request))
-        raise HTTPException(status_code=408, detail="body read timeout")
+        raise _reject(408, "body read timeout")
 
     sig_header = request.headers.get("stripe-signature", "")
     if not sig_header:
         # Cheaper rejection before SDK does its own work.
-        raise HTTPException(status_code=400, detail="missing stripe-signature")
+        raise _reject(400, "missing stripe-signature")
 
     try:
         event = stripe.Webhook.construct_event(
@@ -361,10 +441,10 @@ async def stripe_webhook(request: Request) -> dict:
     except ValueError as exc:
         # Generic 400 - don't echo the raw exception (could leak header bytes).
         logger.warning("webhook: bad payload (%s)", type(exc).__name__)
-        raise HTTPException(status_code=400, detail="bad payload") from exc
+        raise _reject(400, "bad payload") from exc
     except stripe.error.SignatureVerificationError as exc:  # type: ignore[attr-defined]
         logger.warning("webhook: bad signature (%s)", type(exc).__name__)
-        raise HTTPException(status_code=400, detail="bad signature") from exc
+        raise _reject(400, "bad signature") from exc
 
     event_id = event["id"]
     event_type = event["type"]
@@ -376,6 +456,30 @@ async def stripe_webhook(request: Request) -> dict:
         return {"received": True, "duplicate": True}
 
     obj = event["data"]["object"]
+    try:
+        return _apply_event(event_id, event_type, event, obj)
+    except EmailLookupError:
+        # Transient: un-record so Stripe's retry is processed, and 503 so it
+        # retries at all.
+        subscriptions.forget_stripe_event(event_id)
+        raise HTTPException(status_code=503, detail="customer lookup failed")
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001 — e.g. "database is locked"
+        subscriptions.forget_stripe_event(event_id)
+        logger.error("webhook: processing failed for event %s (%s)",
+                     event_id, type(exc).__name__)
+        raise HTTPException(status_code=500, detail="processing failed") from exc
+
+
+def _apply_event(event_id: str, event_type: str, event, obj) -> dict:
+    """Apply one verified, first-seen event to the subscriptions store."""
+    target_tier = tier_for_event(event_type, obj)
+    if target_tier is None:
+        # Decide before any Stripe API call: most event types change nothing.
+        logger.info("webhook: no tier change for event type %s", event_type)
+        return {"received": True, "event_type": event_type}
+
     email = _email_from_event(obj)
     if not email:
         # Don't log the payload (PII / card-last-four can be in there).
@@ -383,51 +487,63 @@ async def stripe_webhook(request: Request) -> dict:
                        event_id, event_type)
         return {"received": True, "no_email": True}
 
-    target_tier: str | None = None
-    if event_type in {
-        "checkout.session.completed",
-        "customer.subscription.created",
-        "customer.subscription.updated",
-        "invoice.paid",
-    }:
-        target_tier = "premium"
-    elif event_type in {
-        "customer.subscription.deleted",
-        "invoice.payment_failed",
-    }:
-        target_tier = "free"
-    else:
-        logger.info("webhook: ignoring event type %s", event_type)
+    event_created = _safe_get(event, "created")
+    try:
+        event_created = int(event_created) if event_created is not None else None
+    except (TypeError, ValueError):
+        event_created = None
+    event_sub_id = _event_subscription_id(obj)
 
-    if target_tier is not None:
-        try:
-            subscriptions.upsert(
-                email=email,
-                tier=target_tier,
-                stripe_customer_id=_safe_get(obj, "customer"),
-                stripe_subscription_id=(
-                    _safe_get(obj, "subscription") or _safe_get(obj, "id")
-                ),
-                current_period_end=_iso_from_unix(
-                    _safe_get(obj, "current_period_end")
-                ),
-                last_event_type=event_type,
-            )
-        except ValueError as exc:
-            # Email failed our validator (e.g. someone signed up with a
-            # punycode address). The event row is already persisted in
-            # `stripe_events` for forensic review. Returning 200 stops
-            # Stripe's retry loop on what is structurally a permanent
-            # rejection.
-            logger.warning(
-                "webhook: rejected upsert for event %s (%s)",
-                event_id, type(exc).__name__,
-            )
-            return {"received": True, "rejected": True}
+    try:
+        existing = subscriptions.lookup(email)
+    except ValueError:
+        existing = None
+    if existing:
+        # Stripe does not guarantee delivery order: never let an older event
+        # overwrite state written by a newer one.
+        stored_created = existing.get("last_event_created")
+        if (event_created is not None and stored_created is not None
+                and event_created < int(stored_created)):
+            logger.info("webhook: stale event %s ignored (out of order)", event_id)
+            return {"received": True, "stale": True}
+        # A downgrade for a DIFFERENT subscription than the one on file (old
+        # sub's period-end cancel after a re-subscribe) must not revoke the
+        # current one.
+        stored_sub = existing.get("stripe_subscription_id")
+        if (target_tier == "free" and event_sub_id and stored_sub
+                and str(stored_sub).startswith("sub_")
+                and event_sub_id != stored_sub):
+            logger.info("webhook: downgrade for non-current subscription on "
+                        "event %s ignored", event_id)
+            return {"received": True, "stale_subscription": True}
 
-        # Alert the operator when a paying user's payment fails (best-effort).
-        if event_type == "invoice.payment_failed":
-            alert_payment_failed(email)
+    try:
+        subscriptions.upsert(
+            email=email,
+            tier=target_tier,
+            stripe_customer_id=_safe_get(obj, "customer"),
+            stripe_subscription_id=event_sub_id,
+            current_period_end=_iso_from_unix(
+                _safe_get(obj, "current_period_end")
+            ),
+            last_event_type=event_type,
+            last_event_created=event_created,
+        )
+    except ValueError as exc:
+        # Email failed our validator (e.g. someone signed up with a
+        # punycode address). The event row is already persisted in
+        # `stripe_events` for forensic review. Returning 200 stops
+        # Stripe's retry loop on what is structurally a permanent
+        # rejection.
+        logger.warning(
+            "webhook: rejected upsert for event %s (%s)",
+            event_id, type(exc).__name__,
+        )
+        return {"received": True, "rejected": True}
+
+    # Alert the operator when a paying user's payment fails (best-effort).
+    if event_type == "invoice.payment_failed":
+        alert_payment_failed(email)
 
     # Don't echo the email back in the response body. Stripe doesn't read it,
     # and a misconfigured proxy could log responses.

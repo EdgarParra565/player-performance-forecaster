@@ -182,10 +182,10 @@ def load_betting_lines_quotes(
         query += f" AND lower(bl.stat_type) IN ({placeholders})"
         params.extend(normalized)
     if books:
-        normalized_books = [str(b).strip() for b in books if str(b).strip()]
+        normalized_books = [str(b).strip().lower() for b in books if str(b).strip()]
         if normalized_books:
             placeholders = ",".join(["?"] * len(normalized_books))
-            query += f" AND bl.book IN ({placeholders})"
+            query += f" AND lower(bl.book) IN ({placeholders})"
             params.extend(normalized_books)
 
     with DatabaseManager(db_path=db_path) as db:
@@ -232,10 +232,10 @@ def load_snapshot_quotes(
         query += f" AND lower(s.stat_type) IN ({placeholders})"
         params.extend(normalized)
     if books:
-        normalized_books = [str(b).strip() for b in books if str(b).strip()]
+        normalized_books = [str(b).strip().lower() for b in books if str(b).strip()]
         if normalized_books:
             placeholders = ",".join(["?"] * len(normalized_books))
-            query += f" AND s.book IN ({placeholders})"
+            query += f" AND lower(s.book) IN ({placeholders})"
             params.extend(normalized_books)
 
     with DatabaseManager(db_path=db_path) as db:

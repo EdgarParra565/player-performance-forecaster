@@ -33,7 +33,7 @@ from scipy.stats import norm
 
 from nba_model.data.database.db_manager import DatabaseManager
 from nba_model.model.odds import american_to_implied_prob
-from nba_model.model.probability import prob_over_distribution
+from nba_model.model.probability import prob_over_distribution, prob_push_distribution
 from nba_model.visualization import player_charts as pc
 
 DEFAULT_DB_PATH = "data/database/nba_data.db"
@@ -82,8 +82,10 @@ def fetch_latest_prop_lines(
 
     Mirrors the dedup window used by ``db_manager.get_consensus_prop_lines``
     and ``player_charts._fetch_latest_book_lines``: newest ``observed_at_utc``
-    wins, restricted to ``active_nba`` rows and the lookback window. An empty
-    ``books`` selection returns an empty (correctly-shaped) frame.
+    (last change) wins, restricted to ``active_nba`` rows whose line was last
+    SEEN inside the lookback window. The returned ``observed_at_utc`` is that
+    last-seen time. An empty ``books`` selection returns an empty
+    (correctly-shaped) frame.
     """
     if books is not None and len(books) == 0:
         return pd.DataFrame(columns=LINE_COLUMNS)
@@ -91,7 +93,10 @@ def fetch_latest_prop_lines(
     clauses = ["player_classification = 'active_nba'"]
     params: list = []
     if since_hours and since_hours > 0:
-        clauses.append("observed_at_utc >= datetime('now', ?)")
+        # Last SEEN (change-only rows keep observed_at = last changed).
+        clauses.append(
+            "datetime(COALESCE(last_seen_at_utc, observed_at_utc)) >= datetime('now', ?)"
+        )
         params.append(f"-{float(since_hours)} hours")
     if books:
         placeholders = ",".join("?" * len(books))
@@ -101,7 +106,8 @@ def fetch_latest_prop_lines(
 
     query = f"""
         WITH latest AS (
-            SELECT book, player_name, stat_type, side, line_value, observed_at_utc,
+            SELECT book, player_name, stat_type, side, line_value,
+                   COALESCE(last_seen_at_utc, observed_at_utc) AS seen_at_utc,
                    ROW_NUMBER() OVER (
                        PARTITION BY lower(player_name), lower(stat_type),
                                     lower(book), lower(side)
@@ -110,7 +116,8 @@ def fetch_latest_prop_lines(
             FROM web_prop_cards
             WHERE {where_sql}
         )
-        SELECT book, player_name, stat_type, side, line_value, observed_at_utc
+        SELECT book, player_name, stat_type, side, line_value,
+               seen_at_utc AS observed_at_utc
         FROM latest WHERE rn = 1
         ORDER BY player_name ASC, stat_type ASC, book ASC, side ASC
     """
@@ -374,14 +381,21 @@ def score_prop_edges(
                     line=line, mu=mu, sigma=sigma,
                     distribution=distribution, sample_size=int(rolling_window),
                 ))
+                # Discrete families push on integer lines; that mass is
+                # neither side's win (continuous modes never push).
+                p_push = float(prob_push_distribution(
+                    line=line, mu=mu, sigma=sigma,
+                    distribution=distribution, sample_size=int(rolling_window),
+                ))
             else:
                 p_over = _normal_p_over(mu, sigma, line)
-            p_under = 1.0 - p_over
+                p_push = 0.0
+            p_under = max(0.0, 1.0 - p_over - p_push)
             best_side = "over" if p_over >= p_under else "under"
             p_best = max(p_over, p_under)
             # DFS cards carry no American price → both sides priced at -110.
             model_edge = p_best - implied_default
-            ev_best = pc.expected_value(p_best, default_american_odds)
+            ev_best = pc.expected_value(p_best, default_american_odds, push_prob=p_push)
 
             cmean = consensus.get((r.player_key, canonical_stat))
             pct_from_consensus = (

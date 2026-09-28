@@ -8,14 +8,19 @@ only — it will not run in a container or in GitHub Actions.
 
 Pipeline (in order, each step writes to the JSON report):
     1. Preflight: Playwright importable + Chrome CDP reachable on :9222
-    2. Web-text ingestion (CDP) over data/config/web_text_urls.txt
-    3. Browser prop parser (prizepicks / underdog / pick6 / parlayplay)
-    4. Team-line parser (betmgm / caesars / draftkings / bovada / kalshi)
-    5. VegasInsider ingestion (freshest stored grid → betting_lines, over-only)
-    6. Lightweight nba_api refresh (recent games + recent player logs)
-    7. Re-derive team_priors (single-pass reverse engineering)
-    8. Settle prediction outcomes (idempotent backfill)
-    9. Write timestamped JSON report under nba_model/data/artifacts/hourly/
+    2. Web-text ingestion (CDP) over data/config/web_text_urls.txt — first
+       closes leftover tabs on every target host (tab hygiene, default ON)
+    3. Session health: per-book ok / login-needed / unreachable from the fresh
+       captures; alerts once per NEW login-needed (debounced state file)
+    4. Browser prop parser (prizepicks / underdog / pick6 / parlayplay)
+    5. Team-line parser (betmgm / caesars / draftkings / bovada / kalshi)
+    6. VegasInsider ingestion (NBA grid → betting_lines; MLB props →
+       mlb_prop_lines)
+    7. Lightweight nba_api refresh (recent player logs) + players.team sync
+    8. Re-derive team_priors (single-pass reverse engineering)
+    9. Settle prediction outcomes (idempotent backfill)
+   10. Prediction recompute for today's betting_lines (optional bet_log settle)
+   11. Write timestamped JSON report under nba_model/data/artifacts/hourly/
 
 Idempotency / overlap safety:
     Acquires an fcntl flock on a lockfile so two overlapping runs can't
@@ -144,17 +149,38 @@ def _write_report(report: dict, report_dir: str) -> str:
     return str(path)
 
 
+_RESULT_FAILED_STATES = frozenset({"failed", "error"})
+_RESULT_PARTIAL_STATES = frozenset({"partial", "partial_success", "degraded"})
+
+
 def _record_step(report: dict, name: str, fn, *args, **kwargs) -> bool:
     """Run a step, catch exceptions, attach result to report, return success."""
     started = time.monotonic()
     try:
         result = fn(*args, **kwargs)
         duration_ms = int((time.monotonic() - started) * 1000)
+        # Several steps report failure in their RETURN value rather than by
+        # raising (web_text: every URL failed -> status 'failed'). Treat that
+        # as a failed step so ok / exit code / alert agree with the result.
+        result_status = (
+            str(result.get("status") or "").strip().lower()
+            if isinstance(result, dict) else ""
+        )
+        step_failed = result_status in _RESULT_FAILED_STATES
         report["steps"][name] = {
-            "ok": True,
+            "ok": not step_failed,
             "duration_s": round(duration_ms / 1000, 2),
             "result": result,
         }
+        if result_status in _RESULT_PARTIAL_STATES:
+            report["steps"][name]["status"] = "partial_success"
+        if step_failed:
+            logger.error(
+                "step '%s' reported status %r", name, result_status,
+                extra={"step": name, "status": "failed", "duration_ms": duration_ms},
+            )
+            report["failed_steps"].append(name)
+            return False
         logger.info(
             "step complete",
             extra={"step": name, "status": "ok", "duration_ms": duration_ms},
@@ -199,12 +225,13 @@ def _run_preflight(
     chrome = check_chrome_cdp_reachable(chrome_port, host=chrome_host)
     if not chrome["ok"]:
         raise RuntimeError(
-            f"{chrome['error']}. Start Chrome with:\n"
-            f"  open -na 'Google Chrome' --args "
-            f"--remote-debugging-port={chrome_port} "
-            "--user-data-dir=/tmp/pp-chrome-profile\n"
-            "Then log in to PrizePicks/Underdog/DK/BetMGM/Caesars in that "
-            "window before the next hourly tick."
+            f"{chrome['error']}. The scraping Chrome is kept alive by the "
+            "com.nba.scraping-chrome LaunchAgent — check it with:\n"
+            "  launchctl list | grep com.nba.scraping-chrome\n"
+            "  tail nba_model/data/logs/scraping_chrome_stderr.log\n"
+            "or start it by hand: scripts/scheduler/scraping_chrome.sh "
+            f"(--remote-debugging-port={chrome_port}, dedicated profile). "
+            "See scripts/scheduler/README.md."
         )
 
     return {
@@ -218,6 +245,8 @@ def _run_web_text(
     urls_file: str,
     chrome_port: int,
     browser_auth_state_file: Optional[str],
+    close_stale_tabs: bool = True,
+    chrome_host: str = "127.0.0.1",
 ) -> dict:
     from nba_model.model.web_text_ingestion import (
         fetch_and_store_web_text,
@@ -236,31 +265,131 @@ def _run_web_text(
         browser_auth_state_file=browser_auth_state_file,
         browser_user_data_dir=None,
         chrome_debug_port=chrome_port,
+        # Close leftover tabs on every target host first: the CDP fetcher
+        # reuses any tab on the same DOMAIN without navigating, which would
+        # store a stale page under this URL.
+        close_stale_tabs=close_stale_tabs,
+        chrome_host=chrome_host,
     )
     summary["urls"] = len(urls)
     return summary
 
 
-def _run_browser_prop_parser(db_path: str) -> dict:
+def _session_notifier(alert_webhook_url: Optional[str], macos_notify: bool):
+    """Build the ``notify`` callable for ``session_health.run_session_health``.
+
+    Channels: the alert webhook (when configured) and, optionally, a macOS
+    Notification Center banner on the scraping host. ``retry`` is set only
+    when a configured channel failed and none succeeded, so the debounce
+    re-tries next tick instead of swallowing the alert.
+    """
+    from nba_model.data.etl_alerts import notify_macos, send_session_alert
+
+    def _notify(books: list[str], _details: dict) -> dict:
+        channels: dict = {}
+        if alert_webhook_url:
+            channels["webhook"] = send_session_alert(books, alert_webhook_url)
+        if macos_notify:
+            channels["macos"] = notify_macos(
+                "NBA scraper: re-login needed",
+                ", ".join(books) + " — sign in again in the scraping Chrome.",
+            )
+        delivered = any(c.get("sent") for c in channels.values())
+        attempted = [c for c in channels.values() if c.get("reason") != "not_macos"]
+        logger.warning(
+            "session alert: re-login needed for %s (delivered=%s)",
+            ", ".join(books), delivered,
+        )
+        return {
+            "delivered": delivered,
+            "retry": bool(attempted) and not delivered,
+            "channels": channels,
+        }
+
+    return _notify
+
+
+def _run_session_health(
+    report: dict,
+    urls_file: str,
+    state_file: str,
+    alert_webhook_url: Optional[str],
+    macos_notify: bool,
+    blocked_books_file: Optional[str] = None,
+) -> dict:
+    """Per-book session status from this run's web-text fetch (see
+    ``nba_model.data.session_health``). Alerts only on a NEW login-needed;
+    books in ``blocked_books_file`` report ``blocked`` and never alert."""
+    from nba_model.data.session_health import load_blocked_books, run_session_health
+
+    web_text = report["steps"].get("web_text") or {}
+    result = web_text.get("result") if isinstance(web_text.get("result"), dict) else {}
+    fetch_results = result.get("results")
+    unreachable_urls = None
+    if "error" in web_text:  # step raised → nothing fetched this tick
+        from nba_model.model.web_text_ingestion import load_urls_from_file
+        try:
+            unreachable_urls = load_urls_from_file(urls_file)
+        except OSError:
+            unreachable_urls = []
+    return run_session_health(
+        fetch_results,
+        state_file,
+        unreachable_urls=unreachable_urls,
+        notify=_session_notifier(alert_webhook_url, macos_notify),
+        blocked=load_blocked_books(blocked_books_file),
+    )
+
+
+def _configured_urls(urls_file: Optional[str]) -> Optional[list[str]]:
+    """The URLs this run fetched — parsers read only their snapshots, never
+    stale history from URLs that left the list."""
+    if not urls_file:
+        return None
+    from nba_model.model.web_text_ingestion import load_urls_from_file
+
+    try:
+        return load_urls_from_file(urls_file) or None
+    except OSError:
+        return None
+
+
+def _zero_extraction_is_success(result: dict, count_key: str) -> dict:
+    """The parsers return ``partial_success`` when they extract nothing. On the
+    hourly cadence an empty board (offseason / preseason / walled snapshots
+    already reported by session_health) is NORMAL — same contract as the VI
+    ingestion — so it must not raise the run's alert every hour. Keep the
+    parser's own verdict visible as ``parser_status`` + ``zero_extraction``."""
+    if (isinstance(result, dict) and result.get("status") == "partial_success"
+            and not result.get(count_key)):
+        result = dict(result, status="success", parser_status="partial_success",
+                      zero_extraction=True)
+    return result
+
+
+def _run_browser_prop_parser(db_path: str, urls_file: Optional[str] = None) -> dict:
     from nba_model.model.browser_prop_parser import parse_and_store_web_prop_cards
 
-    return parse_and_store_web_prop_cards(
+    urls = _configured_urls(urls_file)
+    return _zero_extraction_is_success(parse_and_store_web_prop_cards(
         db_path=db_path,
-        source_urls=None,            # any recent snapshot
+        source_urls=urls,            # this run's URLs (None → any recent)
         max_snapshots_per_url=1,
-        max_total_snapshots=20,
+        max_total_snapshots=max(20, len(urls or [])),
         min_parse_confidence=0.2,
-    )
+    ), "cards_extracted")
 
 
-def _run_team_line_parser(db_path: str) -> dict:
+def _run_team_line_parser(db_path: str, urls_file: Optional[str] = None) -> dict:
     from nba_model.model.team_line_parser import parse_and_store_web_team_lines
 
-    return parse_and_store_web_team_lines(
+    urls = _configured_urls(urls_file)
+    return _zero_extraction_is_success(parse_and_store_web_team_lines(
         db_path=db_path,
+        source_urls=urls,
         max_snapshots_per_url=1,
-        max_total_snapshots=20,
-    )
+        max_total_snapshots=max(20, len(urls or [])),
+    ), "lines_extracted")
 
 
 def _run_vegasinsider_ingestion(db_path: str) -> dict:
@@ -283,6 +412,21 @@ def _run_vegasinsider_ingestion(db_path: str) -> dict:
     from nba_model.data.vegasinsider_odds_ingestion import ingest_vegasinsider_odds
 
     return ingest_vegasinsider_odds(db_path=db_path)
+
+
+def _run_vegasinsider_mlb_props_ingestion(db_path: str) -> dict:
+    """Ingest the freshest stored VegasInsider MLB props grid into ``mlb_prop_lines``.
+
+    Same contract as ``_run_vegasinsider_ingestion`` (idempotent change-only
+    insert; no snapshot / empty grid = normal 0-row return; a parse exception
+    propagates to ``_record_step``). MLB rows go to the dedicated
+    ``mlb_prop_lines`` table so they never reach an NBA query.
+    """
+    from nba_model.data.vegasinsider_mlb_props_ingestion import (
+        ingest_vegasinsider_mlb_props,
+    )
+
+    return ingest_vegasinsider_mlb_props(db_path=db_path)
 
 
 def _run_game_log_refresh(db_path: str, max_players: int) -> dict:
@@ -310,7 +454,7 @@ def _run_game_log_refresh(db_path: str, max_players: int) -> dict:
         """,
         (int(max_players),),
     ).fetchall()
-    loader = DataLoader()
+    loader = DataLoader(db_path=db_path)
     refreshed = 0
     failed: list[dict] = []
     for (name,) in rows:
@@ -506,8 +650,17 @@ def run_hourly_update(
     skip_recompute: bool = False,
     settle_bet_log: bool = False,
     alert_webhook_url: Optional[str] = None,
+    close_stale_tabs: bool = True,
+    session_state_file: Optional[str] = None,
+    macos_notify: bool = False,
+    blocked_books_file: Optional[str] = None,
 ) -> dict:
-    """Execute the hourly pipeline and return the JSON report dict."""
+    """Execute the hourly pipeline and return the JSON report dict.
+
+    ``session_state_file`` (default ``<report_dir>/session_health_state.json``)
+    remembers each book's last session status so a login-needed alert fires
+    once per episode, not every hour.
+    """
     from nba_model.data.etl_alerts import build_alert, maybe_send_alert
     report = {
         "started_at": _utc_now_iso(),
@@ -540,10 +693,25 @@ def run_hourly_update(
     _record_step(
         report, "web_text",
         _run_web_text, db_path, urls_file, chrome_port, browser_auth_state_file,
+        close_stale_tabs, chrome_host,
     )
-    _record_step(report, "browser_prop_parser", _run_browser_prop_parser, db_path)
-    _record_step(report, "team_line_parser", _run_team_line_parser, db_path)
+    _record_step(
+        report, "session_health",
+        _run_session_health, report, urls_file,
+        session_state_file or str(Path(report_dir) / "session_health_state.json"),
+        alert_webhook_url, macos_notify, blocked_books_file,
+    )
+    health = report["steps"]["session_health"].get("result")
+    if isinstance(health, dict):
+        # Top-level per-book summary: {"prizepicks": "login-needed", ...}.
+        report["session_health"] = health.get("books", {})
+    _record_step(report, "browser_prop_parser", _run_browser_prop_parser, db_path, urls_file)
+    _record_step(report, "team_line_parser", _run_team_line_parser, db_path, urls_file)
     _record_step(report, "vegasinsider_ingestion", _run_vegasinsider_ingestion, db_path)
+    _record_step(
+        report, "vegasinsider_mlb_props_ingestion",
+        _run_vegasinsider_mlb_props_ingestion, db_path,
+    )
     _record_step(report, "game_log_refresh", _run_game_log_refresh, db_path, max_players)
     _record_step(report, "players_table_sync", _run_players_table_sync, db_path)
     _record_step(report, "reverse_engineering", _run_reverse_engineering, db_path)
@@ -588,8 +756,30 @@ def _build_parser() -> argparse.ArgumentParser:
              "artifact (paper-trading maintenance; default OFF).",
     )
     parser.add_argument(
-        "--alert-webhook-url", default=None,
-        help="POST a JSON alert here when the run fails or partially fails.",
+        "--alert-webhook-url", default=os.environ.get("NBA_ALERT_WEBHOOK_URL") or None,
+        help="POST a JSON alert here when the run fails or partially fails, "
+             "and when a book newly needs a re-login. Defaults to "
+             "$NBA_ALERT_WEBHOOK_URL (set it in the launchd plist).",
+    )
+    parser.add_argument(
+        "--no-close-stale-tabs", action="store_true",
+        help="Skip closing leftover Chrome tabs on target hosts before the "
+             "fetch (default: close them, so no fetch reuses a stale tab).",
+    )
+    parser.add_argument(
+        "--session-state-file", default=None,
+        help="Remembered per-book session status for alert debouncing "
+             "(default: <report-dir>/session_health_state.json).",
+    )
+    parser.add_argument(
+        "--blocked-books-file", default="data/config/blocked_books.txt",
+        help="Books with a non-auth block (geo/age/app-only): reported as "
+             "'blocked', never alerted.",
+    )
+    parser.add_argument(
+        "--no-macos-notify", action="store_true",
+        help="Don't post a macOS notification when a book newly needs a "
+             "re-login (default: notify on macOS).",
     )
     return parser
 
@@ -615,6 +805,10 @@ def main(argv: Optional[list[str]] = None) -> int:
             skip_recompute=args.skip_recompute,
             settle_bet_log=args.settle_bet_log,
             alert_webhook_url=args.alert_webhook_url,
+            close_stale_tabs=not args.no_close_stale_tabs,
+            session_state_file=args.session_state_file,
+            macos_notify=(sys.platform == "darwin" and not args.no_macos_notify),
+            blocked_books_file=args.blocked_books_file,
         )
 
     logger.info(

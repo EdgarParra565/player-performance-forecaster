@@ -224,3 +224,62 @@ class TeamLineRoundTripTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BovadaLayout2026Tests(unittest.TestCase):
+    """Live capture 2026-09-28 (/sports/basketball/nba): odds-first layout,
+    labels only before the first game, EVEN = +100."""
+
+    TEXT = (
+        "Game Lines NBA - NEXT EVENTS Basketball - NBA 10/20/2026 12:00 PM Spread "
+        "+1.5 -105 -1.5 -115 Win +105 -125 Total o 221.5 -110 u 221.5 -110 "
+        "Boston Celtics Detroit Pistons + 115 10/20/2026 4:00 PM +5.5 -110 -5.5 -110 "
+        "+165 -195 o 231.5 -110 u 231.5 -110 Philadelphia 76ers New York Knicks + 117 "
+        "10/20/2026 6:30 PM +1.5 -110 -1.5 -110 EVEN -120 o 230.5 -110 u 230.5 -110 "
+        "Oklahoma City Thunder San Antonio Spurs + 116"
+    )
+
+    def test_parses_every_game_away_first(self):
+        from nba_model.scrapers.bovada import extract_team_lines
+
+        rows = extract_team_lines(self.TEXT)
+        self.assertEqual(len(rows), 18)
+        games = [(r["away_team"], r["home_team"]) for r in rows[::6]]
+        self.assertEqual(games, [("Celtics", "Pistons"), ("76ers", "Knicks"), ("Thunder", "Spurs")])
+        phi = {(r["market_type"], r["side"]): r for r in rows if r["away_team"] == "76ers"}
+        self.assertEqual(phi[("spread", "away")]["line_value"], 5.5)
+        self.assertEqual(phi[("moneyline", "home")]["odds_american"], -195)
+        self.assertEqual(phi[("total", "under")]["line_value"], 231.5)
+        okc = {(r["market_type"], r["side"]): r for r in rows if r["away_team"] == "Thunder"}
+        self.assertEqual(okc[("moneyline", "away")]["odds_american"], 100)  # EVEN
+
+    def test_legacy_layout_still_parses(self):
+        from nba_model.scrapers.bovada import extract_team_lines
+
+        legacy = ("5/8/26 7:00 PM New York Knicks Philadelphia 76ers + 692 Bets "
+                  "+2.5 (-115) -2.5 (-105) +115 -135 O 213.5 (-110) U 213.5 (-110)")
+        self.assertEqual(len(extract_team_lines(legacy)), 6)
+
+
+class FanDuelLayout2026Tests(unittest.TestCase):
+    """Live capture 2026-09-28 (sportsbook.fanduel.com/navigation/nba)."""
+
+    TEXT = (
+        "All NBA Odds NBA Spread Money Total Boston Celtics Detroit Pistons +1.5 -110 +100 "
+        "O 221.5 -115 -1.5 -110 -118 U 221.5 -105 same game parlay available Oct 20, 3:00pm ET "
+        "Stats More wagers Philadelphia 76ers New York Knicks +5.5 -105 +166 O 232.5 -110 "
+        "-5.5 -115 -198 U 232.5 -110 same game parlay available Oct 20, 7:00pm ET"
+    )
+
+    def test_full_name_layout(self):
+        from nba_model.scrapers.fanduel import extract_team_lines
+
+        rows = extract_team_lines(self.TEXT)
+        self.assertEqual(len(rows), 12)
+        phi = {(r["market_type"], r["side"]): r for r in rows if r["away_team"] == "76ers"}
+        self.assertEqual(phi[("spread", "away")]["line_value"], 5.5)
+        self.assertEqual(phi[("moneyline", "away")]["odds_american"], 166)
+        self.assertEqual(phi[("moneyline", "home")]["odds_american"], -198)
+        self.assertEqual(phi[("total", "over")]["line_value"], 232.5)
+        self.assertEqual(phi[("total", "under")]["odds_american"], -110)
+        self.assertEqual(phi[("spread", "home")]["team"], "Knicks")

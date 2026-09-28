@@ -190,7 +190,7 @@ def fetch_line_movement_snapshots(
         FROM betting_line_snapshots
         WHERE player_id = ?
           AND lower(stat_type) = lower(?)
-          AND snapshot_ts_utc >= datetime('now', ?)
+          AND datetime(snapshot_ts_utc) >= datetime('now', ?)
         ORDER BY book ASC, snapshot_ts_utc ASC
     """
     with DatabaseManager(db_path=db_path) as db:
@@ -265,34 +265,45 @@ def fetch_clv_proxy_by_book(
     A CLV (closing-line-value) proxy: for each book, the earliest and latest
     snapshot line for this player+stat, plus the drift. Columns: ``book``,
     ``open_line``, ``close_line``, ``line_delta``, ``n_snapshots``.
+
+    A single snapshot timestamp can hold a book's whole alt-line ladder, so
+    each (book, snapshot_ts) is first collapsed to its MAIN line
+    (``odds.main_line_index``) — otherwise open/close are arbitrary rungs and
+    one scrape fabricates drift (Bovada 15.5 → 22.5, "line_delta 7.0").
+    ``n_snapshots`` counts snapshot timestamps.
     """
+    from nba_model.model.odds import main_line_index
+
     canonical = _canonical_stat_type(stat_type)
     columns = ["book", "open_line", "close_line", "line_delta", "n_snapshots"]
     with DatabaseManager(db_path=db_path) as db:
         df = pd.read_sql_query(
             """
-            SELECT book, line_value, snapshot_ts_utc
+            SELECT book, line_value, over_odds, under_odds, snapshot_ts_utc
             FROM betting_line_snapshots
             WHERE player_id = ? AND lower(stat_type) = lower(?)
-            ORDER BY book ASC, snapshot_ts_utc ASC
+            ORDER BY book ASC, snapshot_ts_utc ASC, snapshot_id ASC
             """,
             db.conn, params=(int(player_id), str(canonical)),
         )
     if df.empty:
         return pd.DataFrame(columns=columns)
+    df = df.dropna(subset=["line_value"])
     rows = []
     for book, grp in df.groupby("book", sort=True):
-        grp = grp.dropna(subset=["line_value"])
-        if grp.empty:
+        mains = []
+        for _ts, scrape in grp.groupby("snapshot_ts_utc", sort=True):
+            rungs = scrape.to_dict("records")
+            mains.append(float(rungs[main_line_index(rungs)]["line_value"]))
+        if not mains:
             continue
-        open_line = float(grp.iloc[0]["line_value"])
-        close_line = float(grp.iloc[-1]["line_value"])
+        open_line, close_line = mains[0], mains[-1]
         rows.append({
             "book": str(book),
             "open_line": open_line,
             "close_line": close_line,
             "line_delta": close_line - open_line,
-            "n_snapshots": int(len(grp)),
+            "n_snapshots": int(len(mains)),
         })
     return pd.DataFrame(rows, columns=columns)
 
@@ -353,7 +364,7 @@ def _fetch_line_movement(
         FROM web_prop_cards
         WHERE lower(player_name) = lower(?)
           AND lower(stat_type) = lower(?)
-          AND observed_at_utc >= datetime('now', ?)
+          AND datetime(COALESCE(last_seen_at_utc, observed_at_utc)) >= datetime('now', ?)
           AND line_value IS NOT NULL
         ORDER BY book ASC, observed_at_utc ASC
     """
@@ -423,16 +434,18 @@ def _fetch_latest_book_lines(
         WITH ranked AS (
             SELECT book, line_value, over_odds, under_odds, game_date, scraped_at,
                    ROW_NUMBER() OVER (
-                       PARTITION BY book
+                       PARTITION BY lower(book)
                        ORDER BY
                            (game_date < date('now')) ASC,
                            CASE WHEN game_date >= date('now')
                                 THEN julianday(game_date) END ASC,
                            game_date DESC,
-                           scraped_at DESC
+                           scraped_at DESC,
+                           line_id DESC
                    ) AS rn
             FROM betting_lines
             WHERE player_id = ? AND lower(stat_type) = lower(?)
+              AND COALESCE(is_main_line, 1) = 1  -- skip alt-line rungs
         )
         SELECT book, line_value, over_odds, under_odds, game_date,
                scraped_at AS scraped_at_utc
@@ -462,17 +475,19 @@ def _fetch_latest_book_lines(
         # don't pollute today's consensus.
         web_query = """
             WITH ranked AS (
-                SELECT book, line_value, side, observed_at_utc,
+                SELECT book, line_value, side,
+                       COALESCE(last_seen_at_utc, observed_at_utc) AS seen_at_utc,
                        ROW_NUMBER() OVER (
                            PARTITION BY lower(book), lower(side)
-                           ORDER BY observed_at_utc DESC
+                           ORDER BY observed_at_utc DESC, card_id DESC
                        ) AS rn
                 FROM web_prop_cards
                 WHERE lower(player_name) = lower(?)
                   AND lower(stat_type) = lower(?)
-                  AND observed_at_utc >= datetime('now', ?)
+                  AND datetime(COALESCE(last_seen_at_utc, observed_at_utc))
+                      >= datetime('now', ?)
             )
-            SELECT book, line_value, side, observed_at_utc
+            SELECT book, line_value, side, seen_at_utc AS observed_at_utc
             FROM ranked WHERE rn = 1
         """
         web_df = pd.read_sql_query(
@@ -489,8 +504,9 @@ def _fetch_latest_book_lines(
             )
             agg["over_odds"] = None
             agg["under_odds"] = None
-            # For web cards observed_at_utc IS the scrape time, so it's the
-            # correct freshness timestamp.
+            # For web cards the freshness timestamp is when the line was last
+            # SEEN (last_seen_at_utc) — change-only rows keep observed_at_utc
+            # at the last change.
             agg["scraped_at_utc"] = agg["game_date"]
             agg = agg[["book", "line_value", "over_odds", "under_odds",
                        "game_date", "scraped_at_utc"]]
@@ -1580,12 +1596,15 @@ def fitted_prob_over(data: PlayerChartData, line: float) -> Optional[float]:
     return float(1.0 - norm.cdf(line, loc=data.mu, scale=data.sigma))
 
 
-def expected_value(prob: float, american_odds) -> Optional[float]:
-    """Return EV per 1 unit staked at the given odds and win probability."""
+def expected_value(prob: float, american_odds, push_prob: float = 0.0) -> Optional[float]:
+    """Return EV per 1 unit staked at the given odds and win probability.
+
+    ``push_prob`` (stake refunded) is excluded from the losing mass.
+    """
     dec = _american_odds_to_decimal(american_odds)
     if dec is None or prob is None:
         return None
-    return float(prob * (dec - 1.0) - (1.0 - prob))
+    return float(prob * (dec - 1.0) - (1.0 - prob - push_prob))
 
 
 def kelly_stake(prob, american_odds, fraction: float = 1.0) -> float:
@@ -1977,19 +1996,22 @@ def _fetch_latest_team_book_lines(
     # web_team_lines window.  We compute implied_total per-book downstream.
     query = """
         WITH latest_game AS (
-            SELECT away_team, home_team, MAX(observed_at_utc) AS observed_at_utc
+            SELECT away_team, home_team,
+                   MAX(COALESCE(last_seen_at_utc, observed_at_utc)) AS seen_at_utc
             FROM web_team_lines
             WHERE (lower(away_team) = lower(?) OR lower(home_team) = lower(?))
-              AND observed_at_utc >= datetime('now', ?)
+              AND datetime(COALESCE(last_seen_at_utc, observed_at_utc))
+                  >= datetime('now', ?)
             GROUP BY away_team, home_team
-            ORDER BY observed_at_utc DESC LIMIT 1
+            ORDER BY seen_at_utc DESC LIMIT 1
         )
         SELECT t.book, t.market_type, t.side, t.team,
                t.line_value, t.observed_at_utc
         FROM web_team_lines t
         JOIN latest_game lg
           ON t.away_team = lg.away_team AND t.home_team = lg.home_team
-        WHERE t.observed_at_utc >= datetime('now', ?)
+        WHERE datetime(COALESCE(t.last_seen_at_utc, t.observed_at_utc))
+              >= datetime('now', ?)
         ORDER BY t.book ASC, t.observed_at_utc DESC
     """
     lookback = f"-{float(web_lookback_hours)} hours"

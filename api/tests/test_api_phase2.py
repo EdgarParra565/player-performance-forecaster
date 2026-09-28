@@ -116,6 +116,23 @@ def _seed(db_path: str) -> None:
                  "rebounds", 8.0, -110, -110),
             ],
         )
+        # PRA: an alt-line LADDER inside one snapshot (4.5/6.5/8.5 at the
+        # same ts) then a later main-line move to 7.5. Must read as 6.5 -> 7.5,
+        # not as ladder "drift" 4.5 -> 8.5.
+        t1 = _utc(now - timedelta(hours=5))
+        t2 = _utc(now - timedelta(hours=2))
+        db.conn.executemany(
+            """INSERT INTO betting_line_snapshots
+               (snapshot_ts_utc, game_date, player_id, book, market_key,
+                stat_type, line_value, over_odds, under_odds)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            [
+                (t1, today, LEBRON_ID, "FanDuel", "player_points_rebounds_assists", "pra", 4.5, -250, 190),
+                (t1, today, LEBRON_ID, "FanDuel", "player_points_rebounds_assists", "pra", 6.5, -110, -110),
+                (t1, today, LEBRON_ID, "FanDuel", "player_points_rebounds_assists", "pra", 8.5, 200, -260),
+                (t2, today, LEBRON_ID, "FanDuel", "player_points_rebounds_assists", "pra", 7.5, -112, -108),
+            ],
+        )
         db.conn.commit()
 
 
@@ -190,6 +207,19 @@ class Phase2ApiTestCase(unittest.TestCase):
         self.assertAlmostEqual(by_book["FanDuel"]["open_line"], 18.5, places=3)
         self.assertAlmostEqual(by_book["FanDuel"]["close_line"], 17.5, places=3)
         self.assertAlmostEqual(by_book["FanDuel"]["line_delta"], -1.0, places=3)
+
+    def test_line_movement_collapses_alt_ladder_to_main_line(self):
+        r = self.client.get(
+            f"/api/players/{LEBRON_ID}/line-movement",
+            params={"stat": "pra"},
+        )
+        self.assertEqual(r.status_code, 200)
+        body = r.json()
+        fd = next(s for s in body["series"] if s["book"] == "FanDuel")
+        self.assertEqual([p["line"] for p in fd["points"]], [6.5, 7.5])
+        self.assertEqual(fd["open_line"], 6.5)
+        self.assertEqual(fd["close_line"], 7.5)
+        self.assertAlmostEqual(fd["line_delta"], 1.0)
 
     def test_line_movement_empty(self):
         r = self.client.get(f"/api/players/{LEBRON_ID}/line-movement?stat=assists")

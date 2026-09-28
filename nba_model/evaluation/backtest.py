@@ -577,8 +577,12 @@ class Backtester:
                 'bets_made': 0
             }
 
+        # Pushes (stake refunded) are neither wins nor losses: grade only the
+        # bets that resolved, or a push silently counts as a loss.
+        graded = bets[bets['outcome'] != 'push']
+
         # Accuracy
-        accuracy = bets['correct'].mean()
+        accuracy = graded['correct'].mean() if len(graded) > 0 else 0
 
         # ROI
         total_risked = len(bets) * 110  # Risk $110 per bet at -110 odds
@@ -586,9 +590,9 @@ class Backtester:
         roi = (total_profit / total_risked) * 100
 
         # Win rate
-        wins = (bets['correct'] == True).sum()
-        losses = (bets['correct'] == False).sum()
-        win_rate = wins / len(bets) if len(bets) > 0 else 0
+        wins = (graded['correct'] == True).sum()
+        losses = (graded['correct'] == False).sum()
+        win_rate = wins / len(graded) if len(graded) > 0 else 0
 
         # Sharpe ratio (risk-adjusted returns)
         if len(bets) > 1:
@@ -598,8 +602,10 @@ class Backtester:
             sharpe = 0
 
         # Brier score (probability calibration)
-        binary_outcomes = (df['actual_value'] > df['line']).astype(int)
-        brier_score = np.mean((df['prob_over'] - binary_outcomes) ** 2)
+        # A push is not an under: score only rows that resolved over/under.
+        resolved = df[df['outcome'] != 'push']
+        binary_outcomes = (resolved['actual_value'] > resolved['line']).astype(int)
+        brier_score = np.mean((resolved['prob_over'] - binary_outcomes) ** 2)
 
         metrics = {
             'total_games': len(df),

@@ -6,18 +6,15 @@ import { StatCard } from "../components/StatCard";
 import { DataTable, type Column } from "../components/DataTable";
 import { CrossBookTable } from "../components/CrossBookTable";
 import { EmptyState } from "../components/EmptyState";
-import { Loading, ErrorState } from "../components/Loading";
+import { ErrorState, errorMessage } from "../components/Loading";
+import { TableSkeleton } from "../components/Skeleton";
+import { Card, KpiGrid, Page } from "../components/Page";
 import { OddsBadge } from "../components/OddsBadge";
 import { Delta } from "../components/Delta";
-import { Chip, Segmented, NumberField } from "../components/controls";
+import { Button, Chip, FilterRow, MODEL_MODES, NumberField, Segmented } from "../components/controls";
 import { downloadCsv } from "../lib/csv";
-import { fmtInt, fmtNum, fmtSignedPct, statLabel } from "../lib/format";
-
-const MODEL_MODES = [
-  { key: "chart_mean", label: "Chart mean" },
-  { key: "rolling", label: "Rolling" },
-  { key: "full", label: "Full (beta)" },
-];
+import { DASH, fmtHoursAgo, fmtInt, fmtLine, fmtNum, fmtSignedPct, statLabel } from "../lib/format";
+import { playerHref, toggleItem } from "../lib/rows";
 
 function ArbSection({ arbs }: { arbs: ArbRow[] }) {
   if (!arbs.length) {
@@ -33,7 +30,7 @@ function ArbSection({ arbs }: { arbs: ArbRow[] }) {
     {
       key: "player_name",
       header: "Player",
-      render: (r) => <span className="text-fg">{r.player_name}</span>,
+      render: (r) => <span className="font-medium text-fg">{r.player_name}</span>,
       sortable: true,
       sortValue: (r) => r.player_name,
     },
@@ -46,8 +43,8 @@ function ArbSection({ arbs }: { arbs: ArbRow[] }) {
       key: "over",
       header: "OVER leg",
       render: (r) => (
-        <span className="text-muted">
-          {r.over_book} <span className="tnum">{fmtNum(r.over_line)}</span>{" "}
+        <span className="inline-flex items-center gap-2 text-muted">
+          {r.over_book} <span className="tnum text-fg">o{fmtLine(r.over_line)}</span>
           <OddsBadge odds={r.over_odds} />
         </span>
       ),
@@ -56,8 +53,8 @@ function ArbSection({ arbs }: { arbs: ArbRow[] }) {
       key: "under",
       header: "UNDER leg",
       render: (r) => (
-        <span className="text-muted">
-          {r.under_book} <span className="tnum">{fmtNum(r.under_line)}</span>{" "}
+        <span className="inline-flex items-center gap-2 text-muted">
+          {r.under_book} <span className="tnum text-fg">u{fmtLine(r.under_line)}</span>
           <OddsBadge odds={r.under_odds} />
         </span>
       ),
@@ -110,15 +107,12 @@ export function CrossBook() {
     [modelMode, minGap, minBooks, books, stats],
   );
 
-  const { data, isLoading, isError, isFetching } = useCrossBook(params);
+  const { data, isLoading, isError, error, isFetching } = useCrossBook(params);
   const rows = data?.rows ?? [];
   const arbs = data?.arbs ?? [];
   const allBooks = data?.books_available ?? meta.data?.books ?? [];
   const allStats = data?.stats_available ?? meta.data?.stats ?? [];
-
-  function toggle(list: string[], setter: (v: string[]) => void, item: string) {
-    setter(list.includes(item) ? list.filter((x) => x !== item) : [...list, item]);
-  }
+  const arbCount = data?.kpis.arb_count ?? 0;
 
   function exportCsv() {
     downloadCsv<CrossBookRow>("cross_book.csv", rows, [
@@ -136,134 +130,100 @@ export function CrossBook() {
   }
 
   return (
-    <div className="space-y-5">
-      <div className="flex items-end justify-between">
-        <div>
-          <h1 className="text-lg font-semibold text-fg">Cross-book</h1>
-          <p className="mt-0.5 text-xs text-faint">
-            Line shopping &amp; middle candidates from the DFS board, plus TRUE
-            two-way arbitrage from real posted odds. Middles are candidates, not
-            guaranteed.
-          </p>
-        </div>
-        {isFetching && <span className="eyebrow text-faint">scanning…</span>}
-      </div>
-
-      <div className="grid grid-cols-2 gap-3 lg:grid-cols-5">
-        <StatCard label="Pairs (2+ books)" value={fmtInt(data?.kpis.pairs ?? 0)} />
-        <StatCard label="Max gap" value={fmtNum(data?.kpis.max_gap ?? 0)} />
-        <StatCard label={`≥ ${minGap} gap`} value={fmtInt(data?.kpis.over_threshold ?? 0)} />
+    <Page
+      title="Cross-book"
+      description="Line shopping and middle candidates from the DFS board, plus TRUE two-way arbitrage from real posted odds. Middles are candidates, never guaranteed."
+      actions={
+        <>
+          {isFetching && (
+            <span className="text-label text-faint" role="status">
+              Scanning…
+            </span>
+          )}
+          <Button onClick={exportCsv} disabled={!rows.length} title="Download the line-shopping table">
+            <span aria-hidden>↓</span> Export CSV
+          </Button>
+        </>
+      }
+    >
+      <KpiGrid cols={5}>
+        <StatCard label="Pairs (2+ books)" value={data ? fmtInt(data.kpis.pairs) : DASH} />
+        <StatCard label="Max gap" value={data ? fmtLine(data.kpis.max_gap) : DASH} />
+        <StatCard label={`Gap ≥ ${fmtNum(minGap)}`} value={data ? fmtInt(data.kpis.over_threshold) : DASH} />
         <StatCard
           label="True arbs"
-          value={fmtInt(data?.kpis.arb_count ?? 0)}
-          tone={(data?.kpis.arb_count ?? 0) > 0 ? "pos" : "default"}
-          accent={(data?.kpis.arb_count ?? 0) > 0}
+          value={data ? fmtInt(arbCount) : DASH}
+          tone={arbCount > 0 ? "pos" : "default"}
+          accent={arbCount > 0}
           sub="real odds only"
         />
-        <StatCard
-          label="Freshest line"
-          value={
-            data?.kpis.freshest_hours != null
-              ? `${fmtNum(data.kpis.freshest_hours)}h`
-              : "—"
-          }
-          sub="scraped ago"
-        />
-      </div>
+        <StatCard label="Freshest line" value={fmtHoursAgo(data?.kpis.freshest_hours)} sub="scraped" />
+      </KpiGrid>
 
-      {/* Filters */}
-      <div className="panel space-y-3 p-4">
-        <div className="flex flex-wrap items-center gap-6">
-          <div className="flex items-center gap-2">
-            <span className="eyebrow">Model</span>
-            <Segmented options={MODEL_MODES} value={modelMode} onChange={setModelMode} />
+      <Card title="Filters">
+        <div className="space-y-4">
+          <div className="flex flex-wrap items-center gap-6">
+            <Segmented label="Model mode" options={MODEL_MODES} value={modelMode} onChange={setModelMode} />
+            <NumberField label="Min gap" value={minGap} onChange={setMinGap} step={0.5} min={0} max={100} />
+            <NumberField label="Min books" value={minBooks} onChange={setMinBooks} min={2} max={12} />
           </div>
-          <NumberField label="min gap" value={minGap} onChange={setMinGap} step={0.5} min={0} />
-          <NumberField label="min books" value={minBooks} onChange={setMinBooks} min={2} max={12} />
-          <button
-            onClick={exportCsv}
-            disabled={!rows.length}
-            className="tnum rounded border border-line px-2.5 py-1 text-[11px] text-muted enabled:hover:border-line-strong enabled:hover:text-fg disabled:opacity-40"
-          >
-            ↓ CSV
-          </button>
-        </div>
-        <div className="flex flex-wrap items-start gap-2">
-          <span className="eyebrow mt-1 w-12">Books</span>
-          <div className="flex flex-1 flex-wrap gap-1">
+          <FilterRow label="Books">
             {allBooks.map((b) => (
-              <Chip key={b} active={books.includes(b)} onClick={() => toggle(books, setBooks, b)}>
+              <Chip key={b} active={books.includes(b)} onClick={() => setBooks(toggleItem(books, b))}>
                 {b}
               </Chip>
             ))}
-          </div>
-        </div>
-        <div className="flex flex-wrap items-start gap-2">
-          <span className="eyebrow mt-1 w-12">Stats</span>
-          <div className="flex flex-1 flex-wrap gap-1">
+          </FilterRow>
+          <FilterRow label="Stats">
             {allStats.map((s) => (
-              <Chip key={s} active={stats.includes(s)} onClick={() => toggle(stats, setStats, s)}>
+              <Chip key={s} active={stats.includes(s)} onClick={() => setStats(toggleItem(stats, s))}>
                 {statLabel(s)}
               </Chip>
             ))}
-          </div>
+          </FilterRow>
         </div>
-      </div>
+      </Card>
 
-      {/* Line shopping / middles */}
-      <section className="panel">
-        <div className="flex items-center justify-between border-b border-line px-4 py-2.5">
-          <h2 className="eyebrow">Line shopping &amp; middle candidates</h2>
-          <span className="text-[11px] text-faint">
-            {fmtInt(rows.length)} shown · {fmtInt(data?.n_lines ?? 0)} lines scanned
-          </span>
-        </div>
+      <Card
+        title="Line shopping & middle candidates"
+        meta={data ? `${fmtInt(rows.length)} shown · ${fmtInt(data.n_lines)} lines scanned` : undefined}
+        flush
+      >
         {isError ? (
           <div className="p-4">
-            <ErrorState message="Cross-book scan failed." />
+            <ErrorState message={errorMessage(error, "Cross-book scan failed.")} />
           </div>
         ) : isLoading ? (
-          <Loading rows={8} />
+          <TableSkeleton rows={8} cols={10} />
         ) : rows.length ? (
-          <CrossBookTable
-            rows={rows}
-            onRowClick={(r) =>
-              navigate(
-                `/player?name=${encodeURIComponent(r.player_name)}&stat=${r.stat_type}`,
-              )
-            }
-          />
+          <CrossBookTable rows={rows} onRowClick={(r) => navigate(playerHref(r.player_name, r.stat_type))} />
         ) : (
           <EmptyState
             title="No cross-book opportunities."
-            hint="Needs 2+ books quoting the same player+stat within the lookback window. During the NBA offseason the DFS board is empty, so this fills in once lines return in October."
+            hint="Needs 2+ books quoting the same player + stat within the lookback window. During the NBA offseason the DFS board is empty, so this fills in once lines return in October."
             lastData={
-              data?.kpis.freshest_hours != null
-                ? `freshest line ${fmtNum(data.kpis.freshest_hours)}h ago`
-                : null
+              data?.kpis.freshest_hours != null ? `freshest line ${fmtHoursAgo(data.kpis.freshest_hours)}` : null
             }
           />
         )}
-      </section>
+      </Card>
 
-      {/* TRUE arb — visually distinct */}
-      <section className="rounded-md border border-pos-dim/40 bg-pos-soft/30">
-        <div className="flex items-center justify-between border-b border-pos-dim/40 px-4 py-2.5">
-          <h2 className="eyebrow text-pos">True two-way arbitrage · real odds only</h2>
-          <span className="tnum text-[11px] text-pos">
-            {fmtInt(arbs.length)} locked
-          </span>
-        </div>
+      {/* TRUE arb — the one surface whose whole meaning is locked +EV. */}
+      <Card
+        tone="pos"
+        title="True two-way arbitrage · real odds only"
+        meta={<span className="tnum text-pos">{fmtInt(arbs.length)} locked</span>}
+        flush
+      >
         <ArbSection arbs={arbs} />
-      </section>
+      </Card>
 
-      <p className="text-[11px] leading-relaxed text-faint">
-        Line shopping / middle rows come from the DFS board (assumed -110) and are
-        NEVER guaranteed profit. Only the true-arb section — sourced from real
-        posted odds on both legs with raw implied sum &lt; 1.0 in an executable
-        direction — is locked profit. P(over) shown at each end uses the row's
-        fitted model, for reference.
+      <p className="max-w-4xl text-label text-faint">
+        Line shopping / middle rows come from the DFS board (assumed -110) and are NEVER guaranteed
+        profit. Only the true-arb section — sourced from real posted odds on both legs with raw
+        implied sum &lt; 1.0 in an executable direction — is locked profit. P(over) shown at each end
+        uses the row's fitted model, for reference.
       </p>
-    </div>
+    </Page>
   );
 }

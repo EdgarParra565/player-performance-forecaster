@@ -76,5 +76,9 @@ def win_rate_significance_summary(
         "breakeven_prob": float(breakeven_p),
         "z_score_vs_breakeven": z_test["z_score"],
         "p_value_vs_breakeven": z_test["p_value"],
-        "significant_at_5pct": float(z_test["p_value"]) < 0.05,
+        # "Significant" means significantly BETTER than breakeven: a strategy
+        # that loses significantly (z < 0) must not be flagged.
+        "significant_at_5pct": (
+            float(z_test["p_value"]) < 0.05 and float(z_test["z_score"]) > 0
+        ),
     }

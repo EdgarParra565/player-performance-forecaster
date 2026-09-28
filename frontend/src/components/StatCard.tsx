@@ -4,7 +4,7 @@ interface StatCardProps {
   label: string;
   value: ReactNode;
   sub?: ReactNode;
-  // Optional polarity accent on the value (e.g. +EV green).
+  // Polarity accent on the value — only for values that ARE +EV / -EV.
   tone?: "default" | "pos" | "neg" | "warn";
   accent?: boolean;
 }
@@ -16,18 +16,25 @@ const TONE: Record<string, string> = {
   warn: "text-warn",
 };
 
-// The KPI tile. A left accent rule + eyebrow label + large mono value.
+// The KPI tile: small label, large tabular figure, quiet caption.
 export function StatCard({ label, value, sub, tone = "default", accent }: StatCardProps) {
   return (
-    <div className="panel relative overflow-hidden px-4 py-3">
+    <div className="panel relative overflow-hidden px-4 py-4">
       {accent && (
-        <div className="absolute inset-y-0 left-0 w-0.5 bg-pos" aria-hidden />
+        <div
+          className="absolute inset-x-0 top-0 h-px bg-linear-to-r from-pos/0 via-pos/80 to-pos/0"
+          aria-hidden
+        />
       )}
-      <div className="eyebrow">{label}</div>
-      <div className={`tnum mt-1.5 text-2xl leading-none font-semibold ${TONE[tone]}`}>
-        {value}
-      </div>
-      {sub && <div className="mt-1.5 text-[11px] text-faint">{sub}</div>}
+      <div className="text-label font-medium text-muted">{label}</div>
+      <div className={`num mt-2 truncate text-kpi font-semibold ${TONE[tone]}`}>{value}</div>
+      {sub && <div className="mt-1 truncate text-caption text-faint">{sub}</div>}
     </div>
   );
+}
+
+// Tone for a signed KPI (EV, CLV, units): green above zero, red below.
+export function signedTone(v: number | null | undefined): "default" | "pos" | "neg" {
+  if (v == null || !Number.isFinite(v) || Math.abs(v) < 1e-9) return "default";
+  return v > 0 ? "pos" : "neg";
 }

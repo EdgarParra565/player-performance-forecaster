@@ -15,7 +15,8 @@ The current baseline is designed to be reproducible offline (synthetic benchmark
 - NBA API ingest (`nba_model/data/nba_results_ingestion.py`) populates a `games` table (8K+ team-game rows) and bulk player game logs (90K+ rows across 3 seasons + 1K players) from `leaguegamefinder` / `playergamelogs`.
 - Streamlit + Tk UIs both expose Player charts, Team charts, Game Results, and Player Stats Browse. All graphing inputs go through `nba_model/web/input_validation.py` (stat type / team code / season / rolling window).
 - Streamlit web app is at full feature parity with the desktop Tk UI: Single prop (full model tuning), Manual lines import (admin-only DB save), and an admin-only Operations console join the Player/Team chart, Compare, browse, and Parlay views. Every web chart renders via Plotly (zoom / hover / legend-toggle); the line board highlights the best-EV side and offers a compact "line ladder" layout.
-- Hourly self-update path (`nba_model/data/hourly_update.py` + `scripts/scheduler/`): a real Chrome (`:9222`) host re-scrapes books, refreshes game logs, and recomputes predictions every hour via launchd (cron fallback). Scraped lines are stored change-only (a new `web_prop_cards` / `web_team_lines` row lands only when the book actually moves the line/odds).
+- Hourly self-update path (`nba_model/data/hourly_update.py` + `scripts/scheduler/`): a real Chrome (`:9222`) host re-scrapes books, refreshes game logs, and recomputes predictions every hour via launchd (cron fallback). Scraped lines are stored change-only (a new `web_prop_cards` / `web_team_lines` row lands only when the book actually moves the line/odds; `last_seen_at_utc` tracks unchanged re-sights).
+- **Scraping autopilot (zero routine manual input)**: launchd keeps a dedicated scraping Chrome alive on `:9222` with its own persistent profile (book logins survive reboots), the hourly job fires at :05 by the clock (missed-during-sleep runs fire once on wake; a keep-awake agent holds the Mac up on AC power), stale book tabs are closed before every capture, and a per-book session-health check alerts once (macOS notification / `NBA_ALERT_WEBHOOK_URL`) when a book needs a manual re-login — the only remaining manual step (`scripts/scheduler/login_setup.sh`). Geo/age-blocked books live in `data/config/blocked_books.txt`. Setup in `scripts/scheduler/README.md`.
 - **Book Edge Scanner** (`nba_model/model/edge_scanner.py` + the "Line edge scanner" Streamlit view): pick one or more books and rank the whole slate's props by *model-vs-line edge* (not cross-book arbitrage). Three model modes: `chart_mean` (default quick screen — fitted normal, μ = last-N mean, σ = sample std), `rolling`, and `full` (`--model-mode full` — the complete prop_board projection: rolling μ/σ + team priors + per-stat default distribution, sharing the exact helpers the hourly `predictions` recompute uses so the two can't drift). DFS books without a posted price use the -110 breakeven (52.4%). Not validated for real-money betting — see `notes.txt` WS10.
 - **Cross-book layer + paper-trading tooling**: `nba_model/model/cross_book_arb.py` + the "Cross-book" Streamlit view separate three signals — line shopping (best over/under book), middle candidates (wide line gaps), and TRUE two-way arb (flagged only from real posted odds in `betting_lines` whose raw implied probabilities sum < 1; never from assumed -110). The WS10 measurement stack — `bet_log` table, `bet_slip` export CLI, `calibration_report`, `hourly_update --settle-bet-log` — is built and waiting on in-season market data (see "Paper trading / bet_log" below).
 - **Team-line priors wired into the live model**: `blend_team_prior()` (pace + implied team total from the cross-book `team_priors` table) now nudges `run_single_prop`, `prop_board`, and the hourly recompute so the model μ and the chart book-mean share one signal.
@@ -24,8 +25,8 @@ The current baseline is designed to be reproducible offline (synthetic benchmark
 - Admin dashboard (subscribers / MRR estimate / churn) gated to `is_admin()`; Stripe `STRIPE_MODE=test|live` env toggle; webhook alert on `invoice.payment_failed`; free-tier app-layer scan throttle; optional first-sign-in trial (`ENABLE_TRIAL`).
 - ETL alerting: daily + hourly reports embed an `alert` marker and accept `--alert-webhook-url`. The hourly recompute persists predictions for points/assists/rebounds/pra. The distribution sweep settles each stat at a realistic per-stat line by default (no more `line == mean` degeneracy).
 - **Multi-sport scaffolding:** idempotent `sport` column on core tables, per-`(book, sport)` scraper resolution, registry-driven stat validation. `sports/` package: NBA live; MLB data layer beta (ingest + **FanDuel and DraftKings team lines, both live-verified**); NFL/NHL/soccer stubs. Streamlit sport-picker shows roadmap cards for non-live sports. Rollout plan: [docs/MULTI_SPORT_PLAN.md](docs/MULTI_SPORT_PLAN.md). Active tracker: `notes.txt`.
-- **New flagship UI (Phases 1 + 2 complete)**: a standalone trading-terminal-style frontend — read-only FastAPI service in `api/` + React/TypeScript/Vite/Tailwind/ECharts app in `frontend/` — parallel to (not replacing) the Streamlit and Tk UIs. Five views verified against the live DB: Slate Dashboard, Player Detail (flagship, now with a line-movement replay panel — play/pause + scrubber over per-book snapshot drift), Edge Scanner, **Cross-book** (line shopping / middle candidates / TRUE two-way arb with KPIs, filters, and CSV export — same pipeline as the Streamlit view), and **Team Charts** (per-game aggregates + props-derived reference lines). ECharts is code-split (initial route chunk ~1.4 MB → ~370 KB). Run: `.venv/bin/python3 -m uvicorn api.main:app --port 8000` + `npm run dev` in `frontend/` → http://localhost:5173 (docs in `frontend/README.md`; Phase 3 roadmap in `notes.txt` "New UI (flagship)").
-- **702 tests passing** in the core suite (regression + stress + adversarial + edge-scanner + cross-book + bet-log/paper-trading + billing + multi-sport + team-chart derived references), plus 21 API-service tests (`.venv/bin/python3 -m pytest api/tests -q`) and 14 frontend component tests (`npm run test` in `frontend/`) run separately. `bandit` MEDIUM/HIGH = 0; `pip-audit` clean.
+- **New flagship UI (Phases 1–3 complete, deploy-ready)**: a standalone trading-terminal-style frontend — read-only FastAPI service in `api/` + React/TypeScript/Vite/Tailwind/ECharts app in `frontend/` — parallel to (not replacing) the Streamlit and Tk UIs. Eight views: Slate Dashboard, Player Detail (line-movement replay with play/pause + scrubber), Edge Scanner, Cross-book (line shopping / middles / TRUE two-way arb), Team Charts, **Parlay builder** (correlation-aware joint probability vs the naive independent product, compute-only), **Paper Trades** (`bet_log` picks + CLV + calibration/Brier), and a client-side **Watchlist** (localStorage, shareable `?w=` links). Redesigned design system (self-hosted fonts, type scale, shared ECharts theme, skeleton loading), full mobile pass (bottom tab bar, 44px tap targets), per-IP rate limiting, optional `FLAGSHIP_ACCESS_CODE` gate, and hardened error handling. Local run: `.venv/bin/python3 -m uvicorn api.main:app --port 8000` + `npm run dev` in `frontend/` → http://localhost:5173. Single-container deploy: `docker compose up flagship` (→ :8080, strict smoke check 18/18 in-container). Cloud deploy: Fly.io + Tigris object storage with hourly compressed DB publish (`publish_db.sh --to-object-store`), atomic in-app swap, and one-command rollback — commands in [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) §16 (awaiting the Fly account step).
+- **891 tests passing** in the core suite (regression + stress + adversarial + edge-scanner + cross-book + bet-log/paper-trading + billing + multi-sport + money-math/data-integrity review suites; note `test_daily_etl.py` requires network access to stats.nba.com), plus 99 API tests (`.venv/bin/python3 -m pytest api/tests -q`) and 99 frontend component tests + clean `tsc` (`npm run test` in `frontend/`) run separately. `bandit` MEDIUM/HIGH = 0; `pip-audit` clean.
 
 ## Repository Layout
 
@@ -1128,11 +1129,37 @@ Latest results are generated into:
 
 ## Operational Runbook (ETL & Odds Ingestion)
 
+- **Scraping autopilot (Mac host, launchd)** — full runbook in
+  [scripts/scheduler/README.md](scripts/scheduler/README.md). Two LaunchAgents:
+  `com.nba.scraping-chrome` keeps a dedicated scraping Chrome alive
+  (`--remote-debugging-port=9222`, persistent profile at
+  `~/Library/Application Support/nba-scraping-chrome` — never the daily Chrome
+  profile; `KeepAlive=true`), `com.nba.hourly` runs the hourly ETL at :05 past
+  every hour (wall-clock `StartCalendarInterval`), and the optional
+  `com.nba.keep-awake` (`caffeinate -s`) stops system sleep on AC power so the
+  loop keeps running. One-time login pass: `scripts/scheduler/login_setup.sh`
+  (opens a tab per auth book, live checklist; you type the credentials). Books
+  blocked for non-auth reasons (geo/age) go in `data/config/blocked_books.txt`.
+  - Load: `sed "s|/ABSOLUTE_PATH_TO_REPO|$(pwd)|g" scripts/scheduler/<agent>.plist > ~/Library/LaunchAgents/<agent>.plist`
+    then `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/<agent>.plist`
+    (Chrome agent first; sign in to the books once in that window).
+  - Unload: `launchctl bootout gui/$(id -u)/com.nba.hourly`,
+    `launchctl bootout gui/$(id -u)/com.nba.keep-awake` and
+    `launchctl bootout gui/$(id -u)/com.nba.scraping-chrome` (quitting Chrome
+    alone just gets it relaunched).
+  - Alerts: set `NBA_ALERT_WEBHOOK_URL` in the hourly plist (or pass
+    `--alert-webhook-url`); a macOS notification also fires. Book sessions are
+    classified every hour (`ok` / `login-needed` / `unreachable`, top-level
+    `session_health` in the report) and a re-login alert fires once per NEW
+    login-needed — re-signing in to that book in the scraping Chrome is the
+    only routine manual step. No automated logins or stored credentials.
 - **CDP Chrome tab hygiene (scraping host)**: the fetcher reuses an existing tab
-  already open on a target URL, and existing-tab reuse skips navigation and content
-  waits — so stale tabs left open in the `:9222` debug Chrome produce silently-stale
-  captures (this masked a DraftKings grid regression on 2026-07-22 until 9 leftover
-  tabs were closed). Close leftover book tabs in the debug Chrome before scrape runs.
+  on the target's DOMAIN (not the exact URL) and reuse skips navigation and
+  content waits, so a leftover tab yields a silently-stale capture (this masked a
+  DraftKings grid regression on 2026-07-22). The hourly runner now closes every
+  open tab on a target host before fetching (default ON; `--no-close-stale-tabs`
+  to skip). For manual runs pass `--close-stale-tabs` to
+  `python -m nba_model.model.web_text_ingestion` with `--chrome-debug-port`.
 - **Check scheduler health**:
   - Verify the `Daily NBA ETL` GitHub Actions workflow is running on schedule and succeeding.
   - On failures, inspect the workflow logs and the **"Show ETL failure summary"** step (which prints per-step status from the last report).

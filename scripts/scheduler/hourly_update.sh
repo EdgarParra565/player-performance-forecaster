@@ -32,17 +32,18 @@ if [[ ! -x "${VENV_PY}" ]]; then
     exit 78
 fi
 
-# Preflight: confirm Chrome CDP is reachable BEFORE we exec the Python entry
-# (the Python module re-checks this too, but failing here gives a clear
-# launchd-log message even when Python imports break).
+# Advisory CDP check only — a clear launchd-log line. It must NOT exit here:
+# the Python preflight is what writes the JSON report and fires the alert
+# webhook when Chrome is down (exit 78 from Python, same code as before).
 CHROME_PORT="${CHROME_PORT:-9222}"
 CHROME_HOST="${CHROME_HOST:-127.0.0.1}"
 if ! curl --silent --fail --max-time 2 "http://${CHROME_HOST}:${CHROME_PORT}/json/version" > /dev/null; then
-    echo "ERROR: Chrome CDP unreachable at http://${CHROME_HOST}:${CHROME_PORT}/json/version" >&2
-    echo "Start Chrome with:" >&2
-    echo "  open -na 'Google Chrome' --args --remote-debugging-port=${CHROME_PORT} --user-data-dir=/tmp/pp-chrome-profile" >&2
-    echo "Then log in to PrizePicks/Underdog/DK/BetMGM/Caesars before the next hourly tick." >&2
-    exit 78
+    echo "WARNING: Chrome CDP unreachable at http://${CHROME_HOST}:${CHROME_PORT}/json/version" >&2
+    echo "The com.nba.scraping-chrome LaunchAgent should keep it up; check:" >&2
+    echo "  launchctl list | grep com.nba.scraping-chrome" >&2
 fi
 
-exec "${VENV_PY}" -m nba_model.data.hourly_update "$@"
+# Forward the port/host so the Python run targets the same Chrome (later
+# "$@" flags still win — argparse keeps the last occurrence).
+exec "${VENV_PY}" -m nba_model.data.hourly_update \
+    --chrome-port "${CHROME_PORT}" --chrome-host "${CHROME_HOST}" "$@"

@@ -122,4 +122,39 @@ def normalize_team(value: str) -> str | None:
     return None
 
 
-__all__ = ["normalize_team", "team_code_to_canonical", "TEAM_NAME_PATTERN"]
+# Canonical short name → the NBA 3-letter code used by players.team,
+# games.team_abbrev and game_logs.matchup (nba_api convention). This is the
+# key space every team-prior CONSUMER looks up in, so team_priors is written
+# with these codes (the book pages / consensus layer use the nicknames).
+_CANONICAL_TO_ABBREV: dict[str, str] = {
+    "Hawks": "ATL", "Celtics": "BOS", "Nets": "BKN", "Hornets": "CHA",
+    "Bulls": "CHI", "Cavaliers": "CLE", "Mavericks": "DAL", "Nuggets": "DEN",
+    "Pistons": "DET", "Warriors": "GSW", "Rockets": "HOU", "Pacers": "IND",
+    "Clippers": "LAC", "Lakers": "LAL", "Grizzlies": "MEM", "Heat": "MIA",
+    "Bucks": "MIL", "Timberwolves": "MIN", "Pelicans": "NOP", "Knicks": "NYK",
+    "Thunder": "OKC", "Magic": "ORL", "76ers": "PHI", "Suns": "PHX",
+    "Trail Blazers": "POR", "Kings": "SAC", "Spurs": "SAS", "Raptors": "TOR",
+    "Jazz": "UTA", "Wizards": "WAS",
+}
+NBA_TEAM_ABBREVS = frozenset(_CANONICAL_TO_ABBREV.values())
+
+
+def team_abbrev(value: str) -> str | None:
+    """Return the NBA 3-letter code for any known team form.
+
+    ``"76ers"`` / ``"Philadelphia 76ers"`` / ``"PHI"`` / ``"phi"`` → ``"PHI"``.
+    Returns None when ``value`` isn't a known NBA team.
+    """
+    if not value:
+        return None
+    upper = str(value).strip().upper()
+    if upper in NBA_TEAM_ABBREVS:
+        return upper
+    canonical = normalize_team(value)
+    return _CANONICAL_TO_ABBREV.get(canonical) if canonical else None
+
+
+__all__ = [
+    "normalize_team", "team_code_to_canonical", "team_abbrev",
+    "NBA_TEAM_ABBREVS", "TEAM_NAME_PATTERN",
+]

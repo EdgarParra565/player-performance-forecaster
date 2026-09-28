@@ -134,8 +134,13 @@ def _draw_samples(
         if mean <= 1e-9:
             return np.zeros(n, dtype=float)
         variance = max(std * std, 1e-6)
-        p = float(np.clip(1.0 - (variance / mean), 1e-4, 0.999))
-        n_trials = int(np.clip(np.ceil(mean / p), 1, 5000))
+        p_raw = 1.0 - (variance / mean)
+        if p_raw <= max(1e-4, mean / 5000.0):
+            # Binomial moments need var < mean (see probability.py); fall back
+            # to NB / Poisson instead of collapsing the mean.
+            return _draw_samples(mean, std, n, "negative_binomial", sample_size)
+        p = min(p_raw, 0.999)
+        n_trials = int(max(1, np.ceil(mean / p)))
         return rng.binomial(n=n_trials, p=p, size=n).astype(float)
 
     if dist == "negative_binomial":

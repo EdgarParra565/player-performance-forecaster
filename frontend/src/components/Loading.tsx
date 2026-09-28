@@ -1,30 +1,25 @@
-interface LoadingProps {
-  label?: string;
-  rows?: number;
+import { ApiError } from "../api/client";
+import { TableSkeleton } from "./Skeleton";
+
+// Back-compat loading block: a table-shaped skeleton.
+export function Loading({ rows = 5 }: { rows?: number }) {
+  return <TableSkeleton rows={rows} />;
 }
 
-// Skeleton shimmer rows — keeps the dense-table rhythm while data loads.
-export function Loading({ label, rows = 5 }: LoadingProps) {
-  return (
-    <div className="py-4">
-      {label && <div className="eyebrow mb-3 px-3">{label}</div>}
-      <div className="space-y-1.5 px-3">
-        {Array.from({ length: rows }).map((_, i) => (
-          <div
-            key={i}
-            className="h-7 animate-pulse rounded bg-panel-2"
-            style={{ opacity: 1 - i * 0.12 }}
-          />
-        ))}
-      </div>
-    </div>
-  );
+// Turn a query error into a human message, keeping the API's `detail`
+// (e.g. "model_mode must be one of …", "database not found").
+export function errorMessage(error: unknown, fallback: string): string {
+  if (error instanceof ApiError && error.message) return `${fallback} ${error.message}`;
+  return fallback;
 }
 
 export function ErrorState({ message }: { message: string }) {
   return (
-    <div className="flex items-center gap-2 rounded border border-neg-dim/40 bg-neg-soft px-3 py-2.5 text-xs text-neg">
-      <span className="h-1.5 w-1.5 rounded-full bg-neg" />
+    <div
+      role="alert"
+      className="flex items-center gap-2 rounded-lg border border-neg-dim/50 bg-neg-soft px-4 py-3 text-body text-neg"
+    >
+      <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-neg" aria-hidden />
       {message}
     </div>
   );

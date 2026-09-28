@@ -115,9 +115,14 @@ def _safe_implied_prob(odds) -> Optional[float]:
     if odds is None or _is_nan(odds):
         return None
     try:
-        return float(american_to_implied_prob(int(round(float(odds)))))
+        american = int(round(float(odds)))
     except (TypeError, ValueError):
         return None
+    # Valid American odds have |odds| >= 100; 0 or -50 would imply a
+    # probability of 0 / 1/3 and fabricate a "guaranteed" arb.
+    if abs(american) < 100:
+        return None
+    return float(american_to_implied_prob(american))
 
 
 # ---------------------------------------------------------------------------
@@ -225,7 +230,8 @@ def fetch_two_way_lines(
     """Latest deduped ``betting_lines`` row per ``(player, stat, book, game_date)``
     joined to ``players`` for the display name.
 
-    Mirrors ``fetch_latest_prop_lines`` (newest ``scraped_at`` wins). Unlike the
+    Mirrors ``fetch_latest_prop_lines`` (newest ``scraped_at`` wins, among MAIN
+    lines — alt-line rungs are excluded; books compare case-insensitively). Unlike the
     DFS ``web_prop_cards`` board, ``betting_lines`` carries real ``over_odds`` /
     ``under_odds`` — this is the ONLY input from which a true arb may be flagged.
     An empty ``books`` selection returns a correctly-shaped empty frame.
@@ -233,7 +239,9 @@ def fetch_two_way_lines(
     if books is not None and len(books) == 0:
         return pd.DataFrame(columns=TWO_WAY_LINE_COLUMNS)
 
-    clauses = ["bl.line_value IS NOT NULL"]
+    # Main lines only: an alt-line ladder's top rung must not stand in for the
+    # book's line (untagged legacy rows count as main).
+    clauses = ["bl.line_value IS NOT NULL", "COALESCE(bl.is_main_line, 1) = 1"]
     params: list = []
     if since_hours and since_hours > 0:
         clauses.append("bl.scraped_at >= datetime('now', ?)")

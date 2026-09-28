@@ -86,7 +86,7 @@ class _RunnerState:
     ) -> bool:
         if self.is_running():
             return False
-        env = os.environ.copy()
+        env = scrubbed_env(os.environ)
         env["PYTHONUNBUFFERED"] = "1"
         if env_extra:
             env.update(env_extra)
@@ -147,6 +147,27 @@ class _RunnerState:
 # but session_state survives, so we stash the live _RunnerState there.
 # ---------------------------------------------------------------------------
 _RUNNER_KEY = "_ops_runner_state"
+
+
+# Secrets no Operations job needs. Child processes inherit the environment
+# and their output lands in a transcript shown on screen, so billing / cloud
+# credentials are stripped. Keys the ETL jobs DO need (e.g. the Odds API key)
+# pass through — this is a denylist on purpose.
+_SCRUB_PREFIXES = ("STRIPE_", "AWS_", "DB_SYNC_")
+_SCRUB_EXACT = frozenset({
+    "SUBSCRIPTIONS_DB_URL",       # Postgres DSN with password
+    "FLAGSHIP_ACCESS_CODE",
+    "BILLING_ALERT_WEBHOOK_URL",
+    "BUCKET_NAME",
+})
+
+
+def scrubbed_env(base) -> dict[str, str]:
+    """Copy of ``base`` without billing / cloud-storage secrets."""
+    return {
+        k: v for k, v in dict(base).items()
+        if not k.upper().startswith(_SCRUB_PREFIXES) and k.upper() not in _SCRUB_EXACT
+    }
 
 
 def _get_runner() -> _RunnerState:

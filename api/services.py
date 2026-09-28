@@ -75,14 +75,33 @@ def _distinct_books(db: DatabaseManager) -> list[str]:
     return sorted(books)
 
 
+def _utc_iso(value) -> Optional[str]:
+    """Normalise a stored timestamp to ISO-8601 UTC with an explicit offset.
+
+    Sources mix formats (``2026-07-22 01:25:56`` naive-UTC in betting_lines vs
+    ``2026-07-21T22:47:43+00:00`` in web_prop_cards); string-comparing them is
+    wrong, and a naive string is read as LOCAL time by browsers.
+    """
+    if value is None or value == "":
+        return None
+    try:
+        ts = pd.Timestamp(str(value))
+    except (ValueError, TypeError):
+        return None
+    if pd.isna(ts):
+        return None
+    ts = ts.tz_localize("UTC") if ts.tzinfo is None else ts.tz_convert("UTC")
+    return ts.isoformat()
+
+
 def _freshest_scrape(db: DatabaseManager) -> Optional[str]:
-    """Newest scrape timestamp across every live-line source."""
+    """Newest scrape timestamp across every live-line source (UTC ISO)."""
     candidates = [
-        _scalar(db, "SELECT MAX(observed_at_utc) FROM web_prop_cards"),
-        _scalar(db, "SELECT MAX(observed_at_utc) FROM web_team_lines"),
-        _scalar(db, "SELECT MAX(scraped_at) FROM betting_lines"),
+        _scalar(db, "SELECT MAX(datetime(observed_at_utc)) FROM web_prop_cards"),
+        _scalar(db, "SELECT MAX(datetime(observed_at_utc)) FROM web_team_lines"),
+        _scalar(db, "SELECT MAX(datetime(scraped_at)) FROM betting_lines"),
     ]
-    vals = [str(c) for c in candidates if c]
+    vals = [v for v in (_utc_iso(c) for c in candidates) if v]
     return max(vals) if vals else None
 
 
@@ -97,7 +116,9 @@ def slate_kpis(db_path: str) -> dict:
         prop_recent = _int(_scalar(
             db,
             "SELECT COUNT(*) FROM web_prop_cards "
-            "WHERE observed_at_utc >= datetime('now', '-48 hours')",
+            # datetime() normalises the ISO 'T'/offset form so the string
+            # comparison against datetime('now', ...) is apples to apples.
+            "WHERE datetime(observed_at_utc) >= datetime('now', '-48 hours')",
         )) or 0
     return {
         "games_in_db": games,
@@ -267,7 +288,9 @@ def search_players(
     if df is not None and not df.empty:
         query = (q or "").strip().lower()
         if query:
-            df = df[df["player_name"].str.lower().str.contains(query, na=False)]
+            # Literal substring match: `q` is user input, never a regex.
+            df = df[df["player_name"].str.lower().str.contains(
+                query, na=False, regex=False)]
         if only_with_lines and "n_books" in df.columns:
             df = df[df["n_books"] > 0]
         df = df.head(int(max(1, limit)))
@@ -434,8 +457,9 @@ def player_detail(
         "rolling_window": int(rolling_window),
         "kpis": {
             "n_games": int(values.size),
-            "mu": _num(mu),
-            "sigma": _num(sigma),
+            # No games -> no estimate (null), never a fake 0.0 projection.
+            "mu": _num(mu) if values.size else None,
+            "sigma": _num(sigma) if values.size else None,
             "market_consensus_line": _num(data.market_consensus_line),
             "n_books": len(book_rows),
             "positive_ev_sides": positive_ev,
@@ -447,7 +471,7 @@ def player_detail(
         "book_lines": book_rows,
         "notes": list(data.notes or []),
         "last_line_scraped_utc": (
-            staleness.get("latest_iso") if staleness else None
+            _utc_iso(staleness.get("latest_iso")) if staleness else None
         ),
     }
 
@@ -581,6 +605,32 @@ def cross_book(
 # Line movement (snapshot drift per book) — Player Detail animation
 # ---------------------------------------------------------------------------
 
+def _american_implied(odds: Optional[int]) -> Optional[float]:
+    if odds is None or odds == 0:
+        return None
+    return 100.0 / (odds + 100.0) if odds > 0 else -odds / (-odds + 100.0)
+
+
+def _main_line(candidates: list[dict]) -> dict:
+    """Pick a book's main line out of one snapshot's alt-line ladder.
+
+    The main line is the most balanced market: smallest |implied(over) -
+    implied(under)|. Rows without both prices fall back to the median line.
+    """
+    if len(candidates) == 1:
+        return candidates[0]
+    priced = []
+    for c in candidates:
+        po = _american_implied(c["over_odds"])
+        pu = _american_implied(c["under_odds"])
+        if po is not None and pu is not None:
+            priced.append((abs(po - pu), c["line"], c))
+    if priced:
+        return min(priced, key=lambda t: (t[0], t[1]))[2]
+    ordered = sorted(candidates, key=lambda c: c["line"])
+    return ordered[(len(ordered) - 1) // 2]
+
+
 def line_movement(
     db_path: str,
     player_id: int,
@@ -600,18 +650,23 @@ def line_movement(
         timestamps = ts_all
         n_snapshots = int(len(df))
         for book, grp in df.groupby("book", sort=True):
-            points = []
+            # A single snapshot can carry a book's whole alt-line ladder
+            # (e.g. 24.5 @ -275 ... 33.5 @ +300). Treating those rows as a
+            # time series fabricated "drift", so collapse each timestamp to
+            # the book's MAIN line first.
+            by_ts: dict[str, list[dict]] = {}
             for r in grp.to_dict("records"):
                 ts = _str(r.get("snapshot_ts_utc"))
                 line = _num(r.get("line_value"))
                 if ts is None or line is None:
                     continue
-                points.append({
+                by_ts.setdefault(ts, []).append({
                     "ts": ts,
                     "line": line,
                     "over_odds": _int(r.get("over_odds")),
                     "under_odds": _int(r.get("under_odds")),
                 })
+            points = [_main_line(by_ts[ts]) for ts in sorted(by_ts)]
             if not points:
                 continue
             opening = points[0]["line"]
@@ -666,8 +721,8 @@ def team_chart(
         "series": series,
         "kpis": {
             "n_games": int(values.size),
-            "mu": _num(data.mu),
-            "sigma": _num(data.sigma),
+            "mu": _num(data.mu) if values.size else None,
+            "sigma": _num(data.sigma) if values.size else None,
             "market_consensus_line": _num(data.market_consensus_line),
             "derived_reference_line": _num(data.derived_reference_line),
         },

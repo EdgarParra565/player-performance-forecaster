@@ -5,6 +5,7 @@
 #   docker compose run --rm tests         # run the full pytest suite once
 #   docker compose run --rm etl-bulk      # one-shot bulk NBA-API ingest
 #   docker compose up webhook             # FastAPI Stripe webhook on :8000
+#   docker compose up flagship            # flagship UI + read-only API on :8080
 #   docker compose down                   # tear everything down
 #
 # Notes:
@@ -150,3 +151,38 @@ services:
     restart: unless-stopped
     profiles:
       - billing
+
+  # ---- Flagship UI (React SPA + read-only FastAPI, one origin) ----------
+  # Built by Dockerfile.flagship (node build stage -> python runtime). The DB
+  # is mounted READ-ONLY; the API never writes. Smoke-check after boot:
+  #   python -m api.smoke_check --base-url http://localhost:8080
+  flagship:
+    build:
+      context: .
+      dockerfile: Dockerfile.flagship
+    image: nba-flagship:latest
+    container_name: nba-flagship
+    ports:
+      - "${FLAGSHIP_PORT:-8080}:8080"
+    environment:
+      - NBA_DB_PATH=/data/nba_data.db
+      - API_DOCS=${API_DOCS:-0}
+      # Public deploys: set to your hostname(s), e.g. props.example.com
+      - API_TRUSTED_HOSTS=${API_TRUSTED_HOSTS:-}
+      # IPs allowed to set X-Forwarded-* (your reverse proxy).
+      - FORWARDED_ALLOW_IPS=${FORWARDED_ALLOW_IPS:-127.0.0.1}
+      # Optional private-preview shared code (unset = open). Not real auth.
+      - FLAGSHIP_ACCESS_CODE=${FLAGSHIP_ACCESS_CODE:-}
+      # Per-IP budgets (requests / minute); see DEPLOYMENT.md §15.
+      - API_RATE_HEAVY_PER_MIN=${API_RATE_HEAVY_PER_MIN:-20}
+      - API_RATE_READ_PER_MIN=${API_RATE_READ_PER_MIN:-240}
+    volumes:
+      - ./data/database:/data:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+

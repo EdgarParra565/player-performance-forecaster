@@ -13,12 +13,17 @@ player's own historical baseline.  Tests pin three things:
 
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pandas as pd
 
 from nba_model.data.database.db_manager import DatabaseManager
 from nba_model.model.simulation import blend_team_prior
+
+# Priors older than TEAM_PRIOR_MAX_AGE_HOURS are ignored by every reader, so
+# fixtures stamp "now".
+_NOW_ISO = datetime.now(timezone.utc).isoformat()
 
 
 class BlendTeamPriorTests(unittest.TestCase):
@@ -130,7 +135,7 @@ def _seed_team_priors_and_games(db, *, home_tt, away_tt, pace, lal_points):
     """Seed a DEN@LAL prior + recent LAL games (for the per-team baseline)."""
     db.upsert_team_priors([{
         "away_team": "DEN", "home_team": "LAL",
-        "computed_at_utc": "2025-04-10T00:00:00Z",
+        "computed_at_utc": _NOW_ISO,
         "consensus_total": home_tt + away_tt,
         "home_spread": -3.0, "away_spread": 3.0,
         "home_team_total": home_tt, "away_team_total": away_tt,
@@ -268,6 +273,136 @@ class RunSinglePropTeamPriorTests(unittest.TestCase):
             )
         self.assertFalse(result["team_prior_applied"])
         self.assertAlmostEqual(result["mu"], result["mu_pre_prior"], places=6)
+
+
+def _nickname_team_lines(observed_at):
+    """Two books' Knicks@76ers lines exactly as the book parsers store them
+    (nicknames, not codes)."""
+    rows = []
+    for book, total in (("draftkings", 220.5), ("fanduel", 221.5)):
+        for market, side, team, line, odds in (
+            ("total", "over", None, total, -110),
+            ("total", "under", None, total, -110),
+            ("spread", "home", "76ers", -4.5, -110),
+            ("spread", "away", "Knicks", 4.5, -110),
+            ("moneyline", "home", "76ers", None, -180),
+            ("moneyline", "away", "Knicks", None, 150),
+        ):
+            rows.append({
+                "snapshot_id": 1, "source_url": f"https://{book}.example/nba",
+                "book": book, "observed_at_utc": observed_at,
+                "away_team": "Knicks", "home_team": "76ers",
+                "market_type": market, "side": side, "team": team,
+                "line_value": line, "odds_american": odds,
+                "parse_confidence": 0.9, "parser_version": "test",
+                "record_sha256": f"{book}-{market}-{side}",
+            })
+    return rows
+
+
+class TeamPriorKeyParityTests(unittest.TestCase):
+    """Review finding: priors were written under nicknames ("76ers") while
+    every consumer looks up players.team codes ("PHI"), so the blend never
+    fired in production. Pin writer/reader key parity end to end."""
+
+    def test_consensus_derived_priors_are_found_by_player_team_codes(self):
+        from nba_model.model.team_line_reverse_engineering import (
+            derive_team_priors_from_consensus,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = str(Path(tmp) / "nba.db")
+            with DatabaseManager(db_path=db_path) as db:
+                db.insert_web_team_lines(_nickname_team_lines(_NOW_ISO))
+                db.insert_games([
+                    {"game_id": f"p{i}", "season": "2025-26",
+                     "season_type": "Regular Season", "game_date": f"2026-04-0{i}",
+                     "team_id": 1610612755, "team_abbrev": "PHI",
+                     "matchup": "PHI vs. NYK", "home_away": "home",
+                     "pts": 110, "opp_pts": 100}
+                    for i in range(1, 4)
+                ])
+            summary = derive_team_priors_from_consensus(
+                since_hours=6.0, min_books=2, db_path=db_path)
+            self.assertEqual(summary["games_with_full_priors"], 1)
+            with DatabaseManager(db_path=db_path) as db:
+                keys = {tuple(r) for r in db.conn.execute(
+                    "SELECT away_team, home_team FROM team_priors")}
+                tp_map = db.get_team_prior_inputs_map()
+                inputs = db.get_team_prior_inputs("PHI", "NYK")
+        self.assertEqual(keys, {("NYK", "PHI")})
+        # The exact lookups prop_board / edge_scanner / hourly make.
+        self.assertIn("PHI", tp_map)
+        self.assertIn("NYK", tp_map)
+        self.assertAlmostEqual(inputs["implied_team_total"], (221.0 + 4.5) / 2)
+        # team_recent_avg_total used to be None forever (nickname vs games codes).
+        self.assertAlmostEqual(tp_map["PHI"]["team_recent_avg_total"], 110.0)
+        self.assertAlmostEqual(inputs["team_recent_avg_total"], 110.0)
+        # And the blend actually moves mu for a PHI player.
+        mu, _ = blend_team_prior(20.0, 5.0, **inputs)
+        self.assertNotAlmostEqual(mu, 20.0)
+
+    def test_lookup_accepts_any_team_form(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with DatabaseManager(db_path=str(Path(tmp) / "nba.db")) as db:
+                _seed_team_priors_and_games(
+                    db, home_tt=118.0, away_tt=112.0, pace=1.05, lal_points=110)
+                self.assertIsNotNone(db.get_team_prior("Nuggets", "Lakers"))
+                self.assertIsNotNone(db.get_team_prior("Denver Nuggets", "LAL"))
+
+    def test_stale_priors_are_ignored(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with DatabaseManager(db_path=str(Path(tmp) / "nba.db")) as db:
+                db.upsert_team_priors([{
+                    "away_team": "Knicks", "home_team": "76ers",
+                    "computed_at_utc": "2026-05-11T22:41:32.564928+00:00",
+                    "home_team_total": 115.0, "away_team_total": 110.0,
+                    "pace_factor": 1.1, "n_books": 3,
+                }])
+                self.assertEqual(db.get_team_prior_inputs_map(), {})
+                self.assertEqual(db.get_team_prior_inputs("PHI", "NYK"), {})
+                self.assertIsNone(db.get_team_prior("NYK", "PHI"))
+                # Explicit opt-out still reads history.
+                self.assertIsNotNone(db.get_team_prior("NYK", "PHI", max_age_hours=None))
+
+    def test_newest_prior_wins_when_team_has_several(self):
+        now = datetime.now(timezone.utc)
+        newer = now.isoformat()
+        older = (now - timedelta(hours=2)).isoformat()
+        for first, second in ((older, newer), (newer, older)):  # insert order irrelevant
+            with tempfile.TemporaryDirectory() as tmp:
+                with DatabaseManager(db_path=str(Path(tmp) / "nba.db")) as db:
+                    db.upsert_team_priors([
+                        {"away_team": "PHI", "home_team": "BOS", "computed_at_utc": first,
+                         "home_team_total": 111.0, "away_team_total": 99.0,
+                         "pace_factor": 1.0},
+                        {"away_team": "NYK", "home_team": "PHI", "computed_at_utc": second,
+                         "home_team_total": 120.0, "away_team_total": 110.0,
+                         "pace_factor": 1.0},
+                    ])
+                    tp_map = db.get_team_prior_inputs_map()
+            expected = 120.0 if second == newer else 99.0
+            self.assertEqual(tp_map["PHI"]["implied_team_total"], expected)
+
+    def test_legacy_nickname_rows_are_migrated_on_open(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = str(Path(tmp) / "nba.db")
+            with DatabaseManager(db_path=db_path) as db:
+                db.conn.execute(
+                    "INSERT INTO team_priors (away_team, home_team, computed_at_utc) "
+                    "VALUES ('Knicks', '76ers', ?)", (_NOW_ISO,))
+                db.conn.execute(
+                    "INSERT INTO team_priors (away_team, home_team, computed_at_utc) "
+                    "VALUES ('Mystery', 'Lakers', ?)", (_NOW_ISO,))
+                db.conn.commit()
+            with DatabaseManager(db_path=db_path) as db:
+                keys = {tuple(r) for r in db.conn.execute(
+                    "SELECT away_team, home_team FROM team_priors")}
+            with DatabaseManager(db_path=db_path) as db:  # idempotent
+                keys_again = {tuple(r) for r in db.conn.execute(
+                    "SELECT away_team, home_team FROM team_priors")}
+        self.assertEqual(keys, {("NYK", "PHI"), ("Mystery", "LAL")})
+        self.assertEqual(keys, keys_again)
 
 
 if __name__ == "__main__":

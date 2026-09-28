@@ -7,15 +7,20 @@ than assuming data is present.
 """
 from __future__ import annotations
 
-from typing import Optional
+from typing import Literal, Optional
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class HealthResponse(BaseModel):
     status: str
     version: str
-    db_path: str
+    db_path: Optional[str] = None  # only with API_EXPOSE_DB_PATH=1
+    # True when FLAGSHIP_ACCESS_CODE is set: the UI prompts for the code.
+    access_code_required: bool = False
+    # Snapshot delivery status: never | not-configured | updated | unchanged
+    # | empty | error (api/db_sync.py). Error detail stays in server logs.
+    db_sync: str = "never"
     db_exists: bool
     last_game_date: Optional[str] = None
     freshest_scrape_utc: Optional[str] = None
@@ -290,3 +295,142 @@ class TeamChartResponse(BaseModel):
     derived_reference_line: Optional[float] = None
     derived_reference_label: Optional[str] = None
     notes: list[str] = []
+
+
+# ---------------------------------------------------------------------------
+# Parlay builder (compute-only POST)
+# ---------------------------------------------------------------------------
+
+class ParlayLegIn(BaseModel):
+    player_id: int = Field(..., ge=1, le=2**31 - 1)
+    stat: str = Field(..., min_length=1, max_length=32)
+    line: float
+    side: Literal["over", "under"]
+    odds: Optional[int] = None  # American; default -110
+
+
+class ParlayRequest(BaseModel):
+    # Hard parse bound; the 2..6 business rule is input_validation's.
+    legs: list[ParlayLegIn] = Field(..., max_length=12)
+    n_games: int = Field(25, ge=3, le=200)
+    n_sims: Optional[int] = None
+    parlay_odds: Optional[int] = None  # book's SGP price if known
+
+
+class ParlayLegOut(BaseModel):
+    player_id: int
+    player_name: str
+    stat: str
+    line: float
+    side: str
+    odds: int
+    n_games: int
+    mu: float
+    sigma: float
+    p_over: float
+    p_hit: float
+    implied_prob: float
+    ev: float
+
+
+class CorrelationMatrix(BaseModel):
+    labels: list[str]
+    matrix: list[list[float]]
+
+
+class ParlayResponse(BaseModel):
+    legs: list[ParlayLegOut]
+    n_games: int
+    n_sims: int
+    n_joint_games: int
+    correlation_fallback: bool
+    joint_prob: float
+    joint_prob_se: float
+    independent_prob: float
+    correlation_lift: Optional[float] = None
+    combined_decimal: float
+    combined_american: Optional[int] = None
+    offered_american: Optional[int] = None
+    offered_is_custom: bool
+    implied_prob: Optional[float] = None
+    fair_american: Optional[int] = None
+    ev_joint: Optional[float] = None
+    ev_independent: Optional[float] = None
+    correlation: CorrelationMatrix
+    disclaimer: str
+
+
+# ---------------------------------------------------------------------------
+# Paper trades (bet_log) + calibration (read-only)
+# ---------------------------------------------------------------------------
+
+class PaperTradeRow(BaseModel):
+    log_id: int
+    created_at_utc: Optional[str] = None
+    game_date: Optional[str] = None
+    player_id: Optional[int] = None
+    player_name: str
+    stat_type: str
+    book: Optional[str] = None
+    line: Optional[float] = None
+    side: str
+    model_prob: Optional[float] = None
+    implied_prob: Optional[float] = None
+    edge: Optional[float] = None
+    model_mode: Optional[str] = None
+    stake_units: Optional[float] = None
+    status: str
+    settled_at_utc: Optional[str] = None
+    actual_value: Optional[float] = None
+    clv_delta: Optional[float] = None
+    est_profit_units: Optional[float] = None
+
+
+class PaperTradeSummary(BaseModel):
+    total: int
+    pending: int
+    won: int
+    lost: int
+    push: int
+    void: int
+    win_rate: Optional[float] = None
+    n_clv: int
+    mean_clv: Optional[float] = None
+    positive_clv_rate: Optional[float] = None
+    est_units: Optional[float] = None
+
+
+class PaperTradesResponse(BaseModel):
+    status_filter: str
+    rows: list[PaperTradeRow]
+    summary: PaperTradeSummary
+
+
+class ReliabilityBucket(BaseModel):
+    stat_type: str
+    bucket: int
+    bucket_low: float
+    bucket_high: float
+    n: int
+    mean_pred: float
+    realized_rate: float
+    calibration_gap: float
+
+
+class BrierRow(BaseModel):
+    stat_type: str
+    n: int
+    brier_score: float
+    mean_pred: float
+    realized_rate: float
+
+
+class CalibrationResponse(BaseModel):
+    source: str
+    stat: str
+    n_buckets: int
+    n_settled: int
+    stats_available: list[str]
+    reliability: list[ReliabilityBucket]
+    brier: Optional[BrierRow] = None
+    brier_by_stat: list[BrierRow]

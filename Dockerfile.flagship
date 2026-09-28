@@ -1,0 +1,73 @@
+# Flagship UI container: the Vite-built React app + the read-only FastAPI
+# service, served by ONE uvicorn process from ONE origin (no CORS, no proxy).
+#
+# Build:
+#   docker build -f Dockerfile.flagship -t nba-flagship .
+#
+# Run (DB is volume-mounted read-only; the API never writes):
+#   docker run --rm -p 8080:8080 \
+#     -v "$(pwd)/data/database:/data:ro" \
+#     -e NBA_DB_PATH=/data/nba_data.db \
+#     nba-flagship
+#
+# Then: http://localhost:8080  (UI)   http://localhost:8080/api/health  (API)
+# Smoke: python -m api.smoke_check --base-url http://localhost:8080
+#
+# See docs/DEPLOYMENT.md §15 before exposing this publicly: the flagship has
+# NO auth and NO rate limiting yet — put it behind a TLS reverse proxy / CDN
+# with per-IP limits (edge scans are CPU-heavy).
+
+# ---- 1. Build the SPA ------------------------------------------------------
+FROM node:22-alpine AS web
+WORKDIR /web
+COPY frontend/package.json frontend/package-lock.json ./
+RUN npm ci --no-audit --no-fund
+COPY frontend/ ./
+RUN npm run build
+
+# ---- 2. Runtime: python + api + built assets -------------------------------
+FROM python:3.11-slim AS runtime
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONIOENCODING=UTF-8 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    FLAGSHIP_STATIC_DIR=/app/frontend/dist \
+    NBA_DB_PATH=/data/nba_data.db \
+    API_DOCS=0 \
+    PORT=8080
+
+WORKDIR /app
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends curl tini \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Only what the API imports at runtime.
+COPY nba_model ./nba_model
+COPY sports ./sports
+COPY api ./api
+COPY --from=web /web/dist ./frontend/dist
+
+EXPOSE 8080
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+    CMD curl -fsS "http://127.0.0.1:${PORT}/api/health" || exit 1
+
+# /data holds the SQLite file. Either a read-only bind mount (compose / VPS)
+# or, on Fly.io, a writable dir the boot-time db_sync pull fills from object
+# storage (DEPLOYMENT.md §16).
+RUN useradd --uid 10001 --create-home --shell /bin/false app \
+ && mkdir -p /data && chown -R app:app /app /data
+USER app
+
+ENTRYPOINT ["/usr/bin/tini", "--"]
+# Boot: pull the latest snapshot when object storage is configured (no-op
+# otherwise; a failed pull still starts the server on whatever file exists,
+# and the background poller retries). Then serve.
+# --proxy-headers: trust X-Forwarded-* only from FORWARDED_ALLOW_IPS.
+CMD ["sh", "-c", "python -m api.db_sync pull --if-configured || echo 'db_sync: initial pull failed; starting anyway' >&2; exec uvicorn api.main:app --host 0.0.0.0 --port ${PORT} --no-server-header --proxy-headers --forwarded-allow-ips=${FORWARDED_ALLOW_IPS:-127.0.0.1}"]

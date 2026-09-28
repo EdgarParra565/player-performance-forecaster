@@ -79,6 +79,10 @@ class BookScraper:
     # into view). Generic — the fetcher honors it for any book, so enabling it
     # here never affects other books' capture.
     scroll_page: bool = False
+    # Opt-in: raise the fetcher's global visible-text cap for this book (large
+    # aggregator grids like VegasInsider MLB overflow the 60K default and get
+    # cut mid-section). Only ever RAISES the cap; None = use the global cap.
+    max_text_chars: Optional[int] = None
 
     def matches_host(self, host: str) -> bool:
         """Return True when ``host`` equals or is a subdomain of any known domain."""

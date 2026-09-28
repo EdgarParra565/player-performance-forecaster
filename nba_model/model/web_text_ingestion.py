@@ -836,6 +836,130 @@ def check_chrome_cdp_reachable(
         }
 
 
+def _url_host(url: str) -> str:
+    """Lower-cased hostname of ``url`` without a leading ``www.`` ('' if none)."""
+    from urllib.parse import urlparse as _up
+
+    try:
+        host = (_up(str(url or "")).hostname or "").lower().rstrip(".")
+    except ValueError:
+        return ""
+    return host[4:] if host.startswith("www.") else host
+
+
+def _tab_matches_target(tab_url: str, target_url: str) -> bool:
+    """True when an open tab would be treated as "already on" ``target_url``.
+
+    This is the ONE predicate shared by the CDP fetcher's tab-reuse loop and
+    the pre-fetch tab hygiene, so hygiene closes every tab reuse could pick:
+    the target's netloc as a substring of the tab URL (the historical reuse
+    rule — it matches by DOMAIN, not by URL) OR the same hostname (catches
+    ``www.``/port/case variants the substring rule misses).
+    """
+    tab_url = str(tab_url or "")
+    if not tab_url:
+        return False
+    from urllib.parse import urlparse as _up
+
+    target_netloc = _up(str(target_url or "")).netloc
+    if target_netloc and target_netloc in tab_url:
+        return True
+    target_host = _url_host(target_url)
+    return bool(target_host) and _url_host(tab_url) == target_host
+
+
+def _cdp_http(url: str, method: str = "GET", timeout_seconds: float = 3.0):
+    """Call a Chrome DevTools HTTP endpoint; returns the decoded JSON (or text)."""
+    import json as _json
+    from urllib.request import Request, urlopen
+
+    req = Request(url, method=method)
+    with urlopen(req, timeout=timeout_seconds) as resp:
+        body = resp.read().decode("utf-8", errors="replace")
+    try:
+        return _json.loads(body) if body else None
+    except _json.JSONDecodeError:
+        return body
+
+
+def close_target_tabs_via_cdp(
+    urls: list[str],
+    chrome_debug_port: int,
+    host: str = "127.0.0.1",
+    timeout_seconds: float = 3.0,
+) -> dict:
+    """Close every open Chrome tab that the fetcher could reuse for ``urls``.
+
+    The CDP fetcher reuses an existing tab whose URL contains the target's
+    DOMAIN and then skips navigation + content waits, so a leftover tab on the
+    same host silently yields a stale capture (stored under a different
+    source_url). Closing all host-matching tabs up front forces every fetch
+    onto a fresh navigation. Uses the DevTools HTTP API (``/json/list``,
+    ``/json/close/<id>``) — no Playwright session, no page interaction.
+
+    If every open page tab would be closed, a blank tab is opened first so the
+    Chrome window (and its CDP endpoint) stays up. Never raises: errors are
+    reported in the returned dict so hygiene can't take down the fetch.
+    """
+    base = f"http://{host}:{int(chrome_debug_port)}"
+    summary = {"ok": True, "tabs_seen": 0, "closed": [], "errors": [],
+               "opened_blank": False}
+    targets = [u for u in (urls or []) if str(u or "").strip()]
+    try:
+        tabs = _cdp_http(f"{base}/json/list", timeout_seconds=timeout_seconds) or []
+    except Exception as exc:  # noqa: BLE001 — reported, not raised
+        summary["ok"] = False
+        summary["errors"].append(f"list failed: {exc}")
+        return summary
+
+    pages = [t for t in tabs if isinstance(t, dict) and t.get("type") == "page"]
+    summary["tabs_seen"] = len(pages)
+    to_close = [
+        t for t in pages
+        if any(_tab_matches_target(t.get("url"), target) for target in targets)
+    ]
+    if not to_close:
+        return summary
+
+    if len(to_close) >= len(pages):
+        try:
+            # PUT is required by Chrome >= 111 for /json/new.
+            _cdp_http(f"{base}/json/new?about:blank", method="PUT",
+                      timeout_seconds=timeout_seconds)
+            summary["opened_blank"] = True
+        except Exception as exc:  # noqa: BLE001
+            summary["errors"].append(f"open blank tab failed: {exc}")
+
+    for tab in to_close:
+        tab_id = str(tab.get("id") or "")
+        if not tab_id:
+            continue
+        try:
+            _cdp_http(f"{base}/json/close/{tab_id}", timeout_seconds=timeout_seconds)
+            summary["closed"].append({"id": tab_id, "url": tab.get("url")})
+        except Exception as exc:  # noqa: BLE001
+            summary["errors"].append(f"close {tab_id} failed: {exc}")
+    summary["ok"] = not summary["errors"]
+    return summary
+
+
+def classify_snapshot_session(text: str, url: str) -> dict:
+    """Session status of one fetched page: ``{"book", "session", "reason"}``.
+
+    ``session`` is ``"login_wall"`` or ``"content"`` per ``detect_login_wall``
+    (the same book-specific session_markers the parse path uses to skip
+    walled snapshots). ``book`` is the matched scraper name, else the host.
+    """
+    scraper = get_scraper_for_url(url)
+    book = scraper.name if scraper is not None else (_url_host(url) or "unknown")
+    is_wall, reason = detect_login_wall(text, url)
+    return {
+        "book": book,
+        "session": "login_wall" if is_wall else "content",
+        "reason": reason,
+    }
+
+
 def _resolve_auth_state_path(
     browser_auth_state_file: Optional[str],
     browser_user_data_dir: Optional[str],
@@ -1053,13 +1177,14 @@ def _fetch_url_text_via_cdp(
             raise RuntimeError("No browser context in running Chrome.")
 
         # Prefer an existing tab already on the target domain so we reuse its
-        # fully-loaded SPA state rather than starting a cold navigation.
-        from urllib.parse import urlparse as _up
-        target_domain = _up(url).netloc
+        # fully-loaded SPA state rather than starting a cold navigation. NOTE:
+        # this matches by domain, not URL, and skips navigation — callers that
+        # need a fresh capture run close_target_tabs_via_cdp first (same
+        # predicate), which the hourly path does by default.
         existing_page = None
         for ctx in browser.contexts:
             for pg in ctx.pages:
-                if target_domain in (pg.url or ""):
+                if _tab_matches_target(pg.url, url):
                     existing_page = pg
                     context = ctx
                     break
@@ -1228,6 +1353,22 @@ def _fetch_url_text_with_browser(
     }
 
 
+def _effective_max_chars(url: str, max_chars: int) -> int:
+    """Apply a matched book's ``max_text_chars`` opt-in on top of the global cap.
+
+    The per-book value can only raise the cap; ``max_chars <= 0`` (unlimited)
+    stays unlimited.
+    """
+    max_chars = int(max_chars)
+    if max_chars <= 0:
+        return max_chars
+    scraper = get_scraper_for_url(url)
+    book_cap = getattr(scraper, "max_text_chars", None) if scraper else None
+    if book_cap:
+        return max(max_chars, int(book_cap))
+    return max_chars
+
+
 def _fetch_url_text(
     url: str,
     timeout: int,
@@ -1241,6 +1382,7 @@ def _fetch_url_text(
     chrome_debug_port: Optional[int] = None,
 ) -> dict:
     """Fetch one URL with retry policy and return normalized text payload."""
+    max_chars = _effective_max_chars(url, max_chars)
     attempts = max(1, int(retries) + 1)
     delay_base = max(0.0, float(retry_delay_seconds))
     backoff = max(1.0, float(retry_backoff))
@@ -1304,8 +1446,16 @@ def fetch_and_store_web_text(
     browser_auth_state_file: Optional[str] = None,
     browser_user_data_dir: Optional[str] = None,
     chrome_debug_port: Optional[int] = None,
+    close_stale_tabs: bool = False,
+    chrome_host: str = "127.0.0.1",
 ) -> dict:
-    """Fetch text snapshots for URLs and store into web_text_snapshots table."""
+    """Fetch text snapshots for URLs and store into web_text_snapshots table.
+
+    ``close_stale_tabs`` (CDP path only): before fetching, close every open
+    Chrome tab on a target host (see ``close_target_tabs_via_cdp``) so no
+    fetch silently reuses a stale tab. Each fetched result also carries the
+    page's session classification (``book`` / ``session`` / ``session_reason``).
+    """
     use_browser = bool(
         str(browser_auth_state_file or "").strip()
         or str(browser_user_data_dir or "").strip()
@@ -1332,6 +1482,17 @@ def fetch_and_store_web_text(
         min_hours = max(0.0, float(min_hours_between_polls))
     with DatabaseManager(db_path=db_path) as db:
         latest_fetch_map = db.get_latest_web_text_fetch_times(normalized_urls)
+
+    tab_hygiene = None
+    if close_stale_tabs and chrome_debug_port is not None:
+        tab_hygiene = close_target_tabs_via_cdp(
+            normalized_urls, chrome_debug_port, host=chrome_host,
+        )
+        if tab_hygiene["closed"] or tab_hygiene["errors"]:
+            logger.info(
+                "tab hygiene: closed %d stale target tab(s), %d error(s)",
+                len(tab_hygiene["closed"]), len(tab_hygiene["errors"]),
+            )
 
     now_utc = datetime.now(timezone.utc)
     snapshot_records = []
@@ -1383,6 +1544,7 @@ def fetch_and_store_web_text(
             )
             snapshot_records.append(record)
             fetched_count += 1
+            session = classify_snapshot_session(record.get("text_content") or "", url)
             results.append(
                 {
                     "url": url,
@@ -1390,6 +1552,9 @@ def fetch_and_store_web_text(
                     "http_status": record.get("http_status"),
                     "text_length": record.get("text_length"),
                     "content_sha256": record.get("content_sha256"),
+                    "book": session["book"],
+                    "session": session["session"],
+                    "session_reason": session["reason"],
                 }
             )
         except Exception as exc:
@@ -1400,6 +1565,7 @@ def fetch_and_store_web_text(
                     "status": "failed",
                     "error_type": exc.__class__.__name__,
                     "error_message": str(exc),
+                    "book": classify_snapshot_session("", url)["book"],
                 }
             )
 
@@ -1414,7 +1580,7 @@ def fetch_and_store_web_text(
     elif failed_count > 0:
         status = "partial_success"
 
-    return {
+    summary = {
         "status": status,
         "urls_received": int(len(urls or [])),
         "urls_considered": int(len(normalized_urls)),
@@ -1428,6 +1594,9 @@ def fetch_and_store_web_text(
         "db_attempted": int(db_insert_summary.get("attempted", 0)),
         "results": results,
     }
+    if tab_hygiene is not None:
+        summary["tab_hygiene"] = tab_hygiene
+    return summary
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -1529,6 +1698,15 @@ def _build_parser() -> argparse.ArgumentParser:
             "(defaults to 9222 if omitted there). For --validate-session, "
             "passing this flag opts into routing the check through a running "
             "real Chrome instead of Playwright's headless Chromium."
+        ),
+    )
+    parser.add_argument(
+        "--close-stale-tabs",
+        action="store_true",
+        help=(
+            "With --chrome-debug-port: close every open Chrome tab on a target "
+            "URL's host before fetching, so no fetch reuses a stale tab "
+            "(the hourly runner does this by default)."
         ),
     )
     parser.add_argument(
@@ -1657,6 +1835,7 @@ def main():
             browser_auth_state_file=args.browser_auth_state_file,
             browser_user_data_dir=args.browser_user_data_dir,
             chrome_debug_port=args.chrome_debug_port,
+            close_stale_tabs=args.close_stale_tabs,
         )
 
         print("Web text ingestion summary:")

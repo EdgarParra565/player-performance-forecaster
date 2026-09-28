@@ -6,16 +6,19 @@ a single game, we can derive:
   - **win probabilities** for each side, vig-removed via the standard
     "two-sided proportional de-vig" (each side's no-vig prob is its raw
     implied / (raw_home + raw_away))
-  - **pace proxy**: total / 200 (NBA average possession-per-team ~100, so
-    a total of 220 implies ~10% above-average pace; a total of 195 ~2.5%
-    below). This is a coarse estimate but stable across books.
+  - **pace proxy**: total / LEAGUE_PACE_BASELINE_TOTAL (228), so a total
+    of 240 implies ~5% above-average pace and 217 ~5% below. This is a
+    coarse estimate but stable across books.
 
 These are useful as priors for the player-level model: e.g. if the implied
 team total is 5pts above what the player's last-15 average team total
 would suggest, the player's points projection should drift up proportionally.
 
-Outputs land in ``team_priors`` (new view-only table) so the chart layer
-and player-projection code can read them without re-running the math.
+Outputs land in ``team_priors`` keyed by NBA team codes ("PHI", not the
+consensus layer's "76ers" — ``upsert_team_priors`` normalizes) so the
+player-projection code (run_single_prop / prop_board / hourly recompute /
+scanner full mode) can look them up by ``players.team``. Readers ignore priors
+older than ``TEAM_PRIOR_MAX_AGE_HOURS``.
 """
 
 from __future__ import annotations

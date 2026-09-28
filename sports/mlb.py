@@ -20,6 +20,12 @@ Implemented (data/scrapers layer):
   4. Lines come in BOTH yes/no (hit a HR -> anytime_home_run) and over/under
      (over 1.5 hits) forms — `preprocess_mlb_props` handles both.
 
+  5. Prop lines: VegasInsider's MLB props grid (real multi-book odds) lands in
+     the dedicated `mlb_prop_lines` table via
+     `nba_model/data/vegasinsider_mlb_props_ingestion.py` (stat types validated
+     against `SPORT.stat_types` / `stat_line_ranges` below). Separate table for
+     the same reason as `mlb_game_logs`: no MLB row can reach an NBA query.
+
 Scrapers (props first): `scrapers/draftkings_mlb.py`, `scrapers/fanduel_mlb.py`
 (sport='mlb'), resolvable via `get_scraper_for_book_sport(book, 'mlb')`.
 

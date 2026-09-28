@@ -1,4 +1,4 @@
-import { useMemo, useState, type ReactNode } from "react";
+import { useMemo, useState, type KeyboardEvent, type ReactNode } from "react";
 
 export interface Column<T> {
   key: string;
@@ -19,8 +19,12 @@ interface DataTableProps<T> {
   rowKey: (row: T, index: number) => string;
   initialSort?: { key: string; dir: "asc" | "desc" };
   onRowClick?: (row: T) => void;
+  // Accessible description of what activating a row does ("Open player").
+  rowActionLabel?: (row: T) => string;
   isActiveRow?: (row: T) => boolean;
   maxHeight?: string;
+  // Pin the first column while the table scrolls horizontally (phones).
+  stickyFirst?: boolean;
 }
 
 type Dir = "asc" | "desc";
@@ -31,34 +35,52 @@ const ALIGN: Record<string, string> = {
   center: "text-center",
 };
 
+// Sticky first column: opaque background matching the row state, plus a soft
+// right edge so scrolled content visibly slides under it.
+const STICKY_BASE = "sticky left-0 z-[1] shadow-[1px_0_0_0_var(--color-line),6px_0_8px_-6px_rgb(0_0_0/0.6)]";
+const STICKY_HEAD = `${STICKY_BASE} z-[2] bg-surface-2`;
+const STICKY_CELL = `${STICKY_BASE} bg-surface-1 group-hover:bg-surface-2 group-focus-visible:bg-surface-3`;
+const STICKY_CELL_ACTIVE = `${STICKY_BASE} bg-surface-3`;
+
+const JUSTIFY: Record<string, string> = {
+  left: "justify-start",
+  right: "justify-end",
+  center: "justify-center",
+};
+
 // Dense, information-first table with a sticky header and click-to-sort. Zebra
 // striping is intentionally omitted; hairline row borders + hover carry the
-// scanning burden without visual noise.
+// scanning burden without visual noise. Clickable rows are keyboard-reachable
+// (Tab + Enter/Space) and sortable headers are real buttons with aria-sort.
 export function DataTable<T>({
   columns,
   rows,
   rowKey,
   initialSort,
   onRowClick,
+  rowActionLabel,
   isActiveRow,
   maxHeight,
+  stickyFirst = true,
 }: DataTableProps<T>) {
-  const [sortKey, setSortKey] = useState<string | null>(
-    initialSort?.key ?? null,
-  );
+  const [sortKey, setSortKey] = useState<string | null>(initialSort?.key ?? null);
   const [dir, setDir] = useState<Dir>(initialSort?.dir ?? "desc");
 
   const sorted = useMemo(() => {
     if (!sortKey) return rows;
     const col = columns.find((c) => c.key === sortKey);
-    if (!col?.sortValue) return rows;
+    const getValue = col?.sortValue;
+    if (!getValue) return rows;
     const factor = dir === "asc" ? 1 : -1;
     return [...rows].sort((a, b) => {
-      const av = col.sortValue!(a);
-      const bv = col.sortValue!(b);
+      const av = getValue(a);
+      const bv = getValue(b);
       // Nulls always sink to the bottom regardless of direction.
-      if (av === null || av === undefined) return 1;
-      if (bv === null || bv === undefined) return -1;
+      const aNull = av === null || av === undefined;
+      const bNull = bv === null || bv === undefined;
+      if (aNull && bNull) return 0;
+      if (aNull) return 1;
+      if (bNull) return -1;
       if (typeof av === "number" && typeof bv === "number") {
         return (av - bv) * factor;
       }
@@ -76,37 +98,53 @@ export function DataTable<T>({
     }
   }
 
+  function onRowKey(e: KeyboardEvent<HTMLTableRowElement>, row: T) {
+    if (!onRowClick) return;
+    if (e.key === "Enter" || e.key === " ") {
+      e.preventDefault();
+      onRowClick(row);
+    }
+  }
+
   return (
     <div
-      className="overflow-auto"
+      className="overflow-auto overscroll-x-contain"
       style={maxHeight ? { maxHeight } : undefined}
     >
-      <table className="w-full border-collapse text-xs">
+      <table className="w-full border-collapse text-body">
         <thead className="sticky top-0 z-10">
-          <tr className="bg-panel-2">
-            {columns.map((col) => {
+          <tr className="bg-surface-2">
+            {columns.map((col, ci) => {
               const active = sortKey === col.key;
+              const sticky = stickyFirst && ci === 0;
+              const sortable = !!(col.sortable && col.sortValue);
+              const align = col.align ?? "left";
               return (
                 <th
                   key={col.key}
-                  onClick={() => toggleSort(col)}
+                  scope="col"
+                  aria-sort={
+                    active ? (dir === "asc" ? "ascending" : "descending") : undefined
+                  }
                   style={col.width ? { width: col.width } : undefined}
-                  className={`eyebrow border-b border-line-strong px-3 py-2 whitespace-nowrap ${
-                    ALIGN[col.align ?? "left"]
-                  } ${
-                    col.sortable && col.sortValue
-                      ? "cursor-pointer select-none hover:text-muted"
-                      : ""
-                  } ${active ? "text-fg" : ""} ${col.headerClassName ?? ""}`}
+                  className={`eyebrow h-9 border-b border-line-strong px-4 whitespace-nowrap pointer-coarse:h-11 ${ALIGN[align]} ${
+                    active ? "text-fg" : ""
+                  } ${sticky ? STICKY_HEAD : ""} ${col.headerClassName ?? ""}`}
                 >
-                  <span className="inline-flex items-center gap-1">
-                    {col.header}
-                    {active && (
-                      <span className="text-pos">
-                        {dir === "asc" ? "▲" : "▼"}
+                  {sortable ? (
+                    <button
+                      type="button"
+                      onClick={() => toggleSort(col)}
+                      className={`inline-flex w-full items-center gap-1 uppercase transition-colors hover:text-fg pointer-coarse:min-h-11 pointer-coarse:min-w-11 ${JUSTIFY[align]}`}
+                    >
+                      <span>{col.header}</span>
+                      <span aria-hidden className={active ? "text-accent" : "text-transparent"}>
+                        {dir === "asc" && active ? "▲" : "▼"}
                       </span>
-                    )}
-                  </span>
+                    </button>
+                  ) : (
+                    col.header
+                  )}
                 </th>
               );
             })}
@@ -115,19 +153,23 @@ export function DataTable<T>({
         <tbody>
           {sorted.map((row, i) => {
             const active = isActiveRow?.(row) ?? false;
+            const clickable = !!onRowClick;
             return (
               <tr
                 key={rowKey(row, i)}
-                onClick={() => onRowClick?.(row)}
-                className={`border-b border-line/60 transition-colors ${
-                  onRowClick ? "cursor-pointer" : ""
-                } ${active ? "bg-panel-3" : "hover:bg-panel-2/70"}`}
+                onClick={clickable ? () => onRowClick(row) : undefined}
+                onKeyDown={clickable ? (e) => onRowKey(e, row) : undefined}
+                tabIndex={clickable ? 0 : undefined}
+                aria-label={clickable ? rowActionLabel?.(row) : undefined}
+                className={`group border-b border-line/70 transition-colors last:border-b-0 ${
+                  clickable ? "cursor-pointer focus-visible:bg-surface-3 focus-visible:outline-none" : ""
+                } ${active ? "bg-surface-3" : "hover:bg-surface-2"}`}
               >
-                {columns.map((col) => (
+                {columns.map((col, ci) => (
                   <td
                     key={col.key}
-                    className={`px-3 py-1.5 whitespace-nowrap ${
-                      ALIGN[col.align ?? "left"]
+                    className={`h-10 px-4 whitespace-nowrap pointer-coarse:h-12 ${ALIGN[col.align ?? "left"]} ${
+                      stickyFirst && ci === 0 ? (active ? STICKY_CELL_ACTIVE : STICKY_CELL) : ""
                     } ${col.cellClassName ?? ""}`}
                   >
                     {col.render(row)}

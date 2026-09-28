@@ -1,103 +1,199 @@
-# Hourly NBA ETL scheduler
+# Hourly NBA ETL scheduler (scraping autopilot)
 
-The deployed model needs to be "updated every hour" — that means cycling
-through web-text ingestion → prop / team-line parsing → game-log refresh →
-team-priors → outcome settlement → prediction recompute, on the cadence of
-1 / hour. The components live in `nba_model/data/hourly_update.py`; this
-directory has the shell wrapper plus a launchd plist.
+The deployed model is "updated every hour": web-text ingestion → prop /
+team-line parsing → VegasInsider ingestion → game-log refresh → team priors →
+outcome settlement → prediction recompute, once per hour. The pipeline lives in
+`nba_model/data/hourly_update.py`; this directory holds the shell wrappers and
+two launchd LaunchAgents:
+
+| Agent | What it does |
+|---|---|
+| `com.nba.scraping-chrome` | Keeps a **dedicated scraping Chrome** running (`--remote-debugging-port=9222`, its own persistent `--user-data-dir`). `KeepAlive=true`: relaunched after a crash, a Cmd-Q, or a reboot/login. |
+| `com.nba.hourly` | Runs `hourly_update.sh` at minute :05 of every hour (wall clock) and once at load. A fire missed while the Mac slept runs once on wake. |
+| `com.nba.keep-awake` | Optional: `caffeinate -s` — no *system* sleep while on AC power (display still sleeps; battery behaves normally). Without it the loop only runs while the Mac is awake. |
+
+With both loaded the loop runs unattended. The **only** routine manual act is
+signing back in to a book when the hourly run alerts "re-login needed".
+Nothing here logs in for you, stores credentials, or solves captchas.
 
 ## Hard constraints
 
-- **Must run on the dev Mac (or a Mac with a residential IP).** Sportsbook
-  scraping needs a real Chrome on `--remote-debugging-port=9222`. Cloudflare
-  / PerimeterX / DataDome fingerprint the TLS stack, so Playwright Chromium
-  alone gets blocked. **Will not work in GitHub Actions or a container.**
-- **Must use the project venv** (`.venv/bin/python3`). System Python doesn't
-  have Playwright and will fail preflight.
-- **Chrome must be logged in.** Open the Chrome window before the first tick
-  and sign in to PrizePicks / Underdog / DK / BetMGM / Caesars in that
-  same profile. Sessions persist across hourly ticks via the user-data-dir.
+- **Dev Mac (residential IP) only.** Sportsbooks fingerprint the TLS stack
+  (Cloudflare / PerimeterX / DataDome), so scraping needs a real Chrome.
+  **Will not work in GitHub Actions or a container.**
+- **Project venv** (`.venv/bin/python3`) — the wrapper enforces it.
+- **The scraping profile is not your daily Chrome profile.** It lives at
+  `~/Library/Application Support/nba-scraping-chrome` (override with
+  `NBA_SCRAPER_PROFILE_DIR`); the launcher refuses the daily-profile path.
+  It is persistent, so logins survive restarts. (Chrome ≥ 136 ignores
+  `--remote-debugging-port` on the default profile anyway.)
 
 ## One-time setup
 
 ```bash
-# 1. Boot the persistent Chrome window (do this once after each restart):
-open -na "Google Chrome" --args \
-    --remote-debugging-port=9222 \
-    --user-data-dir=/tmp/pp-chrome-profile
+cd /path/to/nba-probability-model
+mkdir -p nba_model/data/logs
 
-# 2. In that Chrome window, sign in to the books that require auth
-#    (PrizePicks is the strict one). Then verify CDP is up:
-curl http://127.0.0.1:9222/json/version
+# 1. Install both LaunchAgents with this checkout's absolute path filled in.
+for agent in com.nba.scraping-chrome com.nba.hourly com.nba.keep-awake; do
+  sed "s|/ABSOLUTE_PATH_TO_REPO|$(pwd)|g" "scripts/scheduler/${agent}.plist" \
+    > ~/Library/LaunchAgents/${agent}.plist
+done
 
-# 3. Sanity-check the runner end-to-end (uses the venv automatically):
-./scripts/scheduler/hourly_update.sh
-#    Look at the JSON report it writes under nba_model/data/artifacts/hourly/
+# 2. Optional: alert webhook (Slack/Discord/generic). Edit
+#    ~/Library/LaunchAgents/com.nba.hourly.plist and uncomment the
+#    NBA_ALERT_WEBHOOK_URL entry. Without it, alerts still land in the JSON
+#    report + log and as a macOS notification.
+
+# 3. Start the scraping Chrome first, then the hourly job.
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.nba.scraping-chrome.plist
+curl -s http://127.0.0.1:9222/json/version   # CDP should answer within a few seconds
+
+# 4. One-time login pass (the only manual step) — see "Login pass" below:
+scripts/scheduler/login_setup.sh
+
+# 5. Start the hourly loop (+ optional keep-awake).
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.nba.hourly.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.nba.keep-awake.plist
 ```
 
-## Install the launchd job
+(`launchctl load -w <plist>` / `unload -w <plist>` still work on current
+macOS if you prefer the legacy verbs.)
+
+## Verify
 
 ```bash
-# Replace the placeholders inside the plist with the absolute path of this
-# checkout (the file ships with /ABSOLUTE_PATH_TO_REPO placeholders).
-sed -i '' "s|/ABSOLUTE_PATH_TO_REPO|$(pwd)|g" \
-    scripts/scheduler/com.nba.hourly.plist
-
-cp scripts/scheduler/com.nba.hourly.plist ~/Library/LaunchAgents/
-launchctl unload -w ~/Library/LaunchAgents/com.nba.hourly.plist 2>/dev/null
-launchctl load   -w ~/Library/LaunchAgents/com.nba.hourly.plist
+launchctl list | grep com.nba                      # both agents, PID for chrome
+tail -f nba_model/data/logs/launchd_stdout.log     # hourly runner
+tail nba_model/data/logs/scraping_chrome_stderr.log
+ls -lt nba_model/data/artifacts/hourly | head      # JSON reports
+cat nba_model/data/artifacts/hourly/session_health_state.json
 ```
 
-Verify:
+Each report carries a top-level `session_health` map, e.g.
+`{"prizepicks": "login-needed", "draftkings": "ok", "kalshi": "unreachable"}`,
+and the `web_text` step's `result.tab_hygiene` lists the stale tabs it closed.
+
+## Stop / uninstall
+
+`KeepAlive` relaunches Chrome if you just quit it — unload the agent instead:
 
 ```bash
-launchctl list | grep com.nba.hourly
-tail -f nba_model/data/logs/launchd_stdout.log
-ls -lt nba_model/data/artifacts/hourly | head
+launchctl bootout gui/$(id -u)/com.nba.hourly
+launchctl bootout gui/$(id -u)/com.nba.keep-awake
+launchctl bootout gui/$(id -u)/com.nba.scraping-chrome
+rm ~/Library/LaunchAgents/com.nba.{hourly,keep-awake,scraping-chrome}.plist
 ```
 
-Stop / uninstall:
+To pause scraping temporarily, boot out `com.nba.hourly` only.
+
+## What runs unattended each hour
+
+1. **Preflight** — Playwright importable + CDP reachable on `:9222`. If Chrome
+   is down the run writes a report, fires the alert, exits 78; launchd will
+   usually have Chrome back up for the next tick.
+2. **Tab hygiene** (default ON; `--no-close-stale-tabs` to skip) — closes every
+   open tab on a target URL's HOST. The CDP fetcher reuses any tab on the same
+   domain *without navigating*, which silently stores a stale page under a
+   different URL; closing them forces a fresh navigation per URL.
+3. **Web text** — every URL in `data/config/web_text_urls.txt` via CDP.
+4. **Session health** — each fetched page is classified with the book's
+   `session_markers` (`detect_login_wall`, the same check the parsers use to
+   skip walled snapshots). Per book: `ok` / `login-needed` (any page walled) /
+   `unreachable` (no page fetched). **Alerts fire only on a NEW login-needed**:
+   the state file remembers which books were already alerted; a book re-arms
+   once it is seen `ok` again, `unreachable` blips don't re-fire, and a failed
+   webhook delivery retries next tick. Channels: `NBA_ALERT_WEBHOOK_URL` /
+   `--alert-webhook-url`, plus a macOS notification (`--no-macos-notify` to
+   silence). The step never fails the run, so it can't spam the hourly alert.
+5. Browser prop parser → team-line parser → VegasInsider (NBA grid →
+   `betting_lines`, MLB props → `mlb_prop_lines`) → game logs + players.team
+   sync → team priors (6h window) → outcome settlement → prediction recompute
+   (optional `--settle-bet-log`).
+
+## Login pass (`login_setup.sh`) — the one manual act
 
 ```bash
-launchctl unload -w ~/Library/LaunchAgents/com.nba.hourly.plist
-rm ~/Library/LaunchAgents/com.nba.hourly.plist
+scripts/scheduler/login_setup.sh                      # all auth books, 30-min timeout
+scripts/scheduler/login_setup.sh --books pick6        # after a single re-login alert
+scripts/scheduler/login_setup.sh --timeout 3600
 ```
 
-## Cron fallback
+It opens one tab per auth book (PrizePicks, Underdog, Pick6, ParlayPlay, plus
+any book the last hourly run flagged `login-needed`) in the scraping Chrome,
+then reprints a checklist every 30s as you sign in:
 
-If you'd rather use cron (e.g. you can't use launchd on a server):
+```
+--- 17:48:32Z  4/4 books ok ---
+[ok]   prizepicks  ok
+[ .. ] pick6       login-needed   (Generic login nav 'log in' present ...)
+```
+
+It only reads page text (no navigation, no typing). When every tab reads ok it
+re-checks each book in a fresh tab and exits 0; `--timeout` exits 3 listing
+what's left; Ctrl-C is safe. While it runs it holds the hourly lockfile, so a
+tick that fires mid-login exits 75 instead of closing your login tabs.
+
+## Blocked books (`data/config/blocked_books.txt`)
+
+Books the owner can't fix by logging in — geo (`betmgm`, `underdog` from
+California), age (`betrivers`, `hardrockbet`: 21+) — are listed here. They
+report `blocked` in `session_health`, never alert, and are never prompted by
+`login_setup.sh`. If a blocked book's page ever reads real content, the report
+shows it `ok` and lists it under `blocked_but_ok`. Delete a line to put a book
+back (e.g. when your location changes).
+
+## Re-login runbook
+
+1. Alert says e.g. "Scraper re-login needed: prizepicks".
+2. Run `scripts/scheduler/login_setup.sh --books prizepicks` and sign in in the
+   tab it opens (or just sign in in the scraping Chrome window).
+3. Next hourly report shows the book `ok`; the alert re-arms.
+
+Public books (sportsbooks, Kalshi, VegasInsider) never raise a re-login alert
+from a merely generic "Log in" nav link — a capture where the board didn't
+render reports `unreachable` instead.
+
+Offseason caveat: an AUTH book's lobby with a "Log in" nav link and no live
+lines can classify `login-needed` (generic-nav rule). Expect at most one alert
+per book per episode; it clears when real content returns.
+
+## Scheduling gotchas (learned live 2026-09-28)
+
+- `StartInterval` timers count only AWAKE time, so on a Mac that idle-sleeps
+  (this one: `sleep 1`) an hourly interval job effectively never fires — hence
+  `StartCalendarInterval`.
+- `launchctl kickstart gui/$(id -u)/com.nba.hourly` runs a tick now (same path
+  as the schedule) — handy for manual verification.
+- Check the schedule: `launchctl print gui/$(id -u)/com.nba.hourly | grep -A8
+  "event triggers"` shows the `Minute => 5` calendar trigger; `runs = N`
+  counts fires since load.
+
+## Idempotency / overlap safety
+
+The runner takes an fcntl lock on `/tmp/nba_hourly_update.lock`. If a run
+hasn't finished when the next tick fires (or `login_setup.sh` is running), the
+second invocation exits 75 (EX_TEMPFAIL) and launchd tries again next hour —
+the in-flight run continues.
+
+## Exit codes
+
+| Code | Meaning |
+|---|---|
+| `0` | All steps OK (a login-needed book does not change this). |
+| `1` | At least one ETL step failed. JSON report has per-step details. |
+| `75` | Another hourly run is still in flight; this tick was skipped. |
+| `78` | Preflight failed — venv missing (shell), or Chrome CDP unreachable / Playwright missing (Python; report + alert written). |
+
+`scraping_chrome.sh` exits 78 for a missing Chrome binary or a refused
+(daily) profile path; launchd keeps retrying every 30s (`ThrottleInterval`).
+
+## Cron fallback (hourly job only)
 
 ```cron
 0 * * * * /ABSOLUTE_PATH_TO_REPO/scripts/scheduler/hourly_update.sh \
     >> /ABSOLUTE_PATH_TO_REPO/nba_model/data/logs/cron.log 2>&1
 ```
 
-## Idempotency / overlap safety
-
-The runner takes an fcntl lock on `/tmp/nba_hourly_update.lock`. If an
-hour-long run hasn't finished when the next tick fires, the second
-invocation exits with code 75 (EX_TEMPFAIL) so launchd just retries on the
-next hour boundary — it does *not* tear down the in-flight run.
-
-## Exit codes
-
-| Code | Meaning |
-|---|---|
-| `0` | All steps OK. |
-| `1` | At least one ETL step failed. JSON report has per-step details. |
-| `75` | Another hourly run is still in flight; this tick was skipped. |
-| `78` | Preflight failed — Chrome unreachable on `:9222`, or Playwright not importable, or venv missing. Needs human intervention before the next tick. |
-
-## What gets refreshed each hour
-
-1. **Web text** — every URL in `data/config/web_text_urls.txt` via CDP.
-2. **Browser prop parser** — PrizePicks / Underdog / Pick6 / ParlayPlay cards.
-3. **Team-line parser** — BetMGM / Caesars / DraftKings / Bovada / Kalshi.
-4. **Game logs** — recent 10 games for the top tracked players (nba_api).
-5. **Team priors** — single-pass reverse engineering over the last 6h.
-6. **Outcome settlement** — settle any predictions whose games landed.
-7. **Prediction recompute** — re-score every `betting_lines` row dated today
-   against the latest model so the prop board reflects fresh lines.
-
-Each step's success/failure (and a per-step duration) lands in the JSON
-report at `nba_model/data/artifacts/hourly/hourly_update_<ts>.json`.
+Cron can't keep Chrome alive; start `scripts/scheduler/scraping_chrome.sh`
+yourself (or still use the Chrome LaunchAgent).

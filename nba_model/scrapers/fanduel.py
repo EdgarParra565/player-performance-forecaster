@@ -16,9 +16,18 @@ Token order per game:
     <away_spread> <away_spread_odds> O <total> <over_odds> <away_ml>
     <home_spread> <home_spread_odds> U <total> <under_odds> <home_ml>
 
-TODO(real-capture): the fixture this parser is tested against mirrors the
-format in this module's history; re-validate it against a fresh authenticated
-``sportsbook.fanduel.com`` CDP snapshot (the lobby markup drifts).
+Second layout (live capture 2026-09-28, /navigation/nba, logged out): full
+team names with no abbreviation or ``@``, and the moneyline sits between the
+spread and the total:
+
+    "Boston Celtics Detroit Pistons +1.5 -110 +100 O 221.5 -115 "
+    "-1.5 -110 -118 U 221.5 -105 same game parlay available Oct 20, 3:00pm ET"
+
+    <Away> <Home>
+    <away_spread> <away_spread_odds> <away_ml> O <total> <over_odds>
+    <home_spread> <home_spread_odds> <home_ml> U <total> <under_odds>
+
+Away-first, cross-checked against Caesars + Bovada captures of the same slate.
 """
 
 from __future__ import annotations
@@ -55,16 +64,29 @@ _GAME_RE = re.compile(
 )
 
 
+_GAME_RE_2026 = re.compile(
+    r"(?P<away>" + TEAM_NAME_PATTERN + r")\s+(?P<home>" + TEAM_NAME_PATTERN + r")\s+"
+    r"(?P<away_spread>" + _SPREAD + r")\s+(?P<away_spread_odds>" + _ODDS + r")\s+"
+    r"(?P<away_ml>" + _ODDS + r")\s+"
+    r"O\s+(?P<total>" + _TOTAL + r")\s+(?P<over_odds>" + _ODDS + r")\s+"
+    r"(?P<home_spread>" + _SPREAD + r")\s+(?P<home_spread_odds>" + _ODDS + r")\s+"
+    r"(?P<home_ml>" + _ODDS + r")\s+"
+    r"U\s+" + _TOTAL + r"\s+(?P<under_odds>" + _ODDS + r")"
+)
+
+
 def _normalize_minus_signs(text: str) -> str:
     """Map Unicode minus (U+2212) and en-dash (U+2013) to ASCII '-'."""
     return text.replace("−", "-").replace("–", "-")
 
 
 def extract_team_lines(text: str) -> list[dict]:
-    """Return one record per (game, market, side) found in FanDuel text."""
+    """Return one record per (game, market, side) found in FanDuel text
+    (both the legacy abbrev/@ layout and the 2026-09 full-name layout)."""
     text = _normalize_minus_signs(text)
     out: list[dict] = []
-    for m in _GAME_RE.finditer(text):
+    matches = list(_GAME_RE.finditer(text)) + list(_GAME_RE_2026.finditer(text))
+    for m in matches:
         away = normalize_team(m.group("away"))
         home = normalize_team(m.group("home"))
         if not away or not home:

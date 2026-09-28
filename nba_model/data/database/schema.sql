@@ -293,7 +293,38 @@ CREATE TABLE IF NOT EXISTS mlb_game_logs (
     UNIQUE(player_id, game_pk, stat_type)
 );
 
+-- MLB player-prop lines (real odds + DFS lines, one row per book/player/stat/
+-- side observation). Kept OUT of betting_lines / web_prop_cards on purpose:
+-- betting_lines.player_id is an NBA players FK and its NBA readers
+-- (cross_book_arb, prop_board, line_comparison, ...) never filter on sport, so
+-- a separate table keeps MLB rows out of every NBA query by construction (same
+-- rationale as mlb_game_logs). player_name is the book's display name; no MLB
+-- person-id resolution yet. Change-only inserts (see insert_mlb_prop_lines).
+CREATE TABLE IF NOT EXISTS mlb_prop_lines (
+    mlb_prop_line_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    sport            TEXT NOT NULL DEFAULT 'mlb',
+    snapshot_id      INTEGER,                -- web_text_snapshots row parsed
+    source_url       TEXT,
+    source           TEXT NOT NULL,          -- e.g. 'vegasinsider'
+    book             TEXT NOT NULL,          -- underlying book (registry name)
+    observed_at_utc  TIMESTAMP NOT NULL,
+    game_date        DATE,
+    player_name      TEXT NOT NULL,
+    stat_type        TEXT NOT NULL,          -- canonical sports/mlb.py stat key
+    stat_group       TEXT NOT NULL,          -- 'hitting' | 'pitching' | 'combined'
+    market_shape     TEXT NOT NULL,          -- 'over_under' | 'yes_no'
+    line_value       REAL NOT NULL,
+    side             TEXT NOT NULL,          -- 'over' | 'under' (yes -> over)
+    over_odds        INTEGER,
+    under_odds       INTEGER,
+    parser_version   TEXT NOT NULL,
+    record_sha256    TEXT NOT NULL UNIQUE,
+    created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (snapshot_id) REFERENCES web_text_snapshots(snapshot_id)
+);
+
 -- Indexes for fast queries
+CREATE INDEX IF NOT EXISTS idx_mlb_prop_lines_key ON mlb_prop_lines(book, player_name, stat_type, side, observed_at_utc DESC);
 CREATE INDEX IF NOT EXISTS idx_mlb_game_logs_player_stat ON mlb_game_logs(player_id, stat_type, game_date DESC);
 CREATE INDEX IF NOT EXISTS idx_mlb_game_logs_date ON mlb_game_logs(game_date DESC, game_pk);
 CREATE INDEX IF NOT EXISTS idx_game_logs_player_date ON game_logs(player_id, game_date DESC);

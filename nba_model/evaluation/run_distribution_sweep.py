@@ -127,7 +127,8 @@ def build_distribution_summary(
     for _, row in grouped.iterrows():
         sig = win_rate_significance_summary(
             wins=int(row["wins"]),
-            bets=int(row["total_bets"]),
+            # Graded bets only (pushes excluded), matching backtest metrics.
+            bets=int(row["wins"]) + int(row["losses"]),
             confidence=confidence,
             american_odds=american_odds,
         )

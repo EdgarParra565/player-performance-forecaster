@@ -17,6 +17,48 @@ from nba_model.data.daily_etl import (
 from nba_model.data.database.db_manager import DatabaseManager
 
 
+# Several run_daily_etl tests pass web_text_urls without a db_path, which would
+# run the VegasInsider ingest steps against the default (live) DB. Stub them
+# module-wide; their behaviour is covered in test_vegasinsider_odds /
+# test_vegasinsider_mlb_ingestion against temp DBs.
+_VI_STEP_PATCHES = [
+    patch("nba_model.data.daily_etl._run_vegasinsider_step",
+          return_value={"status": "success", "inserted": 0}),
+    patch("nba_model.data.daily_etl._run_vegasinsider_mlb_props_step",
+          return_value={"status": "success", "inserted": 0}),
+]
+
+
+_REAL_RUN_DAILY_ETL = run_daily_etl
+_ISOLATION_TMP = None
+
+
+def _isolated_run_daily_etl(*args, **kwargs):
+    # Most tests below omit db_path, and run_daily_etl's default is the LIVE
+    # data/database/nba_data.db: _record_odds_poll_run then wrote a fake
+    # 'success' odds_poll_runs row per run (the whole live table was test
+    # pollution), which feeds the 24h odds-freshness guard. Default every call
+    # to a throwaway DB unless the test passes its own.
+    kwargs.setdefault("db_path", str(Path(_ISOLATION_TMP.name) / "nba_data.db"))
+    return _REAL_RUN_DAILY_ETL(*args, **kwargs)
+
+
+def setUpModule():
+    global _ISOLATION_TMP, run_daily_etl
+    _ISOLATION_TMP = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+    run_daily_etl = _isolated_run_daily_etl
+    for p in _VI_STEP_PATCHES:
+        p.start()
+
+
+def tearDownModule():
+    global run_daily_etl
+    for p in _VI_STEP_PATCHES:
+        p.stop()
+    run_daily_etl = _REAL_RUN_DAILY_ETL
+    _ISOLATION_TMP.cleanup()
+
+
 class RetryTests(unittest.TestCase):
     def test_run_with_retry_recovers_after_transient_failure(self):
         attempts = {"count": 0}
