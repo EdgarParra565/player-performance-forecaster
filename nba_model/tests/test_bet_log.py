@@ -66,7 +66,7 @@ class BetLogRoundTripTests(unittest.TestCase):
                 _pick("rebounds", 8.0, "over"),   # 8 == 8 → push
                 _pick("points", 33.5, "over"),    # 30 < 33.5 → lost
             ])
-            self.assertEqual(ins, {"inserted": 4, "attempted": 4})
+            self.assertEqual(ins, {"inserted": 4, "attempted": 4, "duplicates_ignored": 0})
             res = db.settle_bet_log()
             self.assertEqual(res["scanned"], 4)
             self.assertEqual(res["settled"], 4)
@@ -110,7 +110,7 @@ class BetLogRoundTripTests(unittest.TestCase):
                 _pick("points", 25.5, "sideways"),
                 _pick("points", 25.5, "over"),
             ])
-        self.assertEqual(ins, {"inserted": 1, "attempted": 1})
+        self.assertEqual(ins, {"inserted": 1, "attempted": 1, "duplicates_ignored": 0})
 
 
 class BetLogClvTests(unittest.TestCase):
@@ -166,6 +166,71 @@ class BetLogClvTests(unittest.TestCase):
             self.assertEqual(res["clv_filled"], 0)
             clv = db.conn.execute("SELECT clv_delta FROM bet_log").fetchone()[0]
         self.assertIsNone(clv)
+
+
+class BetLogDedupeTests(unittest.TestCase):
+    """Review finding: re-running bet_slip for a slate double-counted stakes."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.db_path = str(Path(self._tmp.name) / "t.db")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_same_pick_twice_is_ignored(self):
+        with DatabaseManager(db_path=self.db_path) as db:
+            first = db.insert_bet_log_rows([_pick("points", 25.5, "over")])
+            again = db.insert_bet_log_rows([_pick("points", 25.5, "over"),
+                                            _pick("points", 25.5, "over", book="UNDERDOG")])
+            n = db.conn.execute("SELECT COUNT(*) FROM bet_log").fetchone()[0]
+        self.assertEqual(first["inserted"], 1)
+        self.assertEqual(again, {"inserted": 0, "attempted": 0, "duplicates_ignored": 2})
+        self.assertEqual(n, 1)
+
+    def test_distinct_picks_still_insert(self):
+        with DatabaseManager(db_path=self.db_path) as db:
+            res = db.insert_bet_log_rows([
+                _pick("points", 25.5, "over"),
+                _pick("points", 26.5, "over"),               # other line
+                _pick("points", 25.5, "under"),              # other side
+                _pick("points", 25.5, "over", book="PrizePicks"),
+                _pick("points", 25.5, "over", model_mode="chart_mean"),
+                _pick("points", 25.5, "over", game_date="2025-04-17"),
+            ])
+        self.assertEqual(res["inserted"], 6)
+
+    def test_unique_index_present_and_enforced(self):
+        import sqlite3
+        with DatabaseManager(db_path=self.db_path) as db:
+            idx = db.conn.execute(
+                "SELECT name FROM sqlite_master WHERE name='ux_bet_log_pick'").fetchone()
+            self.assertIsNotNone(idx)
+            db.insert_bet_log_rows([_pick("points", 25.5, "over")])
+            with self.assertRaises(sqlite3.IntegrityError):
+                db.conn.execute(
+                    "INSERT INTO bet_log (created_at_utc, game_date, player_name, stat_type, "
+                    "book, line, side, model_mode) VALUES ('x', ?, 'lebron james', 'POINTS', "
+                    "'underdog', 25.5, 'over', 'full')", (GAME_DATE,))
+
+    def test_existing_duplicates_skip_index_but_inserts_still_dedupe(self):
+        import sqlite3
+        DatabaseManager(db_path=self.db_path).close()
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("DROP INDEX ux_bet_log_pick")
+        for _ in range(2):
+            conn.execute(
+                "INSERT INTO bet_log (created_at_utc, game_date, player_name, stat_type, "
+                "book, line, side, model_mode) VALUES ('x', ?, 'LeBron James', 'points', "
+                "'Underdog', 25.5, 'over', 'full')", (GAME_DATE,))
+        conn.commit()
+        conn.close()
+        with DatabaseManager(db_path=self.db_path) as db:  # history kept, no index
+            self.assertIsNone(db.conn.execute(
+                "SELECT name FROM sqlite_master WHERE name='ux_bet_log_pick'").fetchone())
+            self.assertEqual(db.conn.execute("SELECT COUNT(*) FROM bet_log").fetchone()[0], 2)
+            res = db.insert_bet_log_rows([_pick("points", 25.5, "over")])
+        self.assertEqual(res["inserted"], 0)
 
 
 if __name__ == "__main__":

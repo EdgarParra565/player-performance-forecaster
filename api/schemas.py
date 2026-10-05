@@ -21,6 +21,11 @@ class HealthResponse(BaseModel):
     # Snapshot delivery status: never | not-configured | updated | unchanged
     # | empty | error (api/db_sync.py). Error detail stays in server logs.
     db_sync: str = "never"
+    # ok | not_mounted (missing / 0-byte file) | invalid. With anything but
+    # ok the endpoint answers 503 and fills code + detail.
+    db_state: str = "ok"
+    code: Optional[str] = None
+    detail: Optional[str] = None
     db_exists: bool
     last_game_date: Optional[str] = None
     freshest_scrape_utc: Optional[str] = None

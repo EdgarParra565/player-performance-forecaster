@@ -6,6 +6,8 @@
 #   fly storage create --app <your-app-name> # Tigris bucket; sets BUCKET_NAME
 #                                            # + AWS_* secrets on the app
 #   fly secrets set FLAGSHIP_ACCESS_CODE="$(openssl rand -base64 24)"
+#   scripts/publish_db.sh --to-object-store --skip-git   # FIRST: health is 503
+#                                                       # until a DB exists
 #   fly deploy
 app = "nba-props-flagship"
 primary_region = "iad"

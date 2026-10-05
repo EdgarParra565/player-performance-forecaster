@@ -16,14 +16,14 @@ import unicodedata
 from pathlib import Path as FsPath
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Path, Query, Request
+from fastapi import FastAPI, HTTPException, Path, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from nba_model.web import input_validation as iv
 from nba_model.model import edge_scanner as es
 
-from . import __version__, config, db_sync, guards, paper_trades, parlay, schemas, services
+from . import __version__, config, db_sync, guards, paper_trades, parlay, schemas, services, working_copy
 
 def _env_flag(name: str, default: bool = False) -> bool:
     raw = os.environ.get(name)
@@ -175,7 +175,7 @@ async def _sqlite_error(_request: Request, exc: sqlite3.Error) -> JSONResponse:
 
     The detail is generic on purpose: sqlite messages can carry SQL text.
     """
-    return JSONResponse(status_code=503, content={"detail": "database unavailable"})
+    return JSONResponse(status_code=503, content={"detail": "database unavailable", "code": "db_error"})
 
 
 # Tables every endpoint depends on. Checked read-only BEFORE the data layer
@@ -206,12 +206,51 @@ def _db_ready(db_path: str) -> bool:
     return True
 
 
+# Public-facing 503 messages: no filesystem paths, just what to do.
+DB_NOT_MOUNTED = (
+    "database file not mounted: the API found no SQLite file at NBA_DB_PATH. "
+    "Local Docker: run `docker compose up flagship` (bind-mounts data/database). "
+    "Fly.io: publish a snapshot first (DEPLOYMENT.md §16)."
+)
+DB_INVALID = "database unavailable"
+
+
+def db_state(db_path: str) -> str:
+    """``ok`` | ``not_mounted`` (missing or 0-byte file — e.g. `docker run`
+    without the bind mount) | ``invalid`` (a file that isn't a usable NBA DB).
+
+    Never creates anything: a missing file must not grow an empty schema.
+    """
+    p = FsPath(db_path)
+    try:
+        if not p.is_file() or p.stat().st_size == 0:
+            return "not_mounted"
+    except OSError:
+        return "not_mounted"
+    return "ok" if _db_ready(db_path) else "invalid"
+
+
+class DatabaseNotReady(Exception):
+    def __init__(self, state: str):
+        super().__init__(state)
+        self.state = state
+
+
+@app.exception_handler(DatabaseNotReady)
+async def _db_not_ready(_request: Request, exc: DatabaseNotReady) -> JSONResponse:
+    code = "db_not_mounted" if exc.state == "not_mounted" else "db_invalid"
+    detail = DB_NOT_MOUNTED if exc.state == "not_mounted" else DB_INVALID
+    return JSONResponse(status_code=503, content={"detail": detail, "code": code})
+
+
 def _require_db() -> str:
+    """Validated path for the data layer to open (a working copy when the
+    source is read-only — see api/working_copy.py)."""
     db_path = config.get_db_path()
-    if not config.db_exists(db_path) or not _db_ready(db_path):
-        # No filesystem path in the body: it's public-facing.
-        raise HTTPException(status_code=503, detail="database unavailable")
-    return db_path
+    state = db_state(db_path)
+    if state != "ok":
+        raise DatabaseNotReady(state)
+    return working_copy.serving_path(db_path)
 
 
 def _expose_db_path() -> bool:
@@ -339,24 +378,32 @@ def _validated_lookback(h: float) -> float:
 # Routes
 # ---------------------------------------------------------------------------
 
-@app.get("/api/health", response_model=schemas.HealthResponse)
-def health() -> schemas.HealthResponse:
+@app.get("/api/health", response_model=schemas.HealthResponse,
+         responses={503: {"model": schemas.HealthResponse}})
+def health(response: Response) -> schemas.HealthResponse:
+    """200 only when the DB is usable; 503 otherwise, so a container or Fly
+    health check FAILS on a missing/empty mount instead of looking healthy."""
     db_path = config.get_db_path()
-    exists = config.db_exists(db_path) and _db_ready(db_path)
+    state = db_state(db_path)
+    exists = state == "ok"
     try:
-        extra = services.health(db_path, exists)
-        status = "ok" if exists else "degraded"
+        extra = services.health(working_copy.serving_path(db_path) if exists else db_path, exists)
     except sqlite3.Error:
         extra = {"last_game_date": None, "freshest_scrape_utc": None,
                  "table_counts": {}}
-        status = "degraded"
+        state, exists = "invalid", False
+    if not exists:
+        response.status_code = 503
     return schemas.HealthResponse(
-        status=status,
+        status="ok" if exists else "degraded",
         version=__version__,
         # Absolute server paths are not for public eyes; opt in for local
         # debugging with API_EXPOSE_DB_PATH=1.
         db_path=db_path if _expose_db_path() else None,
         db_exists=exists,
+        db_state=state,
+        code=None if exists else ("db_not_mounted" if state == "not_mounted" else "db_invalid"),
+        detail=None if exists else (DB_NOT_MOUNTED if state == "not_mounted" else DB_INVALID),
         access_code_required=bool(guards.GUARDS.access_code()),
         db_sync=db_sync.STATE.last_status,
         **extra,

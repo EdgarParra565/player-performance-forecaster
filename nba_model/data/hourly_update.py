@@ -542,8 +542,10 @@ def _run_prediction_recompute(db_path: str) -> dict:
 
     # Blend the cross-book team priors (pace + implied team total) for the
     # whole slate so the hourly-refreshed projections share the market signal.
+    # Keyed by the slate being scored, so a team with two games in the lines
+    # window gets THIS game's prior, not the other one's.
     with DatabaseManager(db_path=db_path) as db:
-        team_priors_map = db.get_team_prior_inputs_map()
+        team_priors_map = db.get_team_prior_inputs_map(game_date=today)
 
     board_lines = _build_board_lines(
         rows=rows,

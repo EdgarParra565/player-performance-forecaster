@@ -4,9 +4,12 @@ import { getAccessCode, signalAccessRequired } from "../lib/access";
 
 export class ApiError extends Error {
   status: number;
-  constructor(status: number, message: string) {
+  // Machine-readable reason from the API (e.g. "db_not_mounted", "db_invalid").
+  code: string | null;
+  constructor(status: number, message: string, code: string | null = null) {
     super(message);
     this.status = status;
+    this.code = code;
     this.name = "ApiError";
   }
 }
@@ -53,14 +56,16 @@ function headers(): Record<string, string> {
 async function handle<T>(res: Response): Promise<T> {
   if (!res.ok) {
     let detail = res.statusText;
+    let code: string | null = null;
     try {
       const body = await res.json();
       if (body?.detail) detail = String(body.detail);
+      if (typeof body?.code === "string") code = body.code;
     } catch {
       /* non-JSON error body */
     }
     if (res.status === 401) signalAccessRequired();
-    throw new ApiError(res.status, detail);
+    throw new ApiError(res.status, detail, code);
   }
   return (await res.json()) as T;
 }

@@ -177,6 +177,26 @@ def _redact_api_key(text: str) -> str:
     return _API_KEY_RE.sub(r"\1***", str(text))
 
 
+# The Odds API answers a bad/expired key with 401, a plan without access with
+# 403 and a spent quota with 429. None of them fixes itself on retry.
+AUTH_OR_QUOTA_STATUS_CODES = frozenset({401, 403, 429})
+
+
+class OddsApiAuthError(requests.HTTPError):
+    """Odds API refused the request for auth / plan / quota reasons.
+
+    Raised immediately (no retries — they only burn quota) and propagated out
+    of ``fetch_and_store_betting_lines`` so the odds step FAILS instead of
+    reporting "success, events_processed 0". ``retryable = False`` tells
+    ``daily_etl.run_with_retry`` not to re-run the step either."""
+
+    retryable = False
+
+    def __init__(self, message: str, status_code: Optional[int] = None):
+        super().__init__(message)
+        self.status_code = status_code
+
+
 def _get_json(
     url: str,
     params: dict,
@@ -197,8 +217,16 @@ def _get_json(
             response.raise_for_status()
             return response.json()
         except requests.HTTPError as exc:
-            snippet = exc.response.text[:500] if getattr(exc, "response", None) is not None else ""
-            last_exc = requests.HTTPError(_redact_api_key(f"{exc} | response={snippet}"))
+            resp = getattr(exc, "response", None)
+            snippet = resp.text[:500] if resp is not None else ""
+            message = _redact_api_key(f"{exc} | response={snippet}")
+            code = getattr(resp, "status_code", None)
+            if code in AUTH_OR_QUOTA_STATUS_CODES:
+                raise OddsApiAuthError(
+                    f"Odds API HTTP {code} (auth / plan / quota): {message}",
+                    status_code=code,
+                ) from None
+            last_exc = requests.HTTPError(message)
         except requests.RequestException as exc:
             last_exc = type(exc)(_redact_api_key(str(exc)))
         except ValueError as exc:
@@ -490,7 +518,7 @@ def normalize_event_player_props(
     return records, sorted(set(missing_players))
 
 
-def fetch_and_store_betting_lines(
+def fetch_and_store_betting_lines(  # noqa: C901 — discovery fallbacks
     api_key: str,
     sport: str = "basketball_nba",
     regions: str = "us",
@@ -515,6 +543,7 @@ def fetch_and_store_betting_lines(
     event_odds_failures = 0
     first_event_error = None
     diagnostic = None
+    auth_error: Optional[OddsApiAuthError] = None
 
     events = []
     should_try_sport_level = not _are_player_prop_markets(selected_markets)
@@ -532,6 +561,8 @@ def fetch_and_store_betting_lines(
                 request_retry_delay_seconds=request_retry_delay_seconds,
                 request_retry_backoff=request_retry_backoff,
             )
+        except OddsApiAuthError:
+            raise
         except Exception as exc:
             logger.warning(f"Sport-level odds fetch failed: {exc}")
             events = []
@@ -558,6 +589,8 @@ def fetch_and_store_betting_lines(
                 request_retry_delay_seconds=request_retry_delay_seconds,
                 request_retry_backoff=request_retry_backoff,
             )
+        except OddsApiAuthError:
+            raise
         except Exception as exc:
             logger.warning(f"Direct events fetch failed: {exc}")
             events = []
@@ -575,6 +608,8 @@ def fetch_and_store_betting_lines(
                 )
                 if events:
                     logger.info("Discovered events via sport odds fallback (h2h).")
+            except OddsApiAuthError:
+                raise
             except Exception as exc:
                 logger.warning(f"Fallback event discovery via sport odds failed: {exc}")
         if not events:
@@ -604,6 +639,12 @@ def fetch_and_store_betting_lines(
                     request_retry_delay_seconds=request_retry_delay_seconds,
                     request_retry_backoff=request_retry_backoff,
                 )
+            except OddsApiAuthError as exc:
+                # Quota/auth mid-run: every remaining event would fail the
+                # same way. Stop requesting, store what was already parsed,
+                # then fail the step (raised after the DB write below).
+                auth_error = exc
+                break
             except Exception as exc:
                 logger.warning(f"Skipping event {event_id}: {exc}")
                 event_odds_failures += 1
@@ -663,7 +704,7 @@ def fetch_and_store_betting_lines(
 
     events_with_books = sum(1 for event in events if isinstance(event, dict) and event.get("bookmakers"))
 
-    return {
+    summary = {
         "ingestion_mode": ingestion_mode,
         "events_processed": len(events),
         "events_with_bookmakers": events_with_books,
@@ -684,6 +725,10 @@ def fetch_and_store_betting_lines(
         "snapshots_attempted": snapshot_insert_summary.get("attempted", 0),
         "snapshots_inserted": snapshot_insert_summary.get("inserted", 0),
     }
+    if auth_error is not None:
+        auth_error.partial_summary = summary
+        raise auth_error
+    return summary
 
 
 def fetch_odds(api_key: str, sport: str = "basketball_nba"):

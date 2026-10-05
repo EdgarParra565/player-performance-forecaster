@@ -124,7 +124,7 @@ export function LineMovementPanel({ playerId, stat }: { playerId: number; stat: 
       <EmptyState
         compact
         title="No stored line movement for this player + stat."
-        hint="Line movement replays betting_line_snapshots per book. Offseason slates have no fresh snapshots within the 30-day window; drift appears once books start posting in October."
+        hint="Line movement replays betting_line_snapshots per book. No fresh snapshots within the 30-day window (offseason, or books haven't posted this player yet); drift appears once books start posting."
         lastData={data?.last_snapshot_utc ? `last snapshot ${fmtDateTime(data.last_snapshot_utc)}` : null}
       />
     );

@@ -35,6 +35,7 @@ from __future__ import annotations
 import re
 
 from nba_model.scrapers.base import BookScraper, SessionMarkers
+from nba_model.scrapers.game_dates import find_date_hint
 from nba_model.scrapers.team_names import TEAM_NAME_PATTERN, normalize_team
 
 
@@ -50,7 +51,7 @@ _GAME_RE = re.compile(
     + r"\s+(?:@|at|vs\.?)\s+"
     + _TEAM.replace("NAME", "home")
     # Optional "Today 7:10pm" / "Sat 1:00pm" block before the odds.
-    + r"\s+(?:[A-Za-z]{3,9}\s+\d{1,2}:\d{2}\s*(?:am|pm|AM|PM)?\s+)?"
+    + r"\s+(?:(?P<date>[A-Za-z]{3,9})\s+\d{1,2}:\d{2}\s*(?:am|pm|AM|PM)?\s+)?"
     + r"(?P<away_spread>" + _SPREAD + r")"
       r"\s+(?P<away_spread_odds>" + _ODDS + r")"
       r"\s+O\s+(?P<total>" + _TOTAL + r")"
@@ -92,7 +93,11 @@ def extract_team_lines(text: str) -> list[dict]:
         if not away or not home:
             continue
         raw = m.group(0)[:300]
-        common = {"away_team": away, "home_team": home, "raw_text": raw}
+        # Legacy: "Today 7:10pm" inside the match; 2026: "... same game parlay
+        # available Oct 20, 3:00pm ET" right after it.
+        hint = m.groupdict().get("date") or find_date_hint(text, m.start(), m.end(), after=60)
+        common = {"away_team": away, "home_team": home, "raw_text": raw,
+                  "game_date_hint": hint}
 
         out.append({**common, "market_type": "spread", "side": "away",
                     "team": away,

@@ -33,6 +33,7 @@ from __future__ import annotations
 import re
 
 from nba_model.scrapers.base import BookScraper, SessionMarkers
+from nba_model.scrapers.game_dates import find_date_hint
 from nba_model.scrapers.team_names import TEAM_NAME_PATTERN, normalize_team
 
 
@@ -55,7 +56,7 @@ _GAME_RE = re.compile(
 _ODDS_OR_EVEN = r"(?:[+\-]\d{2,4}|EVEN)"
 
 _GAME_RE_2026 = re.compile(
-    r"\d{1,2}/\d{1,2}/\d{2,4}\s+\d{1,2}:\d{2}\s*[AP]M\s+"
+    r"(?P<date>\d{1,2}/\d{1,2}/\d{2,4})\s+\d{1,2}:\d{2}\s*[AP]M\s+"
     r"(?:Spread\s+)?"
     r"(?P<away_spread>" + _SPREAD + r")\s+(?P<away_spread_odds>" + _ODDS_OR_EVEN + r")\s+"
     r"(?P<home_spread>" + _SPREAD + r")\s+(?P<home_spread_odds>" + _ODDS_OR_EVEN + r")\s+"
@@ -86,7 +87,11 @@ def extract_team_lines(text: str) -> list[dict]:
         if not away or not home:
             continue
         raw = m.group(0)[:300]
-        common = {"away_team": away, "home_team": home, "raw_text": raw}
+        # 2026 layout carries the date in the match; legacy prints it just
+        # before the team names ("5/8/26 7:00 PM New York Knicks ...").
+        hint = m.groupdict().get("date") or find_date_hint(text, m.start(), m.end(), before=40)
+        common = {"away_team": away, "home_team": home, "raw_text": raw,
+                  "game_date_hint": hint}
 
         out.append({**common, "market_type": "spread", "side": "away",
                     "team": away,

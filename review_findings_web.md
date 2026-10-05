@@ -159,3 +159,11 @@ per-IP limits. See `docs/DEPLOYMENT.md` §15.
   - 44px `pointer-coarse` targets; tables scroll inside their cards with a sticky first column; ECharts `hideOverlap` on axis labels.
   - Audit on all 8 views at 375 and 768 px: 0 page overflow and 0 sub-44px targets. Evidence in `docs/screenshots/flagship/mobile/`.
 
+## 9. Local Docker / freshness pass (2026-10-05)
+
+- `api/main.py` `db_state` + health — **MAJOR** — `docker run` without the bind mount started "healthy" (health 200 "degraded") and served empty views. — Missing or 0-byte file → `not_mounted`: health and data endpoints answer 503 with `code: db_not_mounted`, the HEALTHCHECK fails, nothing is created, and the UI shows a dedicated notice. — **FIXED** (`test_api_hardening.py`: missing file on an empty mount dir, 0-byte, invalid, healthy; `DbNotice.test.tsx`).
+- `.dockerignore` — **MINOR** — `COPY nba_model` carried stray SQLite files (`nba_model/data/database/nba_data.db` 0 B, `test_nba_data.db` 53 KB) into the image. — `**/*.db*` excluded; `find` in the built image returns nothing. — **FIXED**.
+- `nba_model/data/database/db_manager.py` `_ensure_game_date_columns` — **MAJOR** — **CROSS-BOUNDARY** — The new open-time `ALTER TABLE` broke every API request on the read-only compose mount ("attempt to write a readonly database"). — API-side workaround: `api/working_copy.py` (`test_working_copy.py`). Proper fix: a read-only open mode in db_manager (data agent).
+- `api/services.py` freshness — **MINOR** — It windowed on `observed_at_utc` (last CHANGED), so stable, still-posted lines aged out. — Now `COALESCE(last_seen_at_utc, observed_at_utc)`. — **FIXED** (`test_api_freshness.py`).
+- Per-request `DatabaseManager` opens — still **PROPOSED**: blocked on the read-only open mode, which notes.txt does not report as shipped.
+

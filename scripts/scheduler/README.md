@@ -1,5 +1,12 @@
 # Hourly NBA ETL scheduler (scraping autopilot)
 
+> **Status: OFF since 2026-09-28 (owner).** All three agents are unloaded and
+> `launchctl disable`d (California geo-blocks — see
+> `data/config/blocked_books.txt`), so they won't load at login. Don't load
+> them unless the owner re-enables scraping. To turn it back on:
+> `launchctl enable gui/$(id -u)/<label>` for each label, then the
+> `launchctl bootstrap` steps below.
+
 The deployed model is "updated every hour": web-text ingestion → prop /
 team-line parsing → VegasInsider ingestion → game-log refresh → team priors →
 outcome settlement → prediction recompute, once per hour. The pipeline lives in

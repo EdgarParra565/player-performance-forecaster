@@ -15,6 +15,7 @@ from __future__ import annotations
 import re
 
 from nba_model.scrapers.base import BookScraper, SessionMarkers
+from nba_model.scrapers.game_dates import find_date_hint
 from nba_model.scrapers.team_names import TEAM_NAME_PATTERN, normalize_team
 
 
@@ -54,7 +55,9 @@ def extract_team_lines(text: str) -> list[dict]:
         if not away or not home:
             continue
         raw = m.group(0)[:300]
-        common = {"away_team": away, "home_team": home, "raw_text": raw}
+        # The game's date follows its two sides: "... -105 OCT 20 4:10 PM".
+        common = {"away_team": away, "home_team": home, "raw_text": raw,
+                  "game_date_hint": find_date_hint(text, m.start(), m.end(), after=40)}
 
         out.append({**common, "market_type": "spread", "side": "away",
                     "team": away,

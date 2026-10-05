@@ -532,18 +532,41 @@ webhook (§7a) rather than replacing them.
 
 ### Build + run
 
+**The image contains no database.** `data/database/nba_data.db` (~65 MB,
+gitignored, excluded by `.dockerignore`) is mounted read-only at runtime:
+
 ```bash
-# Container (multi-stage: node builds the SPA, python serves it)
+# Easiest: compose builds the image and bind-mounts ./data/database:/data:ro
+docker compose up flagship            # http://localhost:8080
+
+# Plain docker (from the repo root):
 docker build -f Dockerfile.flagship -t nba-flagship .
 docker run --rm -p 8080:8080 \
   -v "$(pwd)/data/database:/data:ro" \
   -e NBA_DB_PATH=/data/nba_data.db \
-  -e API_TRUSTED_HOSTS=props.example.com \
   nba-flagship
 
-# or via compose
-docker compose up flagship            # http://localhost:8080
+# Verify (counts must match the host DB, not an empty schema):
+python -m api.smoke_check --base-url http://localhost:8080 --strict
+curl -s http://localhost:8080/api/slate/kpis
 ```
+
+**If you forget the mount** (`docker run` without `-v`, or a wrong host
+path), `/data` is empty. The API **does not** create an empty schema. Instead:
+- `/api/health` returns **503** with `db_state: "not_mounted"` and
+  `code: "db_not_mounted"`, so the container `HEALTHCHECK` (and Fly's check)
+  fails.
+- Every data endpoint returns 503 with the same code and a safe message (no
+  paths).
+- The UI shows a red "Database file not mounted" notice with the commands
+  above, and the header pill says "No database". The offseason empty states
+  ("No scored edges right now…") appear only when the DB *is* mounted and
+  simply has no current lines.
+- `smoke_check` prints the reason on its `health 200` failure.
+
+A file that exists but isn't a usable NBA DB (corrupt, or missing core
+tables) gives `db_state: "invalid"` / `code: "db_invalid"`, and nothing is
+written to it.
 
 Without Docker (same production path):
 
@@ -735,10 +758,14 @@ fly apps create nba-props-flagship       # or another name; then update `app`
 fly storage create --app nba-props-flagship   # Tigris bucket + app secrets
 fly secrets set --app nba-props-flagship \
   FLAGSHIP_ACCESS_CODE="$(openssl rand -base64 24)"   # recommended ON for now
+# Publish the FIRST snapshot before deploying: /api/health answers 503 until
+# the app has a database, so `fly deploy` would fail its health check on an
+# empty bucket. (Write storage.env as in "Mac-side credentials" first.)
+scripts/publish_db.sh --to-object-store --skip-git
 fly deploy                               # builds Dockerfile.flagship remotely
 ```
 
-Then publish the first snapshot from the Mac (above) and check the live site:
+Then check the live site:
 
 ```bash
 python -m api.smoke_check --base-url https://nba-props-flagship.fly.dev --strict \

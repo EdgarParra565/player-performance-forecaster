@@ -214,3 +214,70 @@ class MainLineMigrationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BettingLinesLastSeenTests(_DbCase):
+    """betting_lines is change-only, so scraped_at = "last changed": a line
+    that didn't move aged out of every scraped_at since-window (cross-book
+    view, TRUE-arb). last_seen_at_utc is bumped on unchanged re-scrapes."""
+
+    def _age(self, days):
+        self.db.conn.execute(
+            "UPDATE betting_lines SET scraped_at = datetime('now', ?), "
+            "last_seen_at_utc = datetime('now', ?)", (f"-{days} days", f"-{days} days"))
+        self.db.conn.commit()
+
+    def test_stable_line_stays_in_since_window(self):
+        from nba_model.model.cross_book_arb import fetch_two_way_lines
+
+        self.db.insert_betting_lines_records([_line(20.5)])
+        self._age(3)
+        self.assertTrue(fetch_two_way_lines(db_path=self.db_path, since_hours=24).empty)
+        res = self.db.insert_betting_lines_records([_line(20.5)])  # re-scrape, unchanged
+        self.assertEqual(res["inserted"], 0)
+        self.assertEqual(res["last_seen_bumped"], 1)
+        df = fetch_two_way_lines(db_path=self.db_path, since_hours=24)
+        self.assertEqual(df["line_value"].tolist(), [20.5])
+        # scraped_at still means "last changed".
+        age = self.db.conn.execute(
+            "SELECT julianday('now') - julianday(scraped_at) FROM betting_lines").fetchone()[0]
+        self.assertGreater(age, 2.5)
+
+    def test_moved_line_old_row_is_not_bumped(self):
+        self.db.insert_betting_lines_records([_line(20.5)])
+        self._age(3)
+        self.db.insert_betting_lines_records([_line(21.5)])
+        rows = self.db.conn.execute(
+            "SELECT line_value, julianday('now') - julianday(last_seen_at_utc) > 2 "
+            "FROM betting_lines ORDER BY line_id").fetchall()
+        self.assertEqual(rows, [(20.5, 1), (21.5, 0)])
+
+    def test_alt_rung_rescrape_bumps_each_rung(self):
+        self.db.insert_betting_lines_records(_ladder())
+        self._age(3)
+        res = self.db.insert_betting_lines_records(_ladder())
+        self.assertEqual(res["inserted"], 0)
+        self.assertEqual(res["last_seen_bumped"], len(BOVADA_LADDER))
+
+    def test_chart_freshness_shows_last_seen(self):
+        from nba_model.visualization import player_charts as pc
+
+        self.db.insert_betting_lines_records([_line(20.5)])
+        self._age(3)
+        self.db.insert_betting_lines_records([_line(20.5)])
+        latest = pc._fetch_latest_book_lines(self.db, PID, "points", player_name="LeBron James")
+        seen = latest.iloc[0]["scraped_at_utc"]
+        age = self.db.conn.execute("SELECT julianday('now') - julianday(?)", (seen,)).fetchone()[0]
+        self.assertLess(age, 0.01)
+
+    def test_migration_backfills_from_scraped_at(self):
+        self.db.insert_betting_lines_records([_line(20.5)])
+        self.db.conn.execute("ALTER TABLE betting_lines DROP COLUMN last_seen_at_utc")
+        self.db.conn.commit()
+        self.db.close()
+        for _ in range(2):
+            with DatabaseManager(self.db_path) as db:
+                row = db.conn.execute(
+                    "SELECT scraped_at, last_seen_at_utc FROM betting_lines").fetchone()
+            self.assertEqual(row[0], row[1])
+        self.db = DatabaseManager(self.db_path)

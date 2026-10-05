@@ -472,9 +472,9 @@ def main():
     if args.home_team and args.away_team:
         with DatabaseManager(db_path=args.db_path) as db:
             team_priors[args.home_team.upper()] = db.get_team_prior_inputs(
-                args.home_team, args.away_team)
+                args.home_team, args.away_team, game_date=args.game_date)
             team_priors[args.away_team.upper()] = db.get_team_prior_inputs(
-                args.away_team, args.home_team)
+                args.away_team, args.home_team, game_date=args.game_date)
         team_priors = {k: v for k, v in team_priors.items() if v}
 
     board_lines = _build_board_lines(

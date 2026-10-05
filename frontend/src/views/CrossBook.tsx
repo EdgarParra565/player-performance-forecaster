@@ -200,7 +200,7 @@ export function CrossBook() {
         ) : (
           <EmptyState
             title="No cross-book opportunities."
-            hint="Needs 2+ books quoting the same player + stat within the lookback window. During the NBA offseason the DFS board is empty, so this fills in once lines return in October."
+            hint="Needs 2+ books quoting the same player + stat within the lookback window. Outside the season (or before books post a game's props) the DFS board is empty, so this fills in once lines return."
             lastData={
               data?.kpis.freshest_hours != null ? `freshest line ${fmtHoursAgo(data.kpis.freshest_hours)}` : null
             }

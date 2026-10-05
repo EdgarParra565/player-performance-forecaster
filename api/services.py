@@ -94,11 +94,26 @@ def _utc_iso(value) -> Optional[str]:
     return ts.isoformat()
 
 
+def _seen_expr(db: DatabaseManager, table: str) -> str:
+    """SQL for "when was this line last SEEN" on a change-only board table.
+
+    Boards store a row only when the line CHANGES (``observed_at_utc``);
+    unchanged re-sights bump ``last_seen_at_utc``. Windowing on
+    ``observed_at_utc`` alone drops stable lines that are still posted, so use
+    the COALESCE (the same rule edge_scanner applies). Older DBs (e.g. on a
+    read-only mount, where the data layer can't add the column) fall back.
+    """
+    cols = {r[1] for r in db.conn.execute(f"PRAGMA table_info({table})")}  # fixed table names only
+    if "last_seen_at_utc" in cols:
+        return "datetime(COALESCE(last_seen_at_utc, observed_at_utc))"
+    return "datetime(observed_at_utc)"
+
+
 def _freshest_scrape(db: DatabaseManager) -> Optional[str]:
-    """Newest scrape timestamp across every live-line source (UTC ISO)."""
+    """Newest scrape (or unchanged re-sight) across every live-line source (UTC ISO)."""
     candidates = [
-        _scalar(db, "SELECT MAX(datetime(observed_at_utc)) FROM web_prop_cards"),
-        _scalar(db, "SELECT MAX(datetime(observed_at_utc)) FROM web_team_lines"),
+        _scalar(db, f"SELECT MAX({_seen_expr(db, 'web_prop_cards')}) FROM web_prop_cards"),
+        _scalar(db, f"SELECT MAX({_seen_expr(db, 'web_team_lines')}) FROM web_team_lines"),
         _scalar(db, "SELECT MAX(datetime(scraped_at)) FROM betting_lines"),
     ]
     vals = [v for v in (_utc_iso(c) for c in candidates) if v]
@@ -117,8 +132,9 @@ def slate_kpis(db_path: str) -> dict:
             db,
             "SELECT COUNT(*) FROM web_prop_cards "
             # datetime() normalises the ISO 'T'/offset form so the string
-            # comparison against datetime('now', ...) is apples to apples.
-            "WHERE datetime(observed_at_utc) >= datetime('now', '-48 hours')",
+            # comparison against datetime('now', ...) is apples to apples;
+            # last-SEEN (not last-changed) keeps stable lines in the window.
+            f"WHERE {_seen_expr(db, 'web_prop_cards')} >= datetime('now', '-48 hours')",
         )) or 0
     return {
         "games_in_db": games,

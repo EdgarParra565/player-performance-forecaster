@@ -128,7 +128,7 @@ function TopEdges({ lastData }: { lastData: string | null }) {
     return (
       <EmptyState
         title="No scored edges right now."
-        hint="The edge scanner ranks scraped prop lines against the model. During the NBA offseason the books post no player props, so the slate is empty until October."
+        hint="The edge scanner ranks scraped prop lines against the model. Outside the season, or before books post the day's player props, the slate is empty."
         lastData={lastData ? `scrape ${fmtAgo(lastData)}` : null}
       />
     );

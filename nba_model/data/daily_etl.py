@@ -263,7 +263,9 @@ def run_with_retry(
             }
         except Exception as exc:  # pragma: no cover - handled by tests via behavior checks
             last_error = exc
-            if attempt > retries:
+            # Errors flagged non-retryable (e.g. Odds API 401/403/429 — a bad
+            # key or spent quota) fail at once: retrying only burns quota.
+            if attempt > retries or getattr(exc, "retryable", True) is False:
                 break
             delay = base_delay * (backoff ** (attempt - 1))
             logger.warning(
@@ -872,6 +874,24 @@ def run_daily_etl(
     run_start = time.perf_counter()
     steps = {}
 
+    # Browser preflight FIRST (before the slow bulk/game-log/odds steps): when
+    # a browser fetch is requested (auth-state / user-data-dir / CDP port) but
+    # Playwright isn't importable (e.g. system python3 instead of
+    # .venv/bin/python3), record web_text as a FAILED step and keep going —
+    # the run still writes its report and fires the alert. It used to raise
+    # after the other steps had run, so no report was written at all.
+    browser_preflight_error = None
+    if web_text_urls and (browser_auth_state_file or browser_user_data_dir or chrome_debug_port):
+        from nba_model.model.web_text_ingestion import playwright_is_available
+        if not playwright_is_available():
+            browser_preflight_error = (
+                "Playwright is not importable in this interpreter, but a "
+                "browser fetch was requested (auth-state / user-data-dir / "
+                "chrome-debug-port set). Re-run with .venv/bin/python3 -m "
+                "nba_model.data.daily_etl ..."
+            )
+            logger.error("browser preflight failed: %s", browser_preflight_error)
+
     # ---- Bulk NBA-API results ingest (games + league-wide player logs) ----
     # This runs BEFORE the per-player game-log refresh so the heavy bulk
     # endpoint populates the table once; the per-player step then only has
@@ -1034,25 +1054,15 @@ def run_daily_etl(
 
             steps["odds"] = odds_step
 
-    if web_text_urls:
-        # Guard: bail out early when the caller asked for a browser fetch but
-        # Playwright isn't importable in this interpreter (e.g. they ran the
-        # ETL with system python3 instead of `.venv/bin/python3`). Otherwise
-        # every URL would retry the same broken import once per
-        # request_retries — slow + confusing logs.
-        if (browser_auth_state_file or browser_user_data_dir or chrome_debug_port):
-            from nba_model.model.web_text_ingestion import playwright_is_available
-            if not playwright_is_available():
-                steps["web_text"] = {
-                    "status": "failed",
-                    "error": (
-                        "Playwright is not importable in this interpreter, but a "
-                        "browser fetch was requested (auth-state / user-data-dir / "
-                        "chrome-debug-port set). Re-run with .venv/bin/python3 -m "
-                        "nba_model.data.daily_etl ..."
-                    ),
-                }
-                raise RuntimeError(steps["web_text"]["error"])
+    if web_text_urls and browser_preflight_error:
+        # Preflight (top of the run) found no Playwright: don't loop every URL
+        # through the same broken import — fail the step, keep the report.
+        steps["web_text"] = {
+            "status": "failed",
+            "error": browser_preflight_error,
+            "reason": "browser_preflight",
+        }
+    elif web_text_urls:
         web_text_step = run_with_retry(
             step_name="web_text",
             func=lambda: _run_web_text_step(
@@ -1097,6 +1107,11 @@ def run_daily_etl(
         steps["browser_parser"] = {
             "status": "skipped",
             "reason": "No web text URLs provided.",
+        }
+    elif browser_preflight_error:
+        steps["browser_parser"] = {
+            "status": "skipped",
+            "reason": "web_text browser preflight failed — no fresh snapshots to parse.",
         }
     else:
         browser_parser_step = run_with_retry(

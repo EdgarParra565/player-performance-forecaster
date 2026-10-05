@@ -355,6 +355,8 @@ def score_prop_edges(
     with DatabaseManager(db_path=db_path) as db:
         # Full mode pulls the whole slate's team priors once (pace + implied
         # team total per team) — the same map the hourly recompute blends.
+        # Board cards carry no game date, so each team gets the prior of its
+        # NEXT game (get_team_prior_inputs_map without game_date).
         team_prior_map = (
             db.get_team_prior_inputs_map() if model_mode == "full" else {}
         )

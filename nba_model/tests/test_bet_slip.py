@@ -86,6 +86,37 @@ class BuildBetSlipGateTests(unittest.TestCase):
         so = slip[slip["player_name"] == "Strong Over"].iloc[0]
         self.assertEqual(so["player_id"], 42)
 
+    def test_same_prop_at_several_books_is_staked_once(self):
+        # Review finding: the same prop at 3 books got 3 full Kelly stakes.
+        rows = []
+        for book, line, edge in (("Underdog", 17.5, 0.20), ("PrizePicks", 17.5, 0.23),
+                                 ("Pick6", 18.5, 0.15)):
+            r = _scored_row("Strong Over", "points", line, 0.75, edge)
+            r["book"] = book
+            rows.append(r)
+        rows.append(_scored_row("Strong Over", "rebounds", 8.5, 0.75, 0.10))  # other prop
+        under = _scored_row("Strong Over", "points", 19.5, 0.30, 0.12)        # opposite side
+        under["book"] = "ParlayPlay"
+        rows.append(under)
+        slip = bet_slip.build_bet_slip(
+            pd.DataFrame(rows, columns=es.SCORED_COLUMNS_FULL), game_date="2025-04-16")
+        pts = slip[slip["stat_type"] == "points"]
+        self.assertEqual(len(pts), 1)                      # one stake per prop
+        self.assertEqual(pts.iloc[0]["book"], "PrizePicks")  # best edge wins
+        self.assertEqual(len(slip), 2)                     # rebounds kept
+
+    def test_dedupe_runs_before_max_picks(self):
+        rows = []
+        for book in ("A", "B", "C"):
+            r = _scored_row("Dup Guy", "points", 17.5, 0.75, 0.30)
+            r["book"] = book
+            rows.append(r)
+        rows.append(_scored_row("Other Guy", "assists", 6.5, 0.75, 0.10))
+        slip = bet_slip.build_bet_slip(
+            pd.DataFrame(rows, columns=es.SCORED_COLUMNS_FULL),
+            game_date="2025-04-16", max_picks=2)
+        self.assertEqual(sorted(slip["player_name"]), ["Dup Guy", "Other Guy"])
+
     def test_empty_frame_returns_shaped_empty(self):
         out = bet_slip.build_bet_slip(
             pd.DataFrame(columns=es.SCORED_COLUMNS_FULL), game_date="2025-04-10")
@@ -155,6 +186,20 @@ class GenerateBetSlipIntegrationTests(unittest.TestCase):
         self.assertEqual(row[0], NEUTRAL_ID)
         self.assertEqual(row[1], "pending")
         self.assertEqual(row[2], "full")
+
+    def test_rerunning_the_same_slate_does_not_double_count(self):
+        first = bet_slip.generate_bet_slip(
+            db_path=self.db_path, game_date="2025-04-16",
+            artifact_dir=self.artifact_dir, dry_run=False)
+        again = bet_slip.generate_bet_slip(
+            db_path=self.db_path, game_date="2025-04-16",
+            artifact_dir=self.artifact_dir, dry_run=False)
+        self.assertGreaterEqual(first["bet_log_inserted"], 1)
+        self.assertEqual(again["bet_log_inserted"], 0)
+        with DatabaseManager(db_path=self.db_path) as db:
+            n, stake = db.conn.execute(
+                "SELECT COUNT(*), SUM(stake_units) FROM bet_log").fetchone()
+        self.assertEqual(n, first["bet_log_inserted"])
 
 
 if __name__ == "__main__":

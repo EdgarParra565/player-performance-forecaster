@@ -5,29 +5,36 @@ Last updated: 2026-09-28
 Active tracker only: architecture, what's done, what's next. CLI runbooks,
 deployment, and security live in **README.md** and **docs/** — not duplicated here.
 
-Test baseline (2026-09-28, end of day): **891 passing** in nba_model/tests
+Test baseline (2026-10-05, end of data-agent pass): **928 passing** in nba_model/tests
 (`.venv/bin/python3 -m pytest nba_model/tests -q`; Windows:
 `.venv\Scripts\python.exe -m pytest nba_model/tests -q`; note `test_daily_etl.py`
-needs real network to stats.nba.com), **99 API tests**
-(`.venv/bin/python3 -m pytest api/tests -q`), and **99 frontend tests + clean tsc**
+needs real network to stats.nba.com), **108 API tests**
+(`.venv/bin/python3 -m pytest api/tests -q`), and **104 frontend tests + clean tsc**
 (`cd frontend && npm run test`).
 
 ---
 
 ## Near-term objectives (NBA)
 
-1. **In-season data loop — LIVE (2026-09-28).** Autopilot running unattended on the
-   Mac: launchd-managed scraping Chrome (`:9222`, dedicated profile, KeepAlive) +
-   hourly ETL at :05 by the clock (+ keep-awake on AC) + session-health alerts
-   (macOS notifications; one alert per new login-needed). First unattended run
-   verified. Remaining slice: `publish_db.sh --to-object-store` → Fly/Tigris cloud
-   app, blocked only on the owner creating the Fly.io account (DEPLOYMENT.md §16).
+1. **In-season data loop — BUILT, OFF since 2026-09-28 (owner).** The autopilot
+   (launchd scraping Chrome on `:9222`, hourly ETL at :05, keep-awake,
+   session-health alerts) was verified live on 2026-09-28, then the owner turned
+   it off: from California several books are geo-blocked (BetMGM, Underdog) and
+   BetRivers/HardRock are 21+. All three LaunchAgents are unloaded AND
+   `launchctl disable`d (they won't load at login); the plists stay installed.
+   **Scraping is still off as of 2026-10-05** — no new lines land; the apps serve
+   what's in the DB. Re-enable = `launchctl enable` + `bootstrap` per
+   scripts/scheduler/README.md. Remaining slice when it's back on:
+   `publish_db.sh --to-object-store` → Fly/Tigris (DEPLOYMENT.md §16).
 2. **Run WS10 validation** — market-line backtests, 4–8 week paper trade
-   (`bet_slip` → `bet_log` → `calibration_report`), CLV review. Tooling is built;
-   opening-week team lines are landing; player props start posting in October.
-   **Do not bet real money until this passes.**
+   (`bet_slip` → `bet_log` → `calibration_report`), CLV review. Tooling is built
+   (2026-10-05: bet_log dedupe + best-book-per-prop slips). **Not started: Phases
+   0–2 need live boards and scraping is off.** **Do not bet real money until this
+   passes.**
 3. **More scrapers** — Caesars, Bovada, and FanDuel NBA promoted LIVE 2026-09-28
-   (opening-week team lines parsed hourly). theScore (futures-only), DK NBA
+   (opening-week team lines parsed hourly while the autopilot ran; now off, and
+   these three extractors capture each game's date since 2026-10-05). The
+   preseason capture sprint has NOT moved (needs Chrome). theScore (futures-only), DK NBA
    (nav shell from CA), VI NBA grid, and the DFS prop boards stay MECH until NBA
    player props post (~Oct). Remaining blocks are external: geo-CA (BetMGM,
    Underdog pick'em, possibly Pick6), age-21+ (BetRivers, HardRock), app-only /
@@ -160,6 +167,8 @@ save; web = Plotly, Tk = matplotlib; do not delete `sports/` scaffolding.
   Also: `hourly_update.sh` curl gate is warning-only and forwards
   `--chrome-port/--chrome-host`. All verified with mocks / fake Chrome binary
   (`tests/test_scraping_autopilot.py`, 30 tests).
+  **Status 2026-10-05: OFF** (owner unloaded + disabled all three agents after
+  the 2026-09-28 pass — California geo-blocks). History of that live pass:
   **LIVE 2026-09-28** — all three LaunchAgents loaded on this Mac:
   `com.nba.scraping-chrome` (Chrome 154, dedicated profile, KeepAlive relaunch
   after kill ≈14s), `com.nba.hourly` (now `StartCalendarInterval` minute :05 —
@@ -186,6 +195,17 @@ save; web = Plotly, Tk = matplotlib; do not delete `sports/` scaffolding.
   `last_seen_at_utc`, betting_lines latest-row dedupe + book casing, alt-line
   main-line tagging, CDP tab reuse via hygiene, hourly wrapper curl gate); 9
   PROPOSED remain. **Live-DB cleanup DONE** (see "Live-DB cleanup" below).
+  **2026-10-05 follow-up (no Chrome, no live fetch):** 6 more majors FIXED —
+  team_priors game date (live bug: PHI's Oct 20 projection used its Dec 25
+  total; extractors now capture dates → `web_team_lines.game_date` → date-keyed
+  consensus → `team_priors` PK incl. game_date → lookups by projection date),
+  `betting_lines.last_seen_at_utc` (stable lines stay in scraped_at windows),
+  bet_log pick dedupe (unique index + INSERT OR IGNORE), bet_slip one pick per
+  prop (best book), Odds API 401/403/429 fail the step (typed, non-retryable),
+  daily_etl Playwright preflight first (failed step + report, no raise). Also
+  the read-only DatabaseManager open (flagship handoff). 5 PROPOSED remain, each
+  with a reason (UTC/ET slate date, predictions run_id, executemany partial
+  writes, publish_db branch, PP-style regex).
   Critical: the suite wrote into the LIVE DB (a module-level test script
   inserted a fabricated LeBron game log `0022400001`; every `odds_poll_runs` row
   is test mock data, and those rows feed the 24h odds-freshness guard). Now blocked by
@@ -200,10 +220,11 @@ save; web = Plotly, Tk = matplotlib; do not delete `sports/` scaffolding.
   API key redaction; MLB Final-only ingest; `mlb_prop_lines` key includes
   game_date; VI grids: rejected headers no longer bleed, 3–5 digit odds only,
   mid-row cutoff guard, linear label regex. Top PROPOSED items still open:
-  - UTC-vs-ET slate `game_date`
-  - `bet_log` / `predictions` dedupe
-  - `betting_lines` change-only rows vs `scraped_at` since-windows (new 2026-09-28)
-  (team priors, `last_seen_at_utc`, alt-line ladders, CDP tab reuse: FIXED 2026-09-28)
+  - UTC-vs-ET slate `game_date` (repo-wide convention change)
+  - `predictions` run_id (needs a calibration reader migration)
+  (team priors, `last_seen_at_utc`, alt-line ladders, CDP tab reuse: FIXED 2026-09-28;
+  team_priors game date, betting_lines last_seen, bet_log dedupe, bet_slip
+  best-book, Odds API auth errors, daily_etl Playwright guard: FIXED 2026-10-05)
 
 - **Live-DB cleanup (2026-09-28, owner-approved)** — backup
   `data/database/backups/nba_data_pre_cleanup_20260928T172053Z.db` (cp; sha256
@@ -239,6 +260,17 @@ save; web = Plotly, Tk = matplotlib; do not delete `sports/` scaffolding.
 - [ ] **Phase 3** — execution layer ONLY if Phases 1–2 pass (book APIs, limits, kill switch).
 
 ### Smaller follow-ups
+
+- [x] **Data-agent pass 2026-10-05 (scraping OFF; no Chrome / live fetch):**
+      read-only `DatabaseManager(path, read_only=True)` (SQLite `mode=ro`, no
+      DDL/migrations/file creation, `DatabaseNotReadyError` on a
+      missing/empty/incomplete/un-migrated file; test_db_read_only); team-line
+      game dates + date-keyed priors (test_team_prior_game_dates);
+      `betting_lines.last_seen_at_utc`; bet_log dedupe; bet_slip best book per
+      prop; Odds API 401/403/429 → failed step; daily_etl Playwright preflight
+      first. Tests 891 → 928. Details: review_findings_data.md (FIXED 2026-10-05).
+      Open, needs Chrome: date capture for betmgm / DK / theScore / Kalshi /
+      BetRivers extractors (no live capture to author against).
 
 - [~] MLB player-props parser + park factors (2026-09-25). **VegasInsider MLB
       props: DONE** — `vegasinsider.extract_mlb_odds_rows` (authored on the REAL
@@ -746,8 +778,12 @@ review_findings_web.md.
       pull).
 - [ ] **Real auth** — deferred with billing. Reuse the OIDC tier model
       (iss+sub admin binding already in auth.py) if the app takes off.
-- [ ] CROSS-BOUNDARY handoff to the data agent: a `db_manager` read-only
-      open mode (the API preflight works around schema-on-open).
+- [x] CROSS-BOUNDARY handoff to the data agent: a `db_manager` read-only
+      open mode (the API preflight works around schema-on-open). **Shipped
+      2026-10-05 (data agent) — for the web agent to wire:**
+      `DatabaseManager(db_path, read_only=True)`; catch
+      `nba_model.data.database.db_manager.DatabaseNotReadyError` (missing /
+      empty / incomplete / un-migrated file) for the preflight/health path.
 
 Test counts after Phase 3: **nba_model 887** (+7 web tests of mine; the rest
 came from concurrent data-agent work), **api 71**, **frontend 86**.
@@ -793,4 +829,47 @@ Screenshots: docs/screenshots/flagship/after/ (1–7 plus 7b live-empty and
   - vitest 4 (`npm audit` 0, including dev).
 
 Test counts after Phase 4: **nba_model 891**, **api 99**, **frontend 99**.
+
+### Phase 4 follow-ups — local Docker + freshness (2026-10-05)
+
+- [x] **Missing DB is obvious, never silently empty.** No file (or a 0-byte
+      file) at NBA_DB_PATH → `/api/health` returns **503** with
+      `db_state: "not_mounted"` / `code: "db_not_mounted"` and a safe message,
+      so the container HEALTHCHECK fails. Every data endpoint returns 503 with
+      the same code. No tables are created. A corrupt or foreign file gives
+      `db_invalid`. The UI shows a red "Database file not mounted" notice with
+      the mount commands and a "No database" pill, distinct from the
+      offseason / no-lines empty states. Run commands are at the top of
+      Dockerfile.flagship and in DEPLOYMENT.md §15. §16 now publishes the
+      first snapshot BEFORE `fly deploy`, since health is 503 until a DB exists.
+- [x] **Image ships no SQLite at all.** `.dockerignore` excludes
+      `**/*.db*` (a stray 0-byte `nba_model/data/database/nba_data.db` and the
+      53 KB `test_nba_data.db` had been riding along via `COPY nba_model`).
+- [x] **Read-only mount works again.** The data layer's new open-time
+      migration (`_ensure_game_date_columns` → `ALTER TABLE web_team_lines ADD
+      COLUMN game_date`) made every DatabaseManager open fail on the
+      `./data/database:/data:ro` mount. The API now serves a disposable
+      working copy (`api/working_copy.py`: online .backup from a read-only
+      connection, refreshed on source mtime/size change, os.replace) whenever
+      the source isn't writable, so the host file is never written.
+      Verified with compose against this Mac's DB: smoke --strict 18/18;
+      kpis games_in_db 4,199 / players_tracked 1,091 / books_producing 16;
+      health table_counts games 8,398 / game_logs 91,734 / web_prop_cards
+      508 / betting_lines 2,955 / predictions 65,380; host file untouched.
+- [x] **Freshness = last SEEN.** `api/services.py` freshest-scrape and the
+      48h `prop_lines_recent` count use
+      `datetime(COALESCE(last_seen_at_utc, observed_at_utc))` (falls back to
+      observed_at_utc if the column is absent). Test:
+      `api/tests/test_api_freshness.py`.
+- [x] **CROSS-BOUNDARY (data agent):** DatabaseManager still writes on open,
+      and there is no read-only open mode yet, so the API still opens it
+      several times per request. The working copy is a workaround, not the
+      fix. Please ship a read-only open (and skip migrations in it); the API
+      will switch to it. **→ Shipped 2026-10-05:** `DatabaseManager(db_path,
+      read_only=True)` raises `DatabaseNotReadyError` instead of growing a
+      schema; api/ not edited by the data agent.
+- Stale shared status, NOT edited (data agent's section): "Near-term
+  objectives" item 1 still says the autopilot is LIVE / running unattended.
+  (Corrected by the data agent 2026-10-05: item 1 now says OFF.)
+  README.md is corrected (disabled 2026-09-28, California geo-blocks).
 

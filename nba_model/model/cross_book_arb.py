@@ -244,7 +244,11 @@ def fetch_two_way_lines(
     clauses = ["bl.line_value IS NOT NULL", "COALESCE(bl.is_main_line, 1) = 1"]
     params: list = []
     if since_hours and since_hours > 0:
-        clauses.append("bl.scraped_at >= datetime('now', ?)")
+        # Last SEEN, not last changed: change-only rows keep scraped_at at the
+        # last move, so a stable line would age out of the window.
+        clauses.append(
+            "datetime(COALESCE(bl.last_seen_at_utc, bl.scraped_at)) >= datetime('now', ?)"
+        )
         params.append(f"-{float(since_hours)} hours")
     if books:
         placeholders = ",".join("?" * len(books))

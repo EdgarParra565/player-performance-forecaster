@@ -76,13 +76,15 @@ def derive_team_priors_from_consensus(
             since_hours=since_hours, min_books=min_books,
         )
 
-    # Group by game.
+    # Group by game — (away, home, game_date): two meetings of the same teams
+    # in the window are two games with two priors.
     games: dict[tuple, dict] = {}
     for r in team_rows:
-        key = (r["away_team"], r["home_team"])
+        key = (r["away_team"], r["home_team"], r.get("game_date"))
         slot = games.setdefault(key, {
             "away_team": r["away_team"],
             "home_team": r["home_team"],
+            "game_date": r.get("game_date"),
             "total": None,
             "home_spread": None,
             "away_spread": None,
@@ -125,6 +127,7 @@ def derive_team_priors_from_consensus(
         priors_payload.append({
             "away_team": slot["away_team"],
             "home_team": slot["home_team"],
+            "game_date": slot["game_date"] or "",
             "computed_at_utc": now_iso,
             "consensus_total": float(total),
             "home_spread": float(home_spread),

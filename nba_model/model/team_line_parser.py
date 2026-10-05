@@ -35,14 +35,20 @@ def _build_record_sha256(
     side: str,
     line_value: Optional[float],
     odds: Optional[int],
+    game_date: Optional[str] = None,
 ) -> str:
-    """Deterministic dedupe hash for a (snapshot, game, market, side) row."""
+    """Deterministic dedupe hash for a (snapshot, game, market, side) row.
+
+    ``game_date`` is appended only when known, so undated rows keep the hash
+    they had before game dates were captured."""
     line_repr = "" if line_value is None else f"{line_value:.3f}"
     odds_repr = "" if odds is None else str(int(odds))
     payload = (
         f"{snapshot_id}|{source_url}|{book}|{away_team}|{home_team}|"
         f"{market_type}|{side}|{line_repr}|{odds_repr}"
     )
+    if game_date:
+        payload += f"|{game_date}"
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
@@ -81,6 +87,8 @@ def extract_team_lines_from_snapshot(
     except Exception:
         return []
 
+    from nba_model.scrapers.game_dates import resolve_game_date
+
     out: list[dict] = []
     seen: set[tuple] = set()
     for rec in raw_records:
@@ -92,8 +100,12 @@ def extract_team_lines_from_snapshot(
             continue
         line = rec.get("line_value")
         odds = rec.get("odds_american")
+        # Extractors attach the raw date token next to each game; resolve it
+        # against the capture time (year inference, Today/Tomorrow).
+        game_date = resolve_game_date(
+            rec.get("game_date") or rec.get("game_date_hint"), observed_at_utc)
         # Dedupe within one snapshot.
-        key = (away.lower(), home.lower(), market, side,
+        key = (away.lower(), home.lower(), game_date, market, side,
                None if line is None else round(float(line), 3),
                None if odds is None else int(odds))
         if key in seen:
@@ -111,6 +123,7 @@ def extract_team_lines_from_snapshot(
             side=side,
             line_value=None if line is None else float(line),
             odds=None if odds is None else int(odds),
+            game_date=game_date,
         )
         out.append(
             {
@@ -120,6 +133,7 @@ def extract_team_lines_from_snapshot(
                 "observed_at_utc": str(observed_at_utc).strip(),
                 "away_team": away,
                 "home_team": home,
+                "game_date": game_date,
                 "market_type": market,
                 "side": side,
                 "team": rec.get("team"),

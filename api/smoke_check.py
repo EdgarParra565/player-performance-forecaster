@@ -44,8 +44,13 @@ def run(base: str, *, strict: bool = False, timeout: float = 30.0) -> list[tuple
         results.append((name, bool(ok), detail))
 
     status, headers, body = _get(base, "/api/health", timeout)
-    health = json.loads(body or b"{}") if status == 200 else {}
-    check("health 200", status == 200, f"status={status}")
+    try:
+        health = json.loads(body or b"{}")
+    except ValueError:
+        health = {}
+    # 503 carries the reason (e.g. "database file not mounted ..."): show it.
+    check("health 200", status == 200,
+          f"status={status}" + (f": {health.get('detail')}" if health.get("detail") else ""))
     check("health db_exists", health.get("db_exists") is True, str(health.get("status")))
     check("health hides db_path", health.get("db_path") in (None, ""), "")
     if health.get("access_code_required"):

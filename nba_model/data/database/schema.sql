@@ -201,6 +201,7 @@ CREATE TABLE IF NOT EXISTS web_team_lines (
 CREATE TABLE IF NOT EXISTS team_priors (
     away_team             TEXT NOT NULL,
     home_team             TEXT NOT NULL,
+    game_date             TEXT NOT NULL DEFAULT '',  -- YYYY-MM-DD; '' = unknown (legacy / undated book)
     computed_at_utc       TIMESTAMP NOT NULL,
     consensus_total       REAL,
     home_spread           REAL,
@@ -212,7 +213,7 @@ CREATE TABLE IF NOT EXISTS team_priors (
     pace_factor           REAL,
     n_books               INTEGER,
     latest_observed_at    TIMESTAMP,
-    PRIMARY KEY (away_team, home_team)
+    PRIMARY KEY (away_team, home_team, game_date)
 );
 
 -- Model predictions (for evaluation)

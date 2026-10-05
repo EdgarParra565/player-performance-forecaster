@@ -110,14 +110,93 @@ def _grade_bet_side(side, actual, line):
     return "lost" if over_hit else "won"
 
 
-class DatabaseManager:
-    """Manages all database operations for NBA data."""
+class DatabaseNotReadyError(RuntimeError):
+    """A ``read_only=True`` open found no usable database at the path (file
+    missing, empty, or missing tables/migrated columns the readers need)."""
 
-    def __init__(self, db_path='data/database/nba_data.db'):
+
+class DatabaseManager:
+    """Manages all database operations for NBA data.
+
+    ``DatabaseManager(path)`` — the writer open: creates the file/parent dir,
+    runs schema.sql + every idempotent migration. Used by all ETL/model code.
+
+    ``DatabaseManager(path, read_only=True)`` — for read-only services (the
+    flagship API): opens the existing file with SQLite ``mode=ro``, runs NO
+    DDL or migrations, never creates the file, and raises
+    ``DatabaseNotReadyError`` when the file is missing/empty or lacks a table
+    or migrated column from ``REQUIRED_SCHEMA``. Any write through it fails
+    with ``sqlite3.OperationalError`` ("attempt to write a readonly database").
+    """
+
+    def __init__(self, db_path='data/database/nba_data.db', read_only: bool = False):
         self.db_path = Path(db_path)
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self.read_only = bool(read_only)
         self.conn = None
+        if self.read_only:
+            self._open_read_only()
+            return
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._initialize_database()
+
+    @classmethod
+    def required_schema(cls) -> dict:
+        """``{table: {columns}}`` a read-only open requires: every table in
+        schema.sql plus the columns added by migrations (an un-migrated file
+        would make the newer readers fail mid-request instead of at open)."""
+        import re
+
+        schema = (Path(__file__).parent / "schema.sql").read_text(encoding="utf-8")
+        required: dict = {
+            name: set() for name in re.findall(
+                r"CREATE TABLE IF NOT EXISTS\s+(\w+)", schema)
+        }
+        for table in cls._SPORT_COLUMN_TABLES:
+            required.setdefault(table, set()).add("sport")
+        for table in cls._LAST_SEEN_TABLES:
+            required.setdefault(table, set()).add("last_seen_at_utc")
+        for table, cols in cls._MIGRATED_COLUMNS.items():
+            required.setdefault(table, set()).update(cols)
+        return required
+
+    def _open_read_only(self):
+        path = self.db_path
+        if not path.is_file():
+            raise DatabaseNotReadyError(f"database file not found: {path}")
+        if path.stat().st_size == 0:
+            raise DatabaseNotReadyError(f"database file is empty: {path}")
+        uri = f"file:{path.resolve().as_posix()}?mode=ro"
+        try:
+            self.conn = sqlite3.connect(uri, uri=True)
+            have: dict = {}
+            for (table,) in self.conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall():
+                have[table] = {
+                    r[1] for r in self.conn.execute(
+                        f"PRAGMA table_info({table})").fetchall()
+                }
+        except sqlite3.DatabaseError as exc:
+            self.close()
+            raise DatabaseNotReadyError(f"not a readable SQLite database: {path}: {exc}") from exc
+        missing_tables = sorted(t for t in self.required_schema() if t not in have)
+        missing_cols = sorted(
+            f"{t}.{c}"
+            for t, cols in self.required_schema().items() if t in have
+            for c in cols if c not in have[t]
+        )
+        if missing_tables or missing_cols:
+            self.close()
+            detail = []
+            if missing_tables:
+                detail.append("missing tables: " + ", ".join(missing_tables))
+            if missing_cols:
+                detail.append("missing columns: " + ", ".join(missing_cols))
+            raise DatabaseNotReadyError(
+                f"database at {path} is incomplete ({'; '.join(detail)}) — "
+                "open it once with a writer DatabaseManager(path) to migrate"
+            )
+        logger.info("Database opened read-only at %s", path)
 
     # Tables that gain a ``sport`` discriminator for the multi-sport rollout
     # (NFL first). Added via idempotent migration rather than editing every
@@ -141,6 +220,8 @@ class DatabaseManager:
         self._ensure_betting_lines_source_column()
         self._ensure_last_seen_columns()
         self._ensure_betting_lines_main_line_column()
+        self._ensure_game_date_columns()
+        self._ensure_bet_log_unique_index()
         self._migrate_team_priors_to_abbrev_keys()
 
         logger.info("Database initialized at %s", self.db_path)
@@ -148,19 +229,25 @@ class DatabaseManager:
     # Change-only boards: a row is written only when the line moves, so
     # observed_at_utc means "last CHANGED". last_seen_at_utc is bumped on every
     # unchanged re-scrape so freshness windows (since_hours) keep stable lines.
-    _LAST_SEEN_TABLES = ("web_prop_cards", "web_team_lines")
+    # table -> the column the last_seen backfill starts from ("last changed").
+    _LAST_SEEN_TABLES = {
+        "web_prop_cards": "observed_at_utc",
+        "web_team_lines": "observed_at_utc",
+        "betting_lines": "scraped_at",
+    }
 
     @staticmethod
-    def seen_at_sql(alias: str = "") -> str:
+    def seen_at_sql(alias: str = "", base_col: str = "observed_at_utc") -> str:
         """SQL expression for "when was this line last observed" (NULL-safe
-        for rows written before the column existed)."""
+        for rows written before the column existed). ``base_col`` is the
+        table's last-changed timestamp (``scraped_at`` for betting_lines)."""
         p = f"{alias}." if alias else ""
-        return f"COALESCE({p}last_seen_at_utc, {p}observed_at_utc)"
+        return f"COALESCE({p}last_seen_at_utc, {p}{base_col})"
 
     def _ensure_last_seen_columns(self):
-        """Add nullable ``last_seen_at_utc`` to the change-only board tables
-        and backfill it from ``observed_at_utc`` once. Idempotent."""
-        for table in self._LAST_SEEN_TABLES:
+        """Add nullable ``last_seen_at_utc`` to the change-only tables and
+        backfill it from their last-changed column once. Idempotent."""
+        for table, base_col in self._LAST_SEEN_TABLES.items():
             try:
                 cols = {
                     r[1] for r in self.conn.execute(
@@ -172,7 +259,7 @@ class DatabaseManager:
                 continue
             self.conn.execute(f"ALTER TABLE {table} ADD COLUMN last_seen_at_utc TEXT")
             self.conn.execute(
-                f"UPDATE {table} SET last_seen_at_utc = observed_at_utc "
+                f"UPDATE {table} SET last_seen_at_utc = {base_col} "
                 "WHERE last_seen_at_utc IS NULL"
             )
             self.conn.commit()
@@ -196,6 +283,63 @@ class DatabaseManager:
         self.conn.executemany(
             sql, [(ts, *key, ts) for key, ts in seen.items()]
         )
+
+    # Columns added by ALTER-style migrations (beyond sport / last_seen), so a
+    # read-only open can tell an un-migrated file apart from a current one.
+    _MIGRATED_COLUMNS = {
+        "betting_lines": ("source", "is_main_line"),
+        "web_team_lines": ("game_date",),
+        "team_priors": ("game_date",),
+    }
+
+    def _ensure_game_date_columns(self):
+        """Game dates for team lines + priors (a team with two games in the
+        lines window must not share one prior). Idempotent.
+
+        * ``web_team_lines.game_date`` — nullable ALTER (NULL = undated).
+        * ``team_priors`` — rebuilt once with ``game_date TEXT NOT NULL
+          DEFAULT ''`` in the primary key (SQLite can't alter a PK); legacy
+          rows keep ``''`` = date unknown.
+        """
+        try:
+            wtl = {r[1] for r in self.conn.execute("PRAGMA table_info(web_team_lines)")}
+            tp = {r[1] for r in self.conn.execute("PRAGMA table_info(team_priors)")}
+        except sqlite3.OperationalError:
+            return
+        if wtl and "game_date" not in wtl:
+            self.conn.execute("ALTER TABLE web_team_lines ADD COLUMN game_date TEXT")
+        if tp and "game_date" not in tp:
+            cols = [
+                "away_team", "home_team", "computed_at_utc", "consensus_total",
+                "home_spread", "away_spread", "home_team_total", "away_team_total",
+                "home_win_prob_devig", "away_win_prob_devig", "pace_factor",
+                "n_books", "latest_observed_at",
+            ]
+            col_sql = ", ".join(cols)
+            self.conn.executescript(f"""
+                ALTER TABLE team_priors RENAME TO team_priors_pre_game_date;
+                CREATE TABLE team_priors (
+                    away_team             TEXT NOT NULL,
+                    home_team             TEXT NOT NULL,
+                    game_date             TEXT NOT NULL DEFAULT '',
+                    computed_at_utc       TIMESTAMP NOT NULL,
+                    consensus_total       REAL,
+                    home_spread           REAL,
+                    away_spread           REAL,
+                    home_team_total       REAL,
+                    away_team_total       REAL,
+                    home_win_prob_devig   REAL,
+                    away_win_prob_devig   REAL,
+                    pace_factor           REAL,
+                    n_books               INTEGER,
+                    latest_observed_at    TIMESTAMP,
+                    PRIMARY KEY (away_team, home_team, game_date)
+                );
+                INSERT INTO team_priors ({col_sql}, game_date)
+                    SELECT {col_sql}, '' FROM team_priors_pre_game_date;
+                DROP TABLE team_priors_pre_game_date;
+            """)
+        self.conn.commit()
 
     # SQL predicate: row is a main line (legacy/untagged NULL rows count as main).
     MAIN_LINE_SQL = "COALESCE({p}is_main_line, 1) = 1"
@@ -255,34 +399,38 @@ class DatabaseManager:
         from nba_model.scrapers.team_names import NBA_TEAM_ABBREVS, team_abbrev
 
         try:
+            cols = {r[1] for r in self.conn.execute("PRAGMA table_info(team_priors)")}
+            gd_sql = "game_date" if "game_date" in cols else "''"
             rows = self.conn.execute(
-                "SELECT away_team, home_team, computed_at_utc FROM team_priors"
+                f"SELECT away_team, home_team, computed_at_utc, {gd_sql} FROM team_priors"
             ).fetchall()
         except sqlite3.OperationalError:
             return
         changed = False
-        for away, home, computed in rows:
+        for away, home, computed, gd in rows:
             if away in NBA_TEAM_ABBREVS and home in NBA_TEAM_ABBREVS:
                 continue
             new_away = team_abbrev(away) or away
             new_home = team_abbrev(home) or home
             if (new_away, new_home) == (away, home):
                 continue
+            gd_where = " AND game_date = ?" if gd_sql == "game_date" else ""
+            gd_param = (gd,) if gd_sql == "game_date" else ()
             existing = self.conn.execute(
                 "SELECT computed_at_utc FROM team_priors "
-                "WHERE away_team = ? AND home_team = ?",
-                (new_away, new_home),
+                "WHERE away_team = ? AND home_team = ?" + gd_where,
+                (new_away, new_home, *gd_param),
             ).fetchone()
             if existing is not None and str(existing[0] or "") >= str(computed or ""):
                 self.conn.execute(
-                    "DELETE FROM team_priors WHERE away_team = ? AND home_team = ?",
-                    (away, home),
+                    "DELETE FROM team_priors WHERE away_team = ? AND home_team = ?" + gd_where,
+                    (away, home, *gd_param),
                 )
             else:
                 self.conn.execute(
                     "UPDATE OR REPLACE team_priors SET away_team = ?, home_team = ? "
-                    "WHERE away_team = ? AND home_team = ?",
-                    (new_away, new_home, away, home),
+                    "WHERE away_team = ? AND home_team = ?" + gd_where,
+                    (new_away, new_home, away, home, *gd_param),
                 )
             changed = True
         if changed:
@@ -390,31 +538,37 @@ class DatabaseManager:
             return None
         return sum(pts) / len(pts)
 
+    _TEAM_PRIOR_COLS = (
+        "away_team", "home_team", "game_date", "computed_at_utc",
+        "consensus_total", "home_spread", "away_spread",
+        "home_team_total", "away_team_total",
+        "home_win_prob_devig", "away_win_prob_devig",
+        "pace_factor", "n_books", "latest_observed_at",
+    )
+
     def upsert_team_priors(self, records):
-        """Upsert reverse-engineered priors (one row per matchup).
+        """Upsert reverse-engineered priors (one row per matchup + game date).
 
         Team keys are normalized to NBA codes ("76ers" → "PHI") — the key
         space players.team / games.team_abbrev use — so consumer lookups
-        actually hit. Unknown names are stored as given.
+        actually hit. Unknown names are stored as given. ``game_date``
+        (YYYY-MM-DD) keys two games of the same matchup apart; missing → ''
+        (date unknown).
         """
         if not records:
             return {"upserted": 0, "attempted": 0}
         from nba_model.scrapers.team_names import team_abbrev
-        query = """
-            INSERT OR REPLACE INTO team_priors (
-                away_team, home_team, computed_at_utc,
-                consensus_total, home_spread, away_spread,
-                home_team_total, away_team_total,
-                home_win_prob_devig, away_win_prob_devig,
-                pace_factor, n_books, latest_observed_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        cols = ", ".join(self._TEAM_PRIOR_COLS)
+        query = f"""
+            INSERT OR REPLACE INTO team_priors ({cols})
+            VALUES ({", ".join("?" * len(self._TEAM_PRIOR_COLS))})
         """
         payload = []
         for r in records:
             payload.append((
                 team_abbrev(r.get("away_team")) or r.get("away_team"),
                 team_abbrev(r.get("home_team")) or r.get("home_team"),
+                str(r.get("game_date") or "").strip()[:10],
                 r.get("computed_at_utc"),
                 _safe_float(r.get("consensus_total")),
                 _safe_float(r.get("home_spread")),
@@ -437,10 +591,9 @@ class DatabaseManager:
 
     @staticmethod
     def _team_prior_fresh_clause(max_age_hours):
-        """``(sql, params)`` restricting team_priors to recent computations.
-
-        Priors carry no game date, so without an age cap a May prior would
-        blend into an October projection for the same teams."""
+        """``(sql, params)`` restricting team_priors to recent computations
+        (a prior is recomputed every tick while its game's lines are up, so an
+        old ``computed_at_utc`` means a past game)."""
         if max_age_hours is None:
             return "1=1", ()
         return (
@@ -448,13 +601,57 @@ class DatabaseManager:
             (f"-{float(max_age_hours)} hours",),
         )
 
+    @staticmethod
+    def _slate_today() -> str:
+        """Today's NBA slate date (America/New_York)."""
+        from zoneinfo import ZoneInfo
+
+        return datetime.now(ZoneInfo("America/New_York")).date().isoformat()
+
+    @classmethod
+    def _pick_prior(cls, candidates: list, game_date: Optional[str]):
+        """Choose ONE prior among a team's/matchup's candidate rows.
+
+        ``candidates``: dicts with ``game_date`` ('' = unknown) and
+        ``computed_at_utc``. With ``game_date``: that date's prior, else an
+        undated one — NEVER another date's (two games of one team must not
+        share a prior). Without: the earliest dated game on/after today's
+        slate, else an undated one; past-dated priors are ignored. Ties →
+        newest ``computed_at_utc``.
+        """
+        def newest(rows):
+            return max(rows, key=lambda r: str(r.get("computed_at_utc") or "")) if rows else None
+
+        undated = [c for c in candidates if not c.get("game_date")]
+        dated = [c for c in candidates if c.get("game_date")]
+        if game_date:
+            want = str(game_date)[:10]
+            return newest([c for c in dated if c["game_date"] == want]) or newest(undated)
+        today = cls._slate_today()
+        upcoming = [c for c in dated if c["game_date"] >= today]
+        if upcoming:
+            first = min(c["game_date"] for c in upcoming)
+            return newest([c for c in upcoming if c["game_date"] == first])
+        return newest(undated)
+
+    def _fresh_prior_rows(self, max_age_hours, where_sql: str = "1=1", params=()) -> list:
+        fresh_sql, fresh_params = self._team_prior_fresh_clause(max_age_hours)
+        rows = self.conn.execute(
+            f"SELECT {', '.join(self._TEAM_PRIOR_COLS)} FROM team_priors "
+            f"WHERE {where_sql} AND {fresh_sql}",
+            (*params, *fresh_params),
+        ).fetchall()
+        return [dict(zip(self._TEAM_PRIOR_COLS, r)) for r in rows]
+
     def get_team_prior(
         self,
         away_team: str,
         home_team: str,
         max_age_hours: Optional[float] = TEAM_PRIOR_MAX_AGE_HOURS,
+        game_date: Optional[str] = None,
     ):
-        """Look up the latest prior row for a matchup; returns None if absent.
+        """The prior for a matchup (see ``_pick_prior`` for how ``game_date``
+        selects among several games); None if absent.
 
         Accepts any team form (nickname / full name / code); only priors
         computed within ``max_age_hours`` count (``None`` = no age cap).
@@ -463,57 +660,44 @@ class DatabaseManager:
 
         away_key = team_abbrev(away_team) or away_team
         home_key = team_abbrev(home_team) or home_team
-        fresh_sql, fresh_params = self._team_prior_fresh_clause(max_age_hours)
-        row = self.conn.execute(
-            f"""
-            SELECT away_team, home_team, computed_at_utc,
-                   consensus_total, home_spread, away_spread,
-                   home_team_total, away_team_total,
-                   home_win_prob_devig, away_win_prob_devig,
-                   pace_factor, n_books, latest_observed_at
-            FROM team_priors
-            WHERE lower(away_team) = lower(?)
-              AND lower(home_team) = lower(?)
-              AND {fresh_sql}
-            ORDER BY datetime(computed_at_utc) DESC
-            LIMIT 1
-            """,
-            (away_key, home_key, *fresh_params),
-        ).fetchone()
-        if row is None:
-            return None
-        keys = ["away_team", "home_team", "computed_at_utc",
-                "consensus_total", "home_spread", "away_spread",
-                "home_team_total", "away_team_total",
-                "home_win_prob_devig", "away_win_prob_devig",
-                "pace_factor", "n_books", "latest_observed_at"]
-        return dict(zip(keys, row))
+        rows = self._fresh_prior_rows(
+            max_age_hours,
+            "lower(away_team) = lower(?) AND lower(home_team) = lower(?)",
+            (away_key, home_key),
+        )
+        return self._pick_prior(rows, game_date)
 
     def get_team_prior_inputs(
         self,
         player_team: str,
         opponent_team: str,
         max_age_hours: Optional[float] = TEAM_PRIOR_MAX_AGE_HOURS,
+        game_date: Optional[str] = None,
     ) -> dict:
         """Resolve the team-prior signals for a player's team in a matchup.
 
-        ``team_priors`` is keyed by ``(away_team, home_team)``; we don't know
-        which side the player is on, so we try both orientations and read the
-        matching ``*_team_total`` for the player's side. Returns a dict ready
-        to splat into ``simulation.blend_team_prior``
-        (``pace_factor`` / ``implied_team_total`` / ``team_recent_avg_total``),
-        or ``{}`` when no prior exists for the matchup.
+        Both orientations (player home / away) are candidates; ``game_date``
+        (the projection's game date) picks the right game when the two teams
+        meet more than once in the window. Returns a dict ready to splat into
+        ``simulation.blend_team_prior`` (``pace_factor`` /
+        ``implied_team_total`` / ``team_recent_avg_total``), or ``{}``.
         """
         if not player_team or not opponent_team:
             return {}
-        # Player at home → matchup stored as (opponent=away, player=home).
-        prior = self.get_team_prior(opponent_team, player_team, max_age_hours)
-        player_is_home = True
-        if prior is None:
-            prior = self.get_team_prior(player_team, opponent_team, max_age_hours)
-            player_is_home = False
+        from nba_model.scrapers.team_names import team_abbrev
+
+        me = team_abbrev(player_team) or player_team
+        opp = team_abbrev(opponent_team) or opponent_team
+        rows = self._fresh_prior_rows(
+            max_age_hours,
+            "((lower(away_team) = lower(?) AND lower(home_team) = lower(?)) OR "
+            " (lower(away_team) = lower(?) AND lower(home_team) = lower(?)))",
+            (opp, me, me, opp),
+        )
+        prior = self._pick_prior(rows, game_date)
         if prior is None:
             return {}
+        player_is_home = str(prior["home_team"]).lower() == str(me).lower()
         implied = (prior.get("home_team_total") if player_is_home
                    else prior.get("away_team_total"))
         own_key = prior.get("home_team") if player_is_home else prior.get("away_team")
@@ -526,36 +710,41 @@ class DatabaseManager:
     def get_team_prior_inputs_map(
         self,
         max_age_hours: Optional[float] = TEAM_PRIOR_MAX_AGE_HOURS,
+        game_date: Optional[str] = None,
     ) -> dict:
         """Map every team (NBA code) with a FRESH prior to its
-        ``blend_team_prior`` inputs.
+        ``blend_team_prior`` inputs, one game per team.
 
-        Each matchup row contributes both sides (home + away). Rows are read
-        oldest → newest, so when a team appears in several fresh matchups the
-        most recently computed one wins. Priors older than ``max_age_hours``
-        are ignored (``None`` = no age cap). Used by the prop-board / hourly
-        recompute / scanner full-mode paths to blend the whole slate at once.
+        ``game_date`` = the slate being projected: each team gets THAT game's
+        prior (or an undated one), never another game's. Without it each team
+        gets its next upcoming game (``_pick_prior``). Used by the prop-board
+        / hourly recompute / scanner full-mode paths.
         """
         from nba_model.scrapers.team_names import team_abbrev
 
-        fresh_sql, fresh_params = self._team_prior_fresh_clause(max_age_hours)
-        rows = self.conn.execute(
-            "SELECT away_team, home_team, away_team_total, home_team_total, "
-            f"pace_factor FROM team_priors WHERE {fresh_sql} "
-            "ORDER BY datetime(computed_at_utc) ASC",
-            fresh_params,
-        ).fetchall()
-        out: dict = {}
-        for away, home, away_tt, home_tt, pace in rows:
-            for team, team_total in ((home, home_tt), (away, away_tt)):
+        per_team: dict = {}
+        for row in self._fresh_prior_rows(max_age_hours):
+            for team, team_total in ((row["home_team"], row["home_team_total"]),
+                                     (row["away_team"], row["away_team_total"])):
                 if not team:
                     continue
                 key = team_abbrev(team) or str(team).upper()
-                out[key] = {
-                    "pace_factor": pace,
+                per_team.setdefault(key, []).append({
+                    "game_date": row["game_date"],
+                    "computed_at_utc": row["computed_at_utc"],
+                    "pace_factor": row["pace_factor"],
                     "implied_team_total": team_total,
-                    "team_recent_avg_total": self.get_team_recent_avg_points(key),
-                }
+                })
+        out: dict = {}
+        for key, cands in per_team.items():
+            pick = self._pick_prior(cands, game_date)
+            if pick is None:
+                continue
+            out[key] = {
+                "pace_factor": pick["pace_factor"],
+                "implied_team_total": pick["implied_team_total"],
+                "team_recent_avg_total": self.get_team_recent_avg_points(key),
+            }
         return out
 
     def backfill_predictions_outcomes(self):
@@ -647,26 +836,77 @@ class DatabaseManager:
     # Paper-trading bet log (WS10 — measurement layer, NOT execution)
     # ------------------------------------------------------------------
 
-    def insert_bet_log_rows(self, rows):
-        """Insert paper-trade ``bet_log`` rows. Returns ``{inserted, attempted}``.
+    # One paper-trade pick = (slate, player, stat, side, line, book, mode,
+    # sport); re-running bet_slip for the same slate must not double-count.
+    _BET_LOG_PICK_KEY_SQL = (
+        "game_date, lower(player_name), lower(stat_type), side, line, "
+        "lower(COALESCE(book, '')), COALESCE(model_mode, ''), sport"
+    )
 
-        Each row is a dict of the bet-slip fields. Missing optional keys default
-        to NULL; ``created_at_utc`` defaults to now, ``status`` to 'pending',
-        ``sport`` to 'nba'. Rows missing a required field (game_date,
-        player_name, stat_type, line) or with an invalid side are skipped."""
+    def _ensure_bet_log_unique_index(self):
+        """UNIQUE index on the bet_log pick key. Skipped (warning) when the
+        table already holds duplicate picks — deleting paper-trade history is
+        the owner's call; ``insert_bet_log_rows`` still refuses new dupes."""
+        try:
+            exists = self.conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='index' AND name='ux_bet_log_pick'"
+            ).fetchone()
+            if exists:
+                return
+            dupes = self.conn.execute(
+                f"SELECT COUNT(*) FROM (SELECT 1 FROM bet_log "
+                f"GROUP BY {self._BET_LOG_PICK_KEY_SQL} HAVING COUNT(*) > 1)"
+            ).fetchone()[0]
+        except sqlite3.OperationalError:
+            return
+        if dupes:
+            logger.warning(
+                "bet_log has %s duplicate pick groups; unique index not created "
+                "(new duplicates are still skipped at insert)", dupes)
+            return
+        self.conn.execute(
+            f"CREATE UNIQUE INDEX ux_bet_log_pick ON bet_log ({self._BET_LOG_PICK_KEY_SQL})")
+        self.conn.commit()
+
+    def _bet_log_pick_exists(self, row) -> bool:
+        return self.conn.execute(
+            """
+            SELECT 1 FROM bet_log
+            WHERE game_date = ? AND lower(player_name) = lower(?)
+              AND lower(stat_type) = lower(?) AND side = ? AND line = ?
+              AND lower(COALESCE(book, '')) = lower(COALESCE(?, ''))
+              AND COALESCE(model_mode, '') = COALESCE(?, '') AND sport = ?
+            LIMIT 1
+            """,
+            (row[1], row[3], row[4], row[7], row[6], row[5], row[11], row[16]),
+        ).fetchone() is not None
+
+    def insert_bet_log_rows(self, rows):
+        """Insert paper-trade ``bet_log`` rows.
+
+        Returns ``{inserted, attempted, duplicates_ignored}``. Each row is a
+        dict of the bet-slip fields. Missing optional keys default to NULL;
+        ``created_at_utc`` defaults to now, ``status`` to 'pending', ``sport``
+        to 'nba'. Rows missing a required field (game_date, player_name,
+        stat_type, line) or with an invalid side are skipped. A pick already
+        logged under the same key (slate, player, stat, side, line, book,
+        model_mode, sport) is ignored, so re-running bet_slip for a slate
+        doesn't double-count stakes / P&L."""
         rows = list(rows or [])
         if not rows:
             return {"inserted": 0, "attempted": 0}
 
         now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         query = """
-            INSERT INTO bet_log (
+            INSERT OR IGNORE INTO bet_log (
                 created_at_utc, game_date, player_id, player_name, stat_type,
                 book, line, side, model_prob, implied_prob, edge, model_mode,
                 distribution, kelly_fraction, stake_units, status, sport
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """
         payload = []
+        duplicates = 0
+        seen_keys: set = set()
         for r in rows:
             game_date = r.get("game_date")
             player_name = str(r.get("player_name", "")).strip()
@@ -695,15 +935,25 @@ class DatabaseManager:
                 str(r.get("status") or "pending"),
                 str(r.get("sport") or "nba"),
             ))
+            new = payload[-1]
+            key = (new[1], new[3].lower(), new[4], new[7], new[6],
+                   (new[5] or "").lower(), new[11] or "", new[16])
+            if key in seen_keys or self._bet_log_pick_exists(new):
+                payload.pop()
+                duplicates += 1
+                continue
+            seen_keys.add(key)
         if not payload:
-            return {"inserted": 0, "attempted": 0}
+            return {"inserted": 0, "attempted": 0, "duplicates_ignored": duplicates}
 
         before = self.conn.total_changes
         self.conn.executemany(query, payload)
         self.conn.commit()
         inserted = self.conn.total_changes - before
-        logger.info("Inserted %s bet_log rows", inserted)
-        return {"inserted": int(inserted), "attempted": int(len(payload))}
+        duplicates += len(payload) - inserted
+        logger.info("Inserted %s bet_log rows (%s duplicates ignored)", inserted, duplicates)
+        return {"inserted": int(inserted), "attempted": int(len(payload)),
+                "duplicates_ignored": int(duplicates)}
 
     def _closing_clv_delta(self, player_id, game_date, stat_type, side,
                            entry_implied, line=None, book=None):
@@ -998,7 +1248,10 @@ class DatabaseManager:
         equals the LATEST stored row of its kind — the latest main line for
         the key, or the latest alt row at the same line value — so an
         A→B→A move is recorded (the old check skipped anything that matched
-        ANY historical row, leaving latest-by-scraped_at stale). Book keys
+        ANY historical row, leaving latest-by-scraped_at stale). A skipped
+        unchanged row bumps the stored current row's ``last_seen_at_utc`` so
+        ``scraped_at`` since-windows keep a line that simply didn't move
+        (readers use ``COALESCE(last_seen_at_utc, scraped_at)``). Book keys
         compare case-insensitively ('FanDuel' == 'fanduel'); the stored name
         is kept as given.
 
@@ -1086,20 +1339,22 @@ class DatabaseManager:
 
         main_sql = self.main_line_sql()
         latest_main_q = f"""
-            SELECT line_value, over_odds, under_odds FROM betting_lines
+            SELECT line_value, over_odds, under_odds, line_id FROM betting_lines
             WHERE player_id = ? AND game_date = ? AND lower(book) = ?
               AND lower(stat_type) = ? AND {main_sql}
             ORDER BY scraped_at DESC, line_id DESC LIMIT 1
         """
         latest_alt_q = """
-            SELECT over_odds, under_odds FROM betting_lines
+            SELECT over_odds, under_odds, line_id FROM betting_lines
             WHERE player_id = ? AND game_date = ? AND lower(book) = ?
               AND lower(stat_type) = ? AND is_main_line = 0
               AND round(line_value, 3) = ?
             ORDER BY scraped_at DESC, line_id DESC LIMIT 1
         """
         state: dict = {}
+        current_row_id: dict = {}  # skey -> line_id of the stored current row
         payload = []
+        bump_ids: set = set()
         for item in valid:
             row, group = item["row"], item["group"]
             line = self._norm_line(row[4])
@@ -1110,29 +1365,43 @@ class DatabaseManager:
                     got = self.conn.execute(latest_main_q, group).fetchone()
                     state[skey] = (None if got is None else
                                    (self._norm_line(got[0]), _odds(got[1]), _odds(got[2])))
+                    current_row_id[skey] = None if got is None else got[3]
                 current = (line,) + prices
             else:
                 skey = ("alt",) + group + (line,)
                 if skey not in state:
                     got = self.conn.execute(latest_alt_q, group + (line,)).fetchone()
                     state[skey] = (None if got is None else (_odds(got[0]), _odds(got[1])))
+                    current_row_id[skey] = None if got is None else got[2]
                 current = prices
             if state[skey] is not None and state[skey] == current:
+                # Unchanged re-scrape: no new row, but the line was SEEN now.
+                if current_row_id.get(skey) is not None:
+                    bump_ids.add(current_row_id[skey])
                 continue
             state[skey] = current
+            current_row_id[skey] = None  # row being inserted this batch
             payload.append(row + (item["source"], item["is_main"]))
 
         query = """
             INSERT INTO betting_lines
                 (player_id, game_date, book, stat_type, line_value,
-                 over_odds, under_odds, source, is_main_line)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 over_odds, under_odds, source, is_main_line, last_seen_at_utc)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
         """
         before_changes = self.conn.total_changes
         if payload:
             self.conn.executemany(query, payload)
-            self.conn.commit()
         inserted = self.conn.total_changes - before_changes
+        if bump_ids:
+            # Same 'YYYY-MM-DD HH:MM:SS' UTC format as scraped_at's default.
+            self.conn.executemany(
+                "UPDATE betting_lines SET last_seen_at_utc = datetime('now') "
+                "WHERE line_id = ?",
+                [(i,) for i in sorted(bump_ids)],
+            )
+        if payload or bump_ids:
+            self.conn.commit()
         ignored = batch_dupes + (len(valid) - inserted)
         if rejected_implausible:
             logger.warning(
@@ -1151,6 +1420,7 @@ class DatabaseManager:
             "rejected_implausible": int(rejected_implausible),
             "attempted": int(len(valid) + batch_dupes),
             "alt_lines_tagged": int(alt_tagged),
+            "last_seen_bumped": int(len(bump_ids)),
         }
 
     def insert_betting_line_snapshots(self, records):
@@ -1471,22 +1741,23 @@ class DatabaseManager:
         return None if row is None else self._norm_line(row[0])
 
     def _latest_web_team_line_state(
-        self, book, away_team, home_team, market_type, side, team
+        self, book, away_team, home_team, market_type, side, team, game_date=None
     ):
         """Most-recent (line_value, odds) for a team-line key, or None.
 
-        ``team`` may be NULL (totals); ``IS`` matches NULL and values alike.
+        ``team`` / ``game_date`` may be NULL; ``IS`` matches NULL and values
+        alike, so two games of the same matchup are separate keys.
         """
         cur = self.conn.execute(
             """
             SELECT line_value, odds_american
             FROM web_team_lines
             WHERE book = ? AND away_team = ? AND home_team = ?
-              AND market_type = ? AND side = ? AND team IS ?
+              AND market_type = ? AND side = ? AND team IS ? AND game_date IS ?
             ORDER BY observed_at_utc DESC, line_id DESC
             LIMIT 1
             """,
-            (book, away_team, home_team, market_type, side, team),
+            (book, away_team, home_team, market_type, side, team, game_date),
         )
         row = cur.fetchone()
         if row is None:
@@ -1736,9 +2007,9 @@ class DatabaseManager:
                 away_team, home_team, market_type, side, team,
                 line_value, odds_american,
                 parse_confidence, raw_text, parser_version, record_sha256,
-                sport, last_seen_at_utc
+                sport, game_date, last_seen_at_utc
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """
         payload = []
         skipped_unchanged = 0
@@ -1779,14 +2050,15 @@ class DatabaseManager:
                 str(rec.get("parser_version", "")).strip(),
                 str(rec.get("record_sha256", "")).strip(),
                 (str(rec.get("sport", "nba")).strip().lower() or "nba"),
+                (str(rec.get("game_date") or "").strip()[:10] or None),
             )
             # Required: source_url, book, observed_at_utc, both teams,
             # market_type, side, parser_version, record_sha256.
             if not all([row[1], row[2], row[3], row[4], row[5], row[6], row[7], row[13], row[14]]):
                 continue
 
-            # book, away, home, market, side, team
-            key = (row[2], row[4], row[5], row[6], row[7], row[8])
+            # book, away, home, market, side, team, game_date
+            key = (row[2], row[4], row[5], row[6], row[7], row[8], row[16])
             if key not in latest_state:
                 latest_state[key] = self._latest_web_team_line_state(*key)
             new_state = (self._norm_line(line_value), odds)
@@ -1800,7 +2072,7 @@ class DatabaseManager:
 
         team_key_sql = (
             "book = ? AND away_team = ? AND home_team = ? "
-            "AND market_type = ? AND side = ? AND team IS ?"
+            "AND market_type = ? AND side = ? AND team IS ? AND game_date IS ?"
         )
         if not payload:
             self._bump_last_seen("web_team_lines", "line_id", team_key_sql, seen_unchanged)
@@ -1835,10 +2107,15 @@ class DatabaseManager:
     ):
         """Return cross-book consensus for game-level markets.
 
-        For each (away_team, home_team, market_type, side) the latest line
-        from each book is selected, then averaged across books.  Returns one
-        row per (game, market, side) with mean line, mean odds, and the
-        list of contributing books.
+        For each (away_team, home_team, game_date, market_type, side) the
+        latest line from each book is selected, then averaged across books.
+        Returns one row per (game, market, side) with mean line, mean odds,
+        the list of contributing books and ``game_date`` (None = undated).
+
+        A game is (away, home, game_date): two meetings of the same teams in
+        the window stay separate. A row from a book that prints no date joins
+        the matchup's dated game only when exactly ONE dated game exists for
+        that matchup in the window; otherwise it stays undated.
 
         ``sport`` defaults to 'nba' so NBA consensus never sees MLB (or other
         non-NBA) rows; pass ``sport=None`` to span all sports or 'mlb' for MLB.
@@ -1879,34 +2156,54 @@ class DatabaseManager:
         # whenever the sample contains both + and - values (the signs flip
         # the magnitude, distorting the mean).
         query = f"""
-            WITH latest_per_book AS (
+            WITH base AS (
+                SELECT line_id, away_team, home_team, market_type, side, book,
+                       line_value, odds_american, observed_at_utc, game_date,
+                       {self.seen_at_sql()} AS seen_at_utc
+                FROM web_team_lines
+                WHERE {where_sql}
+            ),
+            dated AS (
+                SELECT lower(away_team) AS a, lower(home_team) AS h,
+                       MIN(game_date) AS only_date,
+                       COUNT(DISTINCT game_date) AS n_dates
+                FROM base WHERE game_date IS NOT NULL
+                GROUP BY lower(away_team), lower(home_team)
+            ),
+            resolved AS (
+                SELECT b.*,
+                       COALESCE(b.game_date,
+                                CASE WHEN d.n_dates = 1 THEN d.only_date END) AS gd
+                FROM base b
+                LEFT JOIN dated d
+                  ON d.a = lower(b.away_team) AND d.h = lower(b.home_team)
+            ),
+            latest_per_book AS (
                 SELECT
-                    away_team, home_team, market_type, side,
-                    book, line_value, odds_american,
-                    {self.seen_at_sql()} AS seen_at_utc,
+                    away_team, home_team, gd, market_type, side,
+                    book, line_value, odds_american, seen_at_utc,
                     ROW_NUMBER() OVER (
-                        PARTITION BY lower(away_team), lower(home_team),
+                        PARTITION BY lower(away_team), lower(home_team), gd,
                                      lower(market_type), lower(side), lower(book)
                         ORDER BY observed_at_utc DESC, line_id DESC
                     ) AS rn
-                FROM web_team_lines
-                WHERE {where_sql}
+                FROM resolved
             )
             SELECT
                 away_team, home_team, market_type, side,
-                book, line_value, odds_american, seen_at_utc
+                book, line_value, odds_american, seen_at_utc, gd
             FROM latest_per_book
             WHERE rn = 1
-            ORDER BY away_team, home_team, market_type, side, book
+            ORDER BY away_team, home_team, gd, market_type, side, book
         """
         rows = self.conn.execute(query, tuple(params)).fetchall()
 
-        # Group rows by (away, home, market, side) and aggregate.
+        # Group rows by (away, home, game_date, market, side) and aggregate.
         groups: dict[tuple, dict] = {}
-        for away, home, market, side, book, line, odds, obs_at in rows:
-            key = (away.lower(), home.lower(), market.lower(), side.lower())
+        for away, home, market, side, book, line, odds, obs_at, gd in rows:
+            key = (away.lower(), home.lower(), gd, market.lower(), side.lower())
             slot = groups.setdefault(key, {
-                "away_team": away, "home_team": home,
+                "away_team": away, "home_team": home, "game_date": gd,
                 "market_type": market, "side": side,
                 "line_values": [], "odds_probs": [], "raw_odds": [],
                 "books": set(), "latest_observed_at": obs_at,
@@ -1936,6 +2233,7 @@ class DatabaseManager:
             out.append({
                 "away_team": slot["away_team"],
                 "home_team": slot["home_team"],
+                "game_date": slot["game_date"],
                 "market_type": slot["market_type"],
                 "side": slot["side"],
                 "mean_line": (sum(line_vals) / len(line_vals)
@@ -1956,7 +2254,8 @@ class DatabaseManager:
                 "latest_observed_at": slot["latest_observed_at"],
             })
         out.sort(key=lambda r: (
-            r["home_team"], r["away_team"], r["market_type"], r["side"],
+            r["home_team"], r["away_team"], r["game_date"] or "",
+            r["market_type"], r["side"],
         ))
         return out
 
@@ -2685,6 +2984,7 @@ class DatabaseManager:
         """Close database connection."""
         if self.conn:
             self.conn.close()
+            self.conn = None
             logger.info("Database connection closed")
 
     def __enter__(self):

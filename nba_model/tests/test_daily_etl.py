@@ -740,33 +740,91 @@ class DailyETLTests(unittest.TestCase):
 
 
 class PlaywrightGuardTests(unittest.TestCase):
-    """The daily ETL must abort with an actionable error when the caller
-    requested a browser fetch (auth-state / user-data-dir / CDP port) but
-    Playwright isn't importable in the interpreter — otherwise every URL
-    re-runs the same broken import on each retry."""
+    """Review finding: the Playwright guard raised AFTER bulk/game_logs/
+    team_defense/odds had run, so no report was written and no alert fired.
+    Now the preflight runs FIRST, web_text records a failed step (no URL loop
+    through the broken import), and the run still writes its report."""
 
+    @patch("nba_model.data.daily_etl.fetch_and_store_web_text")
     @patch("nba_model.data.daily_etl.fetch_and_store_betting_lines")
     @patch("nba_model.model.web_text_ingestion.playwright_is_available",
            return_value=False)
-    def test_chrome_debug_port_without_playwright_aborts(
-        self, _mock_pw_available, _mock_odds,
+    def test_missing_playwright_fails_step_and_still_writes_report(
+        self, mock_pw, mock_odds, mock_fetch,
     ):
-        with self.assertRaises(RuntimeError) as ctx:
-            run_daily_etl(
+        order = []
+        mock_pw.side_effect = lambda: (order.append("preflight"), False)[1]
+        mock_odds.side_effect = lambda **_kw: (order.append("odds"), {"events_processed": 0})[1]
+        with tempfile.TemporaryDirectory() as tmp:
+            report = run_daily_etl(
                 players=["LeBron James"],
                 include_db_players=False,
+                skip_bulk_results_ingest=True,
                 skip_game_logs=True,
                 skip_team_defense=True,
-                skip_odds=True,
-                skip_browser_parser=True,
                 skip_reverse_engineering=True,
+                odds_api_key="test-key",
                 web_text_urls=["https://example.com/props"],
                 chrome_debug_port=9222,
                 retries=0,
-                write_report=False,
+                write_report=True,
+                report_dir=tmp,
             )
-        self.assertIn("Playwright", str(ctx.exception))
-        self.assertIn(".venv/bin/python3", str(ctx.exception))
+            self.assertTrue(Path(report["report_path"]).exists())
+        self.assertEqual(order, ["preflight", "odds"])  # guard before other steps
+        web = report["steps"]["web_text"]
+        self.assertEqual(web["status"], "failed")
+        self.assertEqual(web["reason"], "browser_preflight")
+        self.assertIn("Playwright", web["error"])
+        self.assertIn(".venv/bin/python3", web["error"])
+        mock_fetch.assert_not_called()  # no per-URL retry loop
+        self.assertEqual(report["steps"]["browser_parser"]["status"], "skipped")
+        self.assertEqual(report["steps"]["odds"]["status"], "success")  # other steps ran
+        self.assertEqual(report["status"], "failed")
+        self.assertEqual(report["alert"]["severity"], "error")
+
+    @patch("nba_model.data.daily_etl.fetch_and_store_web_text",
+           return_value={"status": "success", "fetched_count": 1})
+    @patch("nba_model.model.web_text_ingestion.playwright_is_available",
+           return_value=False)
+    def test_requests_fetch_does_not_need_playwright(self, _mock_pw, mock_fetch):
+        report = run_daily_etl(
+            players=["LeBron James"], include_db_players=False,
+            skip_bulk_results_ingest=True, skip_game_logs=True,
+            skip_team_defense=True, skip_odds=True, skip_browser_parser=True,
+            skip_reverse_engineering=True,
+            web_text_urls=["https://example.com/props"],
+            retries=0, write_report=False,
+        )
+        mock_fetch.assert_called_once()
+        self.assertEqual(report["steps"]["web_text"]["status"], "success")
+
+
+class OddsAuthErrorStepTests(unittest.TestCase):
+    """Review finding: HTTP 401/403/429 on event discovery was swallowed →
+    odds step "success, events_processed 0"."""
+
+    def test_auth_error_fails_odds_step_without_retrying(self):
+        from nba_model.model.odds_ingestion import OddsApiAuthError
+
+        calls = []
+
+        def boom(**_kw):
+            calls.append(1)
+            raise OddsApiAuthError("Odds API HTTP 401 (auth / plan / quota): bad key", 401)
+
+        with patch("nba_model.data.daily_etl.fetch_and_store_betting_lines", side_effect=boom):
+            report = run_daily_etl(
+                players=["LeBron James"], include_db_players=False,
+                skip_bulk_results_ingest=True, skip_game_logs=True,
+                skip_team_defense=True, skip_reverse_engineering=True,
+                skip_browser_parser=True, odds_api_key="bad", retries=2,
+                retry_delay_seconds=0, write_report=False,
+            )
+        self.assertEqual(report["steps"]["odds"]["status"], "failed")
+        self.assertEqual(len(calls), 1)  # retryable=False → no re-runs
+        self.assertIn("401", str(report["steps"]["odds"]["error"]))
+        self.assertEqual(report["status"], "failed")
 
 
 if __name__ == "__main__":

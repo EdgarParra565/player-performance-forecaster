@@ -433,6 +433,7 @@ def _fetch_latest_book_lines(
     query = """
         WITH ranked AS (
             SELECT book, line_value, over_odds, under_odds, game_date, scraped_at,
+                   COALESCE(last_seen_at_utc, scraped_at) AS seen_at_utc,
                    ROW_NUMBER() OVER (
                        PARTITION BY lower(book)
                        ORDER BY
@@ -448,7 +449,7 @@ def _fetch_latest_book_lines(
               AND COALESCE(is_main_line, 1) = 1  -- skip alt-line rungs
         )
         SELECT book, line_value, over_odds, under_odds, game_date,
-               scraped_at AS scraped_at_utc
+               seen_at_utc AS scraped_at_utc  -- last seen (freshness), not last changed
         FROM ranked WHERE rn = 1
         ORDER BY book ASC
     """

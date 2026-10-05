@@ -161,6 +161,7 @@ def run_single_prop(
     opponent_team: Optional[str] = None,
     team_prior_alpha: float = 0.3,
     db_path: str = "data/database/nba_data.db",
+    game_date: Optional[str] = None,
 ):
     """Run single-leg points model flow using unified feature columns.
 
@@ -168,7 +169,9 @@ def run_single_prop(
     ``team_priors`` row exists for the matchup, the projection (``mu``/``sigma``)
     is nudged toward the market's implied pace + team total via
     ``simulation.blend_team_prior`` so the model and the chart's book-mean
-    reference pull from the same signal.
+    reference pull from the same signal. ``game_date`` (YYYY-MM-DD) picks the
+    right game's prior when the two teams meet more than once in the lines
+    window; omitted → the matchup's next game.
     """
     loader = DataLoader(db_path=db_path)
     df = loader.load_player_data(player_name, n_games=n_games)
@@ -221,7 +224,7 @@ def run_single_prop(
     if player_team and opponent_team:
         try:
             team_prior_inputs = loader.db.get_team_prior_inputs(
-                player_team, opponent_team,
+                player_team, opponent_team, game_date=game_date,
             )
         except Exception:  # noqa: BLE001 — prior is best-effort, never fatal
             team_prior_inputs = {}

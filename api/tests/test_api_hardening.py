@@ -35,31 +35,57 @@ class HardeningTestCase(unittest.TestCase):
 
     # --- read-only guarantee -------------------------------------------------
 
-    def test_empty_file_is_503_and_not_written(self):
+    def test_empty_file_is_not_mounted_503_and_not_written(self):
+        # A 0-byte file is what a broken/empty mount looks like.
         empty = Path(self._tmp.name) / "empty.db"
         empty.write_bytes(b"")
         os.environ["NBA_DB_PATH"] = str(empty)
         for path in ("/api/meta", "/api/slate/kpis", f"/api/players/{LEBRON_ID}"):
             r = self.client.get(path)
             self.assertEqual(r.status_code, 503, path)
-            self.assertEqual(r.json()["detail"], "database unavailable")
+            self.assertEqual(r.json()["code"], "db_not_mounted")
+            self.assertIn("database file not mounted", r.json()["detail"])
         # The data layer never opened it -> no schema was created inside.
         self.assertEqual(empty.stat().st_size, 0)
 
-    def test_garbage_file_is_503(self):
+    def test_missing_file_on_empty_mount_dir(self):
+        # `docker run` without -v: /data exists but holds nothing.
+        mount = Path(self._tmp.name) / "data"
+        mount.mkdir()
+        os.environ["NBA_DB_PATH"] = str(mount / "nba_data.db")
+        h = self.client.get("/api/health")
+        self.assertEqual(h.status_code, 503)  # container HEALTHCHECK fails
+        body = h.json()
+        self.assertEqual((body["db_state"], body["code"], body["db_exists"]),
+                         ("not_mounted", "db_not_mounted", False))
+        self.assertIn("docker compose up flagship", body["detail"])
+        r = self.client.get("/api/slate/kpis")
+        self.assertEqual(r.status_code, 503)
+        self.assertEqual(r.json()["code"], "db_not_mounted")
+        self.assertEqual(list(mount.iterdir()), [])  # nothing created, no schema grown
+        self.assertNotIn(self._tmp.name, h.text + r.text)
+
+    def test_garbage_file_is_invalid_503(self):
         junk = Path(self._tmp.name) / "junk.db"
         junk.write_bytes(b"not a sqlite database at all" * 100)
         os.environ["NBA_DB_PATH"] = str(junk)
-        self.assertEqual(self.client.get("/api/meta").status_code, 503)
+        r = self.client.get("/api/meta")
+        self.assertEqual(r.status_code, 503)
+        self.assertEqual(r.json(), {"detail": "database unavailable", "code": "db_invalid"})
         h = self.client.get("/api/health")
-        self.assertEqual(h.status_code, 200)
-        self.assertEqual(h.json()["status"], "degraded")
+        self.assertEqual(h.status_code, 503)
+        self.assertEqual((h.json()["status"], h.json()["db_state"]), ("degraded", "invalid"))
 
     def test_missing_db_detail_has_no_path(self):
         os.environ["NBA_DB_PATH"] = str(Path(self._tmp.name) / "nope.db")
         r = self.client.get("/api/meta")
         self.assertEqual(r.status_code, 503)
         self.assertNotIn(self._tmp.name, r.text)
+
+    def test_healthy_db_reports_ok(self):
+        h = self.client.get("/api/health")
+        self.assertEqual(h.status_code, 200)
+        self.assertEqual((h.json()["db_state"], h.json()["code"]), ("ok", None))
 
     # --- public health body ------------------------------------------------------
 

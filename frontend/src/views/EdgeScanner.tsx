@@ -188,7 +188,7 @@ export function EdgeScanner() {
         ) : (
           <EmptyState
             title="No props cleared the current filters."
-            hint="The scanner scores scraped prop lines against the model. During the NBA offseason no books post player props, so the slate is empty until October — loosen filters once lines return."
+            hint="The scanner scores scraped prop lines against the model. Outside the season (and before books post a game's props) the slate is empty — loosen filters once lines return."
           />
         )}
       </Card>

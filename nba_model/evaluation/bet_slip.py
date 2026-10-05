@@ -78,8 +78,10 @@ def build_bet_slip(
     Gates: ``model_edge >= min_edge`` and best-side prob ``>= min_p``. Each
     surviving pick is staked with capped fractional Kelly
     (``min(kelly_fraction·Kelly, kelly_cap)``); picks with a non-positive Kelly
-    stake are dropped. Ranked by edge desc (prob desc tiebreak) and truncated to
-    ``max_picks``. Pure — no DB writes."""
+    stake are dropped. Ranked by edge desc (prob desc tiebreak); then ONE pick
+    per prop (player, stat) — the best book's — so the same prop quoted at 3
+    books isn't staked 3 times; then truncated to ``max_picks``. Pure — no DB
+    writes."""
     if scored_df is None or scored_df.empty:
         return pd.DataFrame(columns=SLIP_COLUMNS)
 
@@ -130,6 +132,11 @@ def build_bet_slip(
     out = out.sort_values(
         ["edge", "model_prob"], ascending=[False, False]
     ).reset_index(drop=True)
+    # Best book per prop: the sort above puts each (player, stat)'s highest-
+    # edge book first. Both sides at two books (a middle) is still one prop.
+    prop_key = (out["player_name"].astype(str).str.strip().str.lower()
+                + "|" + out["stat_type"].astype(str).str.strip().str.lower())
+    out = out[~prop_key.duplicated(keep="first")].reset_index(drop=True)
     if max_picks is not None and max_picks >= 0:
         out = out.head(int(max_picks))
     return out

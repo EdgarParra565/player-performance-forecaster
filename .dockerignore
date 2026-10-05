@@ -46,6 +46,17 @@ data/config/auth/
 data/raw/
 data/artifacts/
 data/logs/
+# The 65 MB nba_data.db (+ backups / journals) must never be baked into an
+# image: it is bind-mounted (compose / docker run -v) or pulled from object
+# storage at boot (Fly, DEPLOYMENT.md §16).
+data/database/*.db
+data/database/*.db-*
+data/database/backups/
+# ...and no stray SQLite files anywhere (e.g. nba_model/data/database/*.db).
+**/*.db
+**/*.db-*
+**/*.sqlite
+**/*.sqlite3
 nba_model/data/artifacts/
 nba_model/data/logs/
 backups/

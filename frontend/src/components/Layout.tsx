@@ -2,6 +2,8 @@ import { useCallback, useEffect, useRef, useState, type ReactNode } from "react"
 import { NavLink, Outlet, useRouteError } from "react-router-dom";
 import { useHealth } from "../api/hooks";
 import { AccessGate } from "./AccessGate";
+import { DbNotice } from "./DbNotice";
+import { isDbNotMounted } from "./Loading";
 import { fmtAgo, fmtDateShort, parseApiDate } from "../lib/format";
 
 interface NavItem {
@@ -60,9 +62,18 @@ function navClass(isActive: boolean) {
 
 // Freshness pill: green dot only when a scrape landed in the last 6h (that is
 // a statement about data, not decoration). Compact form drops the age text.
-function FreshnessPill({ freshest }: { freshest: string | null }) {
+function FreshnessPill({ freshest, noDb = false }: { freshest: string | null; noDb?: boolean }) {
   const d = parseApiDate(freshest);
   const live = d ? Date.now() - d.getTime() < 6 * 3_600_000 : false;
+  if (noDb) {
+    // Never say "Offseason" when there is no database at all.
+    return (
+      <span className="inline-flex h-7 items-center gap-2 rounded-full border border-neg-dim/60 bg-neg-soft px-3 text-caption whitespace-nowrap text-neg">
+        <span className="h-1.5 w-1.5 rounded-full bg-neg" aria-hidden />
+        No database
+      </span>
+    );
+  }
   return (
     <span className="inline-flex h-7 items-center gap-2 rounded-full border border-line bg-surface-1 px-3 text-caption whitespace-nowrap text-muted">
       <span className={`h-1.5 w-1.5 rounded-full ${live ? "bg-pos" : "bg-faint"}`} aria-hidden />
@@ -233,13 +244,14 @@ export function Layout() {
               <span className="hidden text-caption text-faint lg:inline">
                 last game <span className="tnum text-muted">{fmtDateShort(lastGame)}</span>
               </span>
-              <FreshnessPill freshest={freshest} />
+              <FreshnessPill freshest={freshest} noDb={isDbNotMounted(health.error)} />
             </div>
           </div>
         </header>
 
         {/* pb clears the fixed bottom bar on phones */}
         <main className="flex-1 px-4 pt-6 pb-28 md:px-8 md:py-8">
+          <DbNotice error={health.error} />
           <Outlet />
         </main>
       </div>

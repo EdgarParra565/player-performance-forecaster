@@ -5,9 +5,10 @@ interface EmptyStateProps {
   compact?: boolean;
 }
 
-// Deliberate empty-state — it is the NBA offseason, so most live-line surfaces
-// are empty until October. We show WHY it is empty and how fresh the DB is,
-// rather than a blank pane.
+// Deliberate empty-state for a mounted DB with no current lines (offseason,
+// or books haven't posted yet). We show WHY it is empty and how fresh the DB
+// is, rather than a blank pane. A MISSING database is a different state:
+// see DbNotice.
 export function EmptyState({ title, hint, lastData, compact }: EmptyStateProps) {
   return (
     <div
