@@ -23,7 +23,7 @@ from fastapi.responses import JSONResponse
 from nba_model.web import input_validation as iv
 from nba_model.model import edge_scanner as es
 
-from . import __version__, config, db_sync, guards, paper_trades, parlay, schemas, services, working_copy
+from . import __version__, config, db, db_sync, guards, paper_trades, parlay, schemas, services
 
 def _env_flag(name: str, default: bool = False) -> bool:
     raw = os.environ.get(name)
@@ -178,79 +178,39 @@ async def _sqlite_error(_request: Request, exc: sqlite3.Error) -> JSONResponse:
     return JSONResponse(status_code=503, content={"detail": "database unavailable", "code": "db_error"})
 
 
-# Tables every endpoint depends on. Checked read-only BEFORE the data layer
-# opens the file: ``DatabaseManager`` runs schema.sql + migrations on open,
-# so pointing it at an empty/foreign file would silently write a fresh schema
-# into it (the API must stay read-only).
-REQUIRED_TABLES = config.REQUIRED_TABLES
-_preflight_ok: dict[str, float] = {}
+# Every data connection is ONE read-only open per request on the mounted file
+# itself (api/db.py: DatabaseManager(path, read_only=True) — mode=ro, no DDL,
+# never creates the file). Public-facing 503 messages: no paths, just what to do.
+db.install()
+
+DB_MESSAGES = {
+    "not_mounted": (
+        "database file not mounted: the API found no SQLite file at NBA_DB_PATH. "
+        "Local Docker: run `docker compose up flagship` (bind-mounts data/database). "
+        "Fly.io: publish a snapshot first (DEPLOYMENT.md §16)."
+    ),
+    "unmigrated": (
+        "database needs migrating: the mounted file predates the current schema "
+        "(missing migrated columns). Open it once with the data layer's writer on "
+        "the host (any ETL run), then reload."
+    ),
+    "invalid": "database unavailable",
+}
+DB_CODES = {"not_mounted": "db_not_mounted", "unmigrated": "db_unmigrated", "invalid": "db_invalid"}
+DB_NOT_MOUNTED = DB_MESSAGES["not_mounted"]
 
 
-def _db_ready(db_path: str) -> bool:
-    try:
-        mtime = FsPath(db_path).stat().st_mtime
-    except OSError:
-        return False
-    if _preflight_ok.get(db_path) == mtime:
-        return True
-    uri = f"{FsPath(db_path).resolve().as_uri()}?mode=ro"
-    try:
-        with sqlite3.connect(uri, uri=True, timeout=5) as conn:
-            names = {r[0] for r in conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'")}
-    except sqlite3.Error:
-        return False
-    if not REQUIRED_TABLES.issubset(names):
-        return False
-    _preflight_ok[db_path] = mtime
-    return True
+@app.exception_handler(db.DbNotReady)
+async def _db_not_ready(_request: Request, exc: db.DbNotReady) -> JSONResponse:
+    return JSONResponse(status_code=503, content={
+        "detail": DB_MESSAGES[exc.state], "code": DB_CODES[exc.state]})
 
 
-# Public-facing 503 messages: no filesystem paths, just what to do.
-DB_NOT_MOUNTED = (
-    "database file not mounted: the API found no SQLite file at NBA_DB_PATH. "
-    "Local Docker: run `docker compose up flagship` (bind-mounts data/database). "
-    "Fly.io: publish a snapshot first (DEPLOYMENT.md §16)."
-)
-DB_INVALID = "database unavailable"
-
-
-def db_state(db_path: str) -> str:
-    """``ok`` | ``not_mounted`` (missing or 0-byte file — e.g. `docker run`
-    without the bind mount) | ``invalid`` (a file that isn't a usable NBA DB).
-
-    Never creates anything: a missing file must not grow an empty schema.
-    """
-    p = FsPath(db_path)
-    try:
-        if not p.is_file() or p.stat().st_size == 0:
-            return "not_mounted"
-    except OSError:
-        return "not_mounted"
-    return "ok" if _db_ready(db_path) else "invalid"
-
-
-class DatabaseNotReady(Exception):
-    def __init__(self, state: str):
-        super().__init__(state)
-        self.state = state
-
-
-@app.exception_handler(DatabaseNotReady)
-async def _db_not_ready(_request: Request, exc: DatabaseNotReady) -> JSONResponse:
-    code = "db_not_mounted" if exc.state == "not_mounted" else "db_invalid"
-    detail = DB_NOT_MOUNTED if exc.state == "not_mounted" else DB_INVALID
-    return JSONResponse(status_code=503, content={"detail": detail, "code": code})
-
-
-def _require_db() -> str:
-    """Validated path for the data layer to open (a working copy when the
-    source is read-only — see api/working_copy.py)."""
-    db_path = config.get_db_path()
-    state = db_state(db_path)
-    if state != "ok":
-        raise DatabaseNotReady(state)
-    return working_copy.serving_path(db_path)
+def _db_session():
+    """``with _db_session() as db_path:`` — one read-only connection for the
+    whole request; raises DbNotReady (-> 503 with a code) instead of creating
+    or migrating anything."""
+    return db.read_only_session(config.get_db_path())
 
 
 def _expose_db_path() -> bool:
@@ -381,17 +341,20 @@ def _validated_lookback(h: float) -> float:
 @app.get("/api/health", response_model=schemas.HealthResponse,
          responses={503: {"model": schemas.HealthResponse}})
 def health(response: Response) -> schemas.HealthResponse:
-    """200 only when the DB is usable; 503 otherwise, so a container or Fly
-    health check FAILS on a missing/empty mount instead of looking healthy."""
+    """200 only when the mounted DB opens read-only; 503 otherwise, so a
+    container or Fly health check FAILS on a missing / un-migrated mount
+    instead of looking healthy."""
     db_path = config.get_db_path()
-    state = db_state(db_path)
-    exists = state == "ok"
+    state = "ok"
+    extra = {"last_game_date": None, "freshest_scrape_utc": None, "table_counts": {}}
     try:
-        extra = services.health(working_copy.serving_path(db_path) if exists else db_path, exists)
+        with _db_session():
+            extra = services.health(db_path, True)
+    except db.DbNotReady as exc:
+        state = exc.state
     except sqlite3.Error:
-        extra = {"last_game_date": None, "freshest_scrape_utc": None,
-                 "table_counts": {}}
-        state, exists = "invalid", False
+        state = "invalid"
+    exists = state == "ok"
     if not exists:
         response.status_code = 503
     return schemas.HealthResponse(
@@ -402,8 +365,8 @@ def health(response: Response) -> schemas.HealthResponse:
         db_path=db_path if _expose_db_path() else None,
         db_exists=exists,
         db_state=state,
-        code=None if exists else ("db_not_mounted" if state == "not_mounted" else "db_invalid"),
-        detail=None if exists else (DB_NOT_MOUNTED if state == "not_mounted" else DB_INVALID),
+        code=None if exists else DB_CODES[state],
+        detail=None if exists else DB_MESSAGES[state],
         access_code_required=bool(guards.GUARDS.access_code()),
         db_sync=db_sync.STATE.last_status,
         **extra,
@@ -412,14 +375,14 @@ def health(response: Response) -> schemas.HealthResponse:
 
 @app.get("/api/meta", response_model=schemas.MetaResponse)
 def meta() -> schemas.MetaResponse:
-    db_path = _require_db()
-    return schemas.MetaResponse(**services.meta(db_path))
+    with _db_session() as db_path:
+        return schemas.MetaResponse(**services.meta(db_path))
 
 
 @app.get("/api/slate/kpis", response_model=schemas.SlateKpis)
 def slate_kpis() -> schemas.SlateKpis:
-    db_path = _require_db()
-    return schemas.SlateKpis(**services.slate_kpis(db_path))
+    with _db_session() as db_path:
+        return schemas.SlateKpis(**services.slate_kpis(db_path))
 
 
 @app.get("/api/slate/recent-games", response_model=schemas.RecentGamesResponse)
@@ -429,12 +392,12 @@ def recent_games(
     season_type: Optional[str] = None,
     team: Optional[str] = None,
 ) -> schemas.RecentGamesResponse:
-    db_path = _require_db()
-    return schemas.RecentGamesResponse(**services.recent_games(
-        db_path, n=n, season=_validated_season(season),
-        season_type=_validated_season_type(season_type),
-        team=_validated_team(team),
-    ))
+    with _db_session() as db_path:
+        return schemas.RecentGamesResponse(**services.recent_games(
+            db_path, n=n, season=_validated_season(season),
+            season_type=_validated_season_type(season_type),
+            team=_validated_team(team),
+        ))
 
 
 @app.get("/api/slate/edges", response_model=schemas.EdgeScanResponse)
@@ -451,26 +414,26 @@ def slate_edges(
     only_positive_ev: bool = False,
     limit: int = Query(100, ge=1, le=500),
 ) -> schemas.EdgeScanResponse:
-    db_path = _require_db()
-    if model_mode not in es.MODEL_MODES:
-        raise HTTPException(
-            status_code=400,
-            detail=f"model_mode must be one of {list(es.MODEL_MODES)}",
-        )
-    clean_stats = [_validated_stat(s) for s in stats] if stats else None
-    return schemas.EdgeScanResponse(**services.scan_edges(
-        db_path,
-        books=_validated_books(books),
-        stats=clean_stats,
-        since_hours=_validated_since(since_hours),
-        n_games=_validated_n_games(n_games),
-        model_mode=model_mode,
-        rolling_window=_validated_rolling(rolling_window),
-        min_edge=min_edge,
-        min_p_over=min_p_over,
-        only_positive_ev=only_positive_ev,
-        limit=limit,
-    ))
+    with _db_session() as db_path:
+        if model_mode not in es.MODEL_MODES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"model_mode must be one of {list(es.MODEL_MODES)}",
+            )
+        clean_stats = [_validated_stat(s) for s in stats] if stats else None
+        return schemas.EdgeScanResponse(**services.scan_edges(
+            db_path,
+            books=_validated_books(books),
+            stats=clean_stats,
+            since_hours=_validated_since(since_hours),
+            n_games=_validated_n_games(n_games),
+            model_mode=model_mode,
+            rolling_window=_validated_rolling(rolling_window),
+            min_edge=min_edge,
+            min_p_over=min_p_over,
+            only_positive_ev=only_positive_ev,
+            limit=limit,
+        ))
 
 
 @app.get("/api/players/search", response_model=schemas.PlayerSearchResponse)
@@ -480,11 +443,11 @@ def players_search(
     only_with_lines: bool = False,
     limit: int = Query(30, ge=1, le=100),
 ) -> schemas.PlayerSearchResponse:
-    db_path = _require_db()
-    return schemas.PlayerSearchResponse(**services.search_players(
-        db_path, q=q, team=_validated_team(team),
-        only_with_lines=only_with_lines, limit=limit,
-    ))
+    with _db_session() as db_path:
+        return schemas.PlayerSearchResponse(**services.search_players(
+            db_path, q=q, team=_validated_team(team),
+            only_with_lines=only_with_lines, limit=limit,
+        ))
 
 
 @app.get("/api/players/{player_id}", response_model=schemas.PlayerDetailResponse)
@@ -495,14 +458,14 @@ def player_detail(
     n_games: int = Query(25, ge=3),
     rolling_window: int = Query(5, ge=1),
 ) -> schemas.PlayerDetailResponse:
-    db_path = _require_db()
-    canonical_stat = _chartable_stat(stat)
-    player_name = _resolved_player(db_path, player_id, name)
-    return schemas.PlayerDetailResponse(**services.player_detail(
-        db_path, player_id, player_name, canonical_stat,
-        n_games=_validated_n_games(n_games),
-        rolling_window=_validated_rolling(rolling_window),
-    ))
+    with _db_session() as db_path:
+        canonical_stat = _chartable_stat(stat)
+        player_name = _resolved_player(db_path, player_id, name)
+        return schemas.PlayerDetailResponse(**services.player_detail(
+            db_path, player_id, player_name, canonical_stat,
+            n_games=_validated_n_games(n_games),
+            rolling_window=_validated_rolling(rolling_window),
+        ))
 
 
 @app.get("/api/players/{player_id}/line-movement",
@@ -512,13 +475,13 @@ def line_movement(
     stat: str = Query("points"),
     lookback_hours: float = Query(168.0),
 ) -> schemas.LineMovementResponse:
-    db_path = _require_db()
-    canonical_stat = _validated_stat(stat)
-    _resolved_player(db_path, player_id, None)  # 404 like player detail
-    return schemas.LineMovementResponse(**services.line_movement(
-        db_path, player_id, canonical_stat,
-        lookback_hours=_validated_lookback(lookback_hours),
-    ))
+    with _db_session() as db_path:
+        canonical_stat = _validated_stat(stat)
+        _resolved_player(db_path, player_id, None)  # 404 like player detail
+        return schemas.LineMovementResponse(**services.line_movement(
+            db_path, player_id, canonical_stat,
+            lookback_hours=_validated_lookback(lookback_hours),
+        ))
 
 
 @app.get("/api/cross-book", response_model=schemas.CrossBookResponse)
@@ -532,24 +495,24 @@ def cross_book(
     min_gap: float = Query(0.5, ge=0.0, le=100.0),
     min_books: int = Query(2, ge=2, le=20),
 ) -> schemas.CrossBookResponse:
-    db_path = _require_db()
-    if model_mode not in es.MODEL_MODES:
-        raise HTTPException(
-            status_code=400,
-            detail=f"model_mode must be one of {list(es.MODEL_MODES)}",
-        )
-    clean_stats = [_validated_stat(s) for s in stats] if stats else None
-    return schemas.CrossBookResponse(**services.cross_book(
-        db_path,
-        books=_validated_books(books),
-        stats=clean_stats,
-        since_hours=_validated_since(since_hours),
-        n_games=_validated_n_games(n_games),
-        model_mode=model_mode,
-        rolling_window=_validated_rolling(rolling_window),
-        min_gap=min_gap,
-        min_books=min_books,
-    ))
+    with _db_session() as db_path:
+        if model_mode not in es.MODEL_MODES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"model_mode must be one of {list(es.MODEL_MODES)}",
+            )
+        clean_stats = [_validated_stat(s) for s in stats] if stats else None
+        return schemas.CrossBookResponse(**services.cross_book(
+            db_path,
+            books=_validated_books(books),
+            stats=clean_stats,
+            since_hours=_validated_since(since_hours),
+            n_games=_validated_n_games(n_games),
+            model_mode=model_mode,
+            rolling_window=_validated_rolling(rolling_window),
+            min_gap=min_gap,
+            min_books=min_books,
+        ))
 
 
 @app.get("/api/teams/{team}/chart", response_model=schemas.TeamChartResponse)
@@ -558,16 +521,16 @@ def team_chart(
     stat: str = Query("points"),
     n_games: int = Query(25, ge=3),
 ) -> schemas.TeamChartResponse:
-    db_path = _require_db()
-    try:
-        canonical_team = iv.validate_team_code(team)
-    except iv.ValidationError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    canonical_stat = _chartable_stat(stat)
-    return schemas.TeamChartResponse(**services.team_chart(
-        db_path, canonical_team, canonical_stat,
-        n_games=_validated_n_games(n_games),
-    ))
+    with _db_session() as db_path:
+        try:
+            canonical_team = iv.validate_team_code(team)
+        except iv.ValidationError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        canonical_stat = _chartable_stat(stat)
+        return schemas.TeamChartResponse(**services.team_chart(
+            db_path, canonical_team, canonical_stat,
+            n_games=_validated_n_games(n_games),
+        ))
 
 
 # ---------------------------------------------------------------------------
@@ -589,44 +552,44 @@ def _bad(detail: str) -> HTTPException:
 
 @app.post("/api/parlay/price", response_model=schemas.ParlayResponse)
 def parlay_price(req: schemas.ParlayRequest) -> schemas.ParlayResponse:
-    db_path = _require_db()
-    try:
-        iv.validate_parlay_legs_count(len(req.legs))
-        n_sims = iv.validate_n_sims(req.n_sims, hard_cap=PARLAY_MAX_SIMS)
-        n_games = iv.validate_n_games(req.n_games, min_value=3)
-        parlay_odds = iv.validate_american_odds(req.parlay_odds)
-    except iv.ValidationError as exc:
-        raise _bad(str(exc)) from exc
-
-    legs: list[dict] = []
-    seen: set[tuple] = set()
-    for i, leg in enumerate(req.legs, start=1):
-        stat = _chartable_stat(leg.stat)
+    with _db_session() as db_path:
         try:
-            line = iv.validate_line(stat, leg.line)
-            odds = iv.validate_american_odds(leg.odds)
+            iv.validate_parlay_legs_count(len(req.legs))
+            n_sims = iv.validate_n_sims(req.n_sims, hard_cap=PARLAY_MAX_SIMS)
+            n_games = iv.validate_n_games(req.n_games, min_value=3)
+            parlay_odds = iv.validate_american_odds(req.parlay_odds)
         except iv.ValidationError as exc:
-            raise _bad(f"leg {i}: {exc}") from exc
-        key = (leg.player_id, stat, line, leg.side)
-        if key in seen:
-            raise _bad(f"leg {i} duplicates an earlier leg")
-        seen.add(key)
-        legs.append({
-            "player_id": leg.player_id,
-            "player_name": _resolved_player(db_path, leg.player_id, None),
-            "stat": stat,
-            "line": line,
-            "side": leg.side,
-            "odds": odds if odds is not None else parlay.DEFAULT_LEG_ODDS,
-        })
+            raise _bad(str(exc)) from exc
 
-    try:
-        priced = parlay.price_parlay(
-            db_path, legs, n_games=n_games, n_sims=n_sims, parlay_odds=parlay_odds,
-        )
-    except parlay.LegDataError as exc:
-        raise _bad(str(exc)) from exc
-    return schemas.ParlayResponse(**priced, disclaimer=PARLAY_DISCLAIMER)
+        legs: list[dict] = []
+        seen: set[tuple] = set()
+        for i, leg in enumerate(req.legs, start=1):
+            stat = _chartable_stat(leg.stat)
+            try:
+                line = iv.validate_line(stat, leg.line)
+                odds = iv.validate_american_odds(leg.odds)
+            except iv.ValidationError as exc:
+                raise _bad(f"leg {i}: {exc}") from exc
+            key = (leg.player_id, stat, line, leg.side)
+            if key in seen:
+                raise _bad(f"leg {i} duplicates an earlier leg")
+            seen.add(key)
+            legs.append({
+                "player_id": leg.player_id,
+                "player_name": _resolved_player(db_path, leg.player_id, None),
+                "stat": stat,
+                "line": line,
+                "side": leg.side,
+                "odds": odds if odds is not None else parlay.DEFAULT_LEG_ODDS,
+            })
+
+        try:
+            priced = parlay.price_parlay(
+                db_path, legs, n_games=n_games, n_sims=n_sims, parlay_odds=parlay_odds,
+            )
+        except parlay.LegDataError as exc:
+            raise _bad(str(exc)) from exc
+        return schemas.ParlayResponse(**priced, disclaimer=PARLAY_DISCLAIMER)
 
 
 # ---------------------------------------------------------------------------
@@ -638,11 +601,11 @@ def paper_trades_list(
     status: str = Query("all", max_length=16),
     limit: int = Query(200, ge=1, le=500),
 ) -> schemas.PaperTradesResponse:
-    db_path = _require_db()
-    if status not in paper_trades.STATUS_FILTERS:
-        raise _bad(f"status must be one of {list(paper_trades.STATUS_FILTERS)}")
-    return schemas.PaperTradesResponse(
-        **paper_trades.list_paper_trades(db_path, status=status, limit=limit))
+    with _db_session() as db_path:
+        if status not in paper_trades.STATUS_FILTERS:
+            raise _bad(f"status must be one of {list(paper_trades.STATUS_FILTERS)}")
+        return schemas.PaperTradesResponse(
+            **paper_trades.list_paper_trades(db_path, status=status, limit=limit))
 
 
 @app.get("/api/paper-trades/calibration", response_model=schemas.CalibrationResponse)
@@ -651,12 +614,12 @@ def paper_trades_calibration(
     stat: Optional[str] = Query(None, max_length=32),
     n_buckets: int = Query(10, ge=2, le=20),
 ) -> schemas.CalibrationResponse:
-    db_path = _require_db()
-    if source not in paper_trades.CALIBRATION_SOURCES:
-        raise _bad(f"source must be one of {list(paper_trades.CALIBRATION_SOURCES)}")
-    canonical = _validated_stat(stat) if stat and stat != "all" else None
-    return schemas.CalibrationResponse(**paper_trades.calibration(
-        db_path, source=source, stat=canonical, n_buckets=n_buckets))
+    with _db_session() as db_path:
+        if source not in paper_trades.CALIBRATION_SOURCES:
+            raise _bad(f"source must be one of {list(paper_trades.CALIBRATION_SOURCES)}")
+        canonical = _validated_stat(stat) if stat and stat != "all" else None
+        return schemas.CalibrationResponse(**paper_trades.calibration(
+            db_path, source=source, stat=canonical, n_buckets=n_buckets))
 
 
 # ---------------------------------------------------------------------------

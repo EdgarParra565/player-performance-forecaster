@@ -51,7 +51,11 @@ _STAT_PATTERN = "|".join(
     re.escape(p) for p in sorted(NFL_STAT_ALIASES, key=len, reverse=True)
 )
 # Full "First Last" style names (allow middle name / Jr. / III).
-_NAME = r"[A-Z][A-Za-z'\.\-]+(?:\s+[A-Z][A-Za-z'\.\-]+){1,3}"
+# Name words start only at a token boundary (lookbehind) and are consumed
+# possessively: on one long unspaced token the old pattern restarted at
+# every letter and backtracked the rest (super-linear). Every name here is
+# followed by whitespace, so matches are unchanged.
+_NAME = r"(?<![A-Za-z'\.\-])[A-Z][A-Za-z'\.\-]++(?:\s+[A-Z][A-Za-z'\.\-]++){1,3}"
 _LINE = r"\d{1,3}(?:\.\d+)?"
 _SIDE = r"(?:Over|Under|More|Less)"
 

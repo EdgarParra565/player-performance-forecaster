@@ -22,8 +22,12 @@ from nba_model.scrapers.base import BookScraper, SessionMarkers
 # Position abbrev (e.g. "PG", "SF", "PF").
 _POS = r"(?:PG|SG|SF|PF|C|G|F)"
 # Player header: "<Full Name> <POS> - <TEAM> <TEAM> @ <TEAM> <time> <AM|PM>"
+# Name words start only at a token boundary (lookbehind) and are consumed
+# possessively: on one long unspaced token the old pattern restarted at
+# every letter and backtracked the rest (super-linear). Every name here is
+# followed by whitespace, so matches are unchanged.
 _PLAYER_HEADER_RE = re.compile(
-    r"(?P<player>[A-Z][A-Za-z'\-\.]+(?:\s+[A-Z][A-Za-z'\-\.]+){1,3})"
+    r"(?P<player>(?<![A-Za-z'\-\.])[A-Z][A-Za-z'\-\.]++(?:\s+[A-Z][A-Za-z'\-\.]++){1,3})"
     r"\s+" + _POS + r"\s+-\s+[A-Z]{2,4}\s+"
     r"[A-Z]{2,4}\s+(?:@|vs\.?)\s+[A-Z]{2,4}\s+"
     r"\d{1,2}:\d{2}\s*(?:AM|PM|am|pm)"

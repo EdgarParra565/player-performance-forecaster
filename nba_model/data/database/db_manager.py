@@ -808,38 +808,42 @@ class DatabaseManager:
             """
         ).fetchall()
 
-        for pred_id, player_id, game_date, stat_type, line_value in pending:
-            scanned += 1
-            stat = (stat_type or "").strip().lower()
-            expr = stat_expr.get(stat)
-            if expr is None:
-                unsupported_stats.add(stat or "<empty>")
-                continue
-            row = self.conn.execute(
-                f"""
-                SELECT {expr} AS actual
-                FROM game_logs g
-                WHERE g.player_id = ?
-                  AND DATE(g.game_date) = DATE(?)
-                LIMIT 1
-                """,
-                (int(player_id), str(game_date)),
-            ).fetchone()
-            if not row or row[0] is None:
-                continue
-            actual = float(row[0])
-            if line_value is None:
-                outcome = None
-            else:
-                lv = float(line_value)
-                if actual > lv:
-                    outcome = "over"
-                elif actual < lv:
-                    outcome = "under"
+        # All-or-nothing: a failure mid-loop rolls back this call's UPDATEs
+        # (SAVEPOINT) and re-raises, instead of leaving a partial backfill for
+        # the next unrelated commit; a caller's pending work is kept.
+        with self._atomic("predictions_backfill"):
+            for pred_id, player_id, game_date, stat_type, line_value in pending:
+                scanned += 1
+                stat = (stat_type or "").strip().lower()
+                expr = stat_expr.get(stat)
+                if expr is None:
+                    unsupported_stats.add(stat or "<empty>")
+                    continue
+                row = self.conn.execute(
+                    f"""
+                    SELECT {expr} AS actual
+                    FROM game_logs g
+                    WHERE g.player_id = ?
+                      AND DATE(g.game_date) = DATE(?)
+                    LIMIT 1
+                    """,
+                    (int(player_id), str(game_date)),
+                ).fetchone()
+                if not row or row[0] is None:
+                    continue
+                actual = float(row[0])
+                if line_value is None:
+                    outcome = None
                 else:
-                    outcome = "push"
-            self.conn.execute(update_stmt, (actual, outcome, int(pred_id)))
-            settled += 1
+                    lv = float(line_value)
+                    if actual > lv:
+                        outcome = "over"
+                    elif actual < lv:
+                        outcome = "under"
+                    else:
+                        outcome = "push"
+                self.conn.execute(update_stmt, (actual, outcome, int(pred_id)))
+                settled += 1
 
         self.conn.commit()
         result = {
@@ -1054,39 +1058,41 @@ class DatabaseManager:
         clv_filled = 0
         unsupported_stats: set[str] = set()
 
-        for (log_id, player_id, game_date, stat_type, line, side,
-             implied_prob, book) in pending:
-            scanned += 1
-            stat = (stat_type or "").strip().lower()
-            expr = _GAMELOG_STAT_EXPR.get(stat)
-            if expr is None or player_id is None:
-                unsupported_stats.add(stat or "<empty>")
-                continue
-            row = self.conn.execute(
-                f"""
-                SELECT {expr} AS actual
-                FROM game_logs g
-                WHERE g.player_id = ?
-                  AND DATE(g.game_date) = DATE(?)
-                LIMIT 1
-                """,
-                (int(player_id), str(game_date)),
-            ).fetchone()
-            if not row or row[0] is None:
-                continue
-            actual = float(row[0])
-            status = _grade_bet_side(side, actual, line)
-            if status is None:
-                continue
-            clv = self._closing_clv_delta(
-                player_id, game_date, stat, side, implied_prob,
-                line=line, book=book,
-            ) if fill_clv else None
-            if clv is not None:
-                clv_filled += 1
-            self.conn.execute(
-                update_stmt, (status, now, actual, clv, int(log_id)))
-            settled += 1
+        # All-or-nothing (SAVEPOINT): see backfill_predictions_outcomes.
+        with self._atomic("settle_bet_log"):
+            for (log_id, player_id, game_date, stat_type, line, side,
+                 implied_prob, book) in pending:
+                scanned += 1
+                stat = (stat_type or "").strip().lower()
+                expr = _GAMELOG_STAT_EXPR.get(stat)
+                if expr is None or player_id is None:
+                    unsupported_stats.add(stat or "<empty>")
+                    continue
+                row = self.conn.execute(
+                    f"""
+                    SELECT {expr} AS actual
+                    FROM game_logs g
+                    WHERE g.player_id = ?
+                      AND DATE(g.game_date) = DATE(?)
+                    LIMIT 1
+                    """,
+                    (int(player_id), str(game_date)),
+                ).fetchone()
+                if not row or row[0] is None:
+                    continue
+                actual = float(row[0])
+                status = _grade_bet_side(side, actual, line)
+                if status is None:
+                    continue
+                clv = self._closing_clv_delta(
+                    player_id, game_date, stat, side, implied_prob,
+                    line=line, book=book,
+                ) if fill_clv else None
+                if clv is not None:
+                    clv_filled += 1
+                self.conn.execute(
+                    update_stmt, (status, now, actual, clv, int(log_id)))
+                settled += 1
 
         self.conn.commit()
         result = {

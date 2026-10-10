@@ -52,6 +52,17 @@ PARK_FACTORS: dict[str, float] = {
 
 NEUTRAL_FACTOR = 1.00
 
+# Code aliases -> the PARK_FACTORS key they share. The Athletics left Oakland
+# (2025: Sacramento, Sutter Health Park) and MLB feeds now say "ATH"; without
+# this they silently got the neutral 1.00. They reuse the EXISTING OAK value —
+# no new number is invented here.
+# TODO(validate): the OAK factor describes the Oakland Coliseum, not the
+# Athletics' current park; like every value above it is unvalidated.
+_TEAM_CODE_ALIASES: dict[str, str] = {
+    "ATH": "OAK",
+    "SAC": "OAK",
+}
+
 # Stat types whose baseline scales with the park's run environment. Pitcher
 # counting stats and discrete yes/no markets are deliberately left untouched
 # by default (their park sensitivity is different and not yet modeled).
@@ -61,8 +72,11 @@ _PARK_SENSITIVE_STATS = frozenset({
 
 
 def park_factor(home_team_code: str) -> float:
-    """Return the run park factor for a home-team code (1.00 when unknown)."""
-    return PARK_FACTORS.get(str(home_team_code or "").strip().upper(), NEUTRAL_FACTOR)
+    """Return the run park factor for a home-team code (1.00 when unknown).
+
+    ``ATH`` / ``SAC`` (the relocated Athletics) resolve to the ``OAK`` entry."""
+    code = str(home_team_code or "").strip().upper()
+    return PARK_FACTORS.get(_TEAM_CODE_ALIASES.get(code, code), NEUTRAL_FACTOR)
 
 
 def adjust_for_park(

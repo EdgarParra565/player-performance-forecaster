@@ -564,9 +564,14 @@ path), `/data` is empty. The API **does not** create an empty schema. Instead:
   simply has no current lines.
 - `smoke_check` prints the reason on its `health 200` failure.
 
-A file that exists but isn't a usable NBA DB (corrupt, or missing core
-tables) gives `db_state: "invalid"` / `code: "db_invalid"`, and nothing is
-written to it.
+A real NBA DB that predates the current schema (missing migrated columns or
+newer tables) gives `db_state: "unmigrated"` / `code: "db_unmigrated"`, with
+its own short UI notice: run the ETL (any writer open) on the host once,
+then reload. A file that isn't an NBA DB at all (corrupt, or missing core
+tables) gives `db_state: "invalid"` / `code: "db_invalid"`. In every case the
+API serves the mounted file itself, through one `DatabaseManager(path,
+read_only=True)` connection per request (SQLite `mode=ro`), so nothing is ever
+written, migrated or copied.
 
 Without Docker (same production path):
 

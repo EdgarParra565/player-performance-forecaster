@@ -6,6 +6,19 @@ import { ApiError } from "../api/client";
 export function DbNotice({ error }: { error: unknown }) {
   if (!(error instanceof ApiError) || error.status !== 503) return null;
   const notMounted = error.code === "db_not_mounted";
+  if (error.code === "db_unmigrated") {
+    // A real DB from before the current schema. Short and specific: the fix
+    // is one writer open on the host, never a copy or a silent fallback.
+    return (
+      <div role="alert" className="mb-6 rounded-lg border border-warn/40 bg-warn/5 px-4 py-4 text-body">
+        <div className="font-semibold text-warn">Database needs migrating</div>
+        <p className="mt-2 text-muted">
+          The mounted file is a real NBA database but predates the current schema, so the API won't serve it
+          read-only. Run the ETL (any writer open) on the host once, then reload.
+        </p>
+      </div>
+    );
+  }
   if (!notMounted && error.code !== "db_invalid") return null;
   return (
     <div role="alert" className="mb-6 rounded-lg border border-neg-dim/60 bg-neg-soft px-4 py-4 text-body">

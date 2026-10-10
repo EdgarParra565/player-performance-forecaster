@@ -12,6 +12,8 @@ export function errorMessage(error: unknown, fallback: string): string {
   // A missing DB is a deployment problem, explained once by the app-wide
   // notice; don't repeat the long instructions in every card.
   if (isDbNotMounted(error)) return "Database file not mounted — see the notice at the top.";
+  if (error instanceof ApiError && error.code === "db_unmigrated")
+    return "Database needs migrating — see the notice at the top.";
   if (error instanceof ApiError && error.message) return `${fallback} ${error.message}`;
   return fallback;
 }

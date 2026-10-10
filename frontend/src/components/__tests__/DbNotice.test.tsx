@@ -28,6 +28,16 @@ describe("database-state errors", () => {
     expect(screen.getByRole("alert")).toHaveTextContent("not an offseason slate");
   });
 
+  it("un-migrated DB gets its own short notice (not 'not mounted', not offseason)", () => {
+    const err = new ApiError(503, "database needs migrating", "db_unmigrated");
+    render(<DbNotice error={err} />);
+    const alert = screen.getByRole("alert");
+    expect(alert).toHaveTextContent("Database needs migrating");
+    expect(alert).not.toHaveTextContent("not mounted");
+    expect(alert).not.toHaveTextContent("docker compose");
+    expect(errorMessage(err, "Edge scan failed.")).toBe("Database needs migrating — see the notice at the top.");
+  });
+
   it("invalid DB gets its own copy; other errors show nothing", () => {
     const { rerender } = render(<DbNotice error={new ApiError(503, "x", "db_invalid")} />);
     expect(screen.getByRole("alert")).toHaveTextContent("Database unavailable");

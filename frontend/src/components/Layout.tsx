@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { NavLink, Outlet, useRouteError } from "react-router-dom";
+import { ApiError } from "../api/client";
 import { useHealth } from "../api/hooks";
 import { AccessGate } from "./AccessGate";
 import { DbNotice } from "./DbNotice";
@@ -62,9 +63,25 @@ function navClass(isActive: boolean) {
 
 // Freshness pill: green dot only when a scrape landed in the last 6h (that is
 // a statement about data, not decoration). Compact form drops the age text.
-function FreshnessPill({ freshest, noDb = false }: { freshest: string | null; noDb?: boolean }) {
+function FreshnessPill({
+  freshest,
+  noDb = false,
+  unmigrated = false,
+}: {
+  freshest: string | null;
+  noDb?: boolean;
+  unmigrated?: boolean;
+}) {
   const d = parseApiDate(freshest);
   const live = d ? Date.now() - d.getTime() < 6 * 3_600_000 : false;
+  if (unmigrated) {
+    return (
+      <span className="inline-flex h-7 items-center gap-2 rounded-full border border-warn/40 bg-warn/5 px-3 text-caption whitespace-nowrap text-warn">
+        <span className="h-1.5 w-1.5 rounded-full bg-warn" aria-hidden />
+        Needs migration
+      </span>
+    );
+  }
   if (noDb) {
     // Never say "Offseason" when there is no database at all.
     return (
@@ -244,7 +261,11 @@ export function Layout() {
               <span className="hidden text-caption text-faint lg:inline">
                 last game <span className="tnum text-muted">{fmtDateShort(lastGame)}</span>
               </span>
-              <FreshnessPill freshest={freshest} noDb={isDbNotMounted(health.error)} />
+              <FreshnessPill
+                freshest={freshest}
+                noDb={isDbNotMounted(health.error)}
+                unmigrated={health.error instanceof ApiError && health.error.code === "db_unmigrated"}
+              />
             </div>
           </div>
         </header>

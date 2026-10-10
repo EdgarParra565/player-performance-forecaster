@@ -29,8 +29,12 @@ _POS = r"(?:PG|SG|SF|PF|C|G|F)"
 _TEAM = r"[A-Z]{2,4}"
 # Pick6 row shape (post-icon-noise):
 #   "<F. LastName> <POS> <TEAM> @ <TEAM> Today|Sat|Sun..., <time> ... <line> ... <Stat> More"
+# Name words start only at a token boundary (lookbehind) and are consumed
+# possessively: on one long unspaced token the old pattern restarted at
+# every letter and backtracked the rest (super-linear). Every name here is
+# followed by whitespace, so matches are unchanged.
 _ROW_RE = re.compile(
-    r"(?P<player>[A-Z](?:[A-Z]?\.|[A-Za-z]{2,})\s+[A-Z][A-Za-z'\-]+(?:\s+[A-Z][A-Za-z'\-]+)?)"
+    r"(?P<player>(?<![A-Za-z'\-\.])[A-Z](?:[A-Z]?\.|[A-Za-z]{2,}+)\s+[A-Z][A-Za-z'\-]++(?:\s+[A-Z][A-Za-z'\-]++)?)"
     r"\s+" + _POS + r"\s+"
     + _TEAM + r"\s+(?:@|vs\.?)\s+" + _TEAM + r"\s+"
       r"(?:Today|Tomorrow|Mon|Tue|Wed|Thu|Fri|Sat|Sun)[A-Za-z,\s\d:]+(?:AM|PM)\s+"

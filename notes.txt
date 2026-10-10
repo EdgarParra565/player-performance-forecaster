@@ -5,7 +5,7 @@ Last updated: 2026-10-10
 Active tracker only: architecture, what's done, what's next. CLI runbooks,
 deployment, and security live in **README.md** and **docs/** — not duplicated here.
 
-Test baseline (2026-10-10, end of data-agent pass): **942 passing** in nba_model/tests
+Test baseline (2026-10-10, end of data-agent pass 2): **949 passing** in nba_model/tests
 (`.venv/bin/python3 -m pytest nba_model/tests -q`; Windows:
 `.venv\Scripts\python.exe -m pytest nba_model/tests -q`; note `test_daily_etl.py`
 needs real network to stats.nba.com), **108 API tests**
@@ -203,9 +203,14 @@ save; web = Plotly, Tk = matplotlib; do not delete `sports/` scaffolding.
   bet_log pick dedupe (unique index + INSERT OR IGNORE), bet_slip one pick per
   prop (best book), Odds API 401/403/429 fail the step (typed, non-retryable),
   daily_etl Playwright preflight first (failed step + report, no raise). Also
-  the read-only DatabaseManager open (flagship handoff). 5 PROPOSED remain, each
-  with a reason (UTC/ET slate date, predictions run_id, executemany partial
-  writes, publish_db branch, PP-style regex).
+  the read-only DatabaseManager open (flagship handoff).
+  **2026-10-10 follow-ups:** executemany partial writes FIXED (`_atomic()`
+  SAVEPOINT around every insert helper, then settle_bet_log /
+  backfill_predictions_outcomes too) and the PP-style name regex FIXED
+  (anchored + possessive, then the ParlayPlay / Pick6 / mlb_props / nfl_props
+  copies). **3 majors remain PROPOSED** (matches review_findings_data.md):
+  UTC/ET slate date, predictions run_id, publish_db branch handling — each with
+  its reason on the findings row.
   Critical: the suite wrote into the LIVE DB (a module-level test script
   inserted a fabricated LeBron game log `0022400001`; every `odds_poll_runs` row
   is test mock data, and those rows feed the 24h odds-freshness guard). Now blocked by
@@ -219,12 +224,14 @@ save; web = Plotly, Tk = matplotlib; do not delete `sports/` scaffolding.
   no longer satisfy the freshness guard; current-season loader and `db_path`; Odds
   API key redaction; MLB Final-only ingest; `mlb_prop_lines` key includes
   game_date; VI grids: rejected headers no longer bleed, 3–5 digit odds only,
-  mid-row cutoff guard, linear label regex. Top PROPOSED items still open:
+  mid-row cutoff guard, linear label regex. PROPOSED majors still open (all 3):
   - UTC-vs-ET slate `game_date` (repo-wide convention change)
   - `predictions` run_id (needs a calibration reader migration)
+  - publish_db branch handling (publishing is off)
   (team priors, `last_seen_at_utc`, alt-line ladders, CDP tab reuse: FIXED 2026-09-28;
   team_priors game date, betting_lines last_seen, bet_log dedupe, bet_slip
-  best-book, Odds API auth errors, daily_etl Playwright guard: FIXED 2026-10-05)
+  best-book, Odds API auth errors, daily_etl Playwright guard: FIXED 2026-10-05;
+  executemany partial writes, PP-style name regexes: FIXED 2026-10-10)
 
 - **Live-DB cleanup (2026-09-28, owner-approved)** — backup
   `data/database/backups/nba_data_pre_cleanup_20260928T172053Z.db` (cp; sha256
@@ -286,6 +293,15 @@ save; web = Plotly, Tk = matplotlib; do not delete `sports/` scaffolding.
       **For the web agent:** the live file opens with
       `DatabaseManager(path, read_only=True)` — the scratch copy
       (api/working_copy.py + the compose-mount copy) can be retired.
+- [x] **Data-agent pass 2026-10-10 #2 (scraping OFF; live DB not written —
+      mtime + sha256 identical before/after):** `settle_bet_log` and
+      `backfill_predictions_outcomes` run inside `_atomic()` (a mid-loop
+      failure rolls back that call's settles; caller's pending work kept;
+      test_settle_atomic — temp DBs only, live bet_log / predictions untouched).
+      ParlayPlay / Pick6 / mlb_props / nfl_props name regexes anchored +
+      possessive (linear on long unspaced tokens; 0-diff over all 286 stored
+      snapshots for parlayplay / pick6 / generic; mlb_props + nfl_props have no
+      stored capture — fixture tests only; no live re-check). Tests 942 → 949.
 
 - [x] **Data-agent pass 2026-10-05 (scraping OFF; no Chrome / live fetch):**
       read-only `DatabaseManager(path, read_only=True)` (SQLite `mode=ro`, no
@@ -311,6 +327,12 @@ save; web = Plotly, Tk = matplotlib; do not delete `sports/` scaffolding.
       2026-09-25), so `mlb_props.preprocess_mlb_props` stays fixture-only/unwired.
       Park factors: `data/mlb_park_factors.py` exists (unvalidated TODO; `OAK`
       key predates the Athletics' Sacramento move — MLB feeds may say `ATH`).
+      **2026-10-10:** `ATH` / `SAC` now alias the EXISTING `OAK` factor (no new
+      number; `mlb_team_names` also knows ATH / "Sacramento Athletics"), so the
+      Athletics no longer fall back to neutral 1.00. The factors themselves —
+      including OAK, which describes the Coliseum, not the club's current park
+      — are **still unvalidated** (TODO(validate) kept), and `adjust_for_park`
+      stays unused outside its tests (guarded by a test).
       *Why not betting_lines/web_prop_cards:* `betting_lines.player_id` is an NBA
       FK and its NBA readers (cross_book_arb, prop_board, line_comparison, ...)
       never filter `sport`; `web_prop_cards` feeds api/ book+freshness counts —
@@ -871,17 +893,33 @@ Test counts after Phase 4: **nba_model 891**, **api 99**, **frontend 99**.
 - [x] **Image ships no SQLite at all.** `.dockerignore` excludes
       `**/*.db*` (a stray 0-byte `nba_model/data/database/nba_data.db` and the
       53 KB `test_nba_data.db` had been riding along via `COPY nba_model`).
-- [x] **Read-only mount works again.** The data layer's new open-time
-      migration (`_ensure_game_date_columns` → `ALTER TABLE web_team_lines ADD
-      COLUMN game_date`) made every DatabaseManager open fail on the
-      `./data/database:/data:ro` mount. The API now serves a disposable
-      working copy (`api/working_copy.py`: online .backup from a read-only
-      connection, refreshed on source mtime/size change, os.replace) whenever
-      the source isn't writable, so the host file is never written.
-      Verified with compose against this Mac's DB: smoke --strict 18/18;
-      kpis games_in_db 4,199 / players_tracked 1,091 / books_producing 16;
-      health table_counts games 8,398 / game_logs 91,734 / web_prop_cards
-      508 / betting_lines 2,955 / predictions 65,380; host file untouched.
+- [x] **Read-only mount works again** (2026-10-05, superseded 2026-10-10 —
+      see the next item). The data layer's open-time migration made every
+      DatabaseManager open fail on the `./data/database:/data:ro` mount, so
+      the API temporarily served a scratch copy (`api/working_copy.py`).
+- [x] **API serves the mount itself, read-only (2026-10-10).** Every request
+      opens ONE `DatabaseManager(path, read_only=True)` on NBA_DB_PATH
+      (`api/db.py`). The data-layer read paths the API wraps (player_charts,
+      edge_scanner, cross_book_arb, calibration_report, api/services,
+      api/paper_trades) reuse that connection via a request-scoped rebinding of
+      their `DatabaseManager` name; outside a request it is the normal writer,
+      so the ETL is unaffected. A write attempt through it fails ("readonly
+      database"). `DatabaseNotReadyError` → 503 codes: missing/0-byte =
+      `db_not_mounted`; a real file missing migrated columns/newer tables =
+      `db_unmigrated` (own short UI notice + "Needs migration" pill, never
+      copied around); not SQLite / missing core tables = `db_invalid`.
+      **`api/working_copy.py` and its tests are deleted**; the container has no
+      /tmp/nba-flagship. Tests: `api/tests/test_read_only_db.py` (one
+      read-only open per request on all 12 GET endpoints + parlay POST, ro
+      mount never written, unmigrated / invalid / not-mounted, write fails).
+      Verified with compose against this Mac's DB (2026-10-10): smoke --strict
+      18/18; health games 8,398 / game_logs 91,734 / web_prop_cards 508 /
+      betting_lines 2,955 / predictions 65,380; kpis games_in_db 4,199 /
+      players_tracked 1,091 / books_producing 16 / last_game_date 2026-06-13.
+      The browser slate shows 4,199 / 1,091 / 16 with no DB notice; Player
+      Detail (LeBron James) renders (PTS mean 21.1, 6 books, charts) with no
+      error boundary. `/data` in the container is a read-only filesystem;
+      host file mtime + sha256 unchanged.
 - [x] **Freshness = last SEEN.** `api/services.py` freshest-scrape and the
       48h `prop_lines_recent` count use
       `datetime(COALESCE(last_seen_at_utc, observed_at_utc))` (falls back to
@@ -893,7 +931,8 @@ Test counts after Phase 4: **nba_model 891**, **api 99**, **frontend 99**.
       fix. Please ship a read-only open (and skip migrations in it); the API
       will switch to it. **→ Shipped 2026-10-05:** `DatabaseManager(db_path,
       read_only=True)` raises `DatabaseNotReadyError` instead of growing a
-      schema; api/ not edited by the data agent.
+      schema; api/ not edited by the data agent. **→ Done 2026-10-10: the API
+      now uses it** (one read-only open per request on the mount; see above).
 - Stale shared status, NOT edited (data agent's section): "Near-term
   objectives" item 1 still says the autopilot is LIVE / running unattended.
   (Corrected by the data agent 2026-10-05: item 1 now says OFF.)

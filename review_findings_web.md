@@ -12,8 +12,8 @@ STATUS: **FIXED** (with regression test) · **PROPOSED** (judgment call / follow
 | | FIXED | PROPOSED | CROSS-BOUNDARY |
 |---|---|---|---|
 | Critical | 4 | 0 | 0 |
-| Major | 26 | 0 | 1 (`db_manager` schema-on-open) |
-| Minor / info | 29 | 7 (6 deferred with billing) | 0 |
+| Major | 27 | 0 | 0 (`db_manager` schema-on-open resolved 2026-10-10) |
+| Minor / info | 30 | 6 (all deferred with billing) | 0 |
 
 Test counts after this pass: **nba_model 862** (778 baseline + 28 new in
 `test_review_web_security.py`; the remaining +56 came from a concurrent agent's
@@ -59,7 +59,7 @@ per-IP limits. See `docs/DEPLOYMENT.md` §15.
 
 ## 2. API contract
 
-- `api/main.py:124` + `nba_model/data/database/db_manager.py:111-136` — **MAJOR** — The "read-only" API wrote: every `DatabaseManager()` open runs `schema.sql` plus migrations. Pointing `NBA_DB_PATH` at an empty file created 52 schema objects in it. — The API now runs a read-only preflight (`sqlite3 …?mode=ro`, required tables present, cached by mtime) *before* the data layer is allowed to open the file. Otherwise it returns 503 "database unavailable". — **FIXED** (`test_empty_file_is_503_and_not_written`). The root cause is in `db_manager` (schema-on-open with no read-only mode). — **CROSS-BOUNDARY** (proposed: a `read_only=True` open mode).
+- `api/main.py:124` + `nba_model/data/database/db_manager.py:111-136` — **MAJOR** — The "read-only" API wrote: every `DatabaseManager()` open runs `schema.sql` plus migrations. Pointing `NBA_DB_PATH` at an empty file created 52 schema objects in it. — The API now runs a read-only preflight (`sqlite3 …?mode=ro`, required tables present, cached by mtime) *before* the data layer is allowed to open the file. Otherwise it returns 503 "database unavailable". — **FIXED** (`test_empty_file_is_503_and_not_written`). The root cause was in `db_manager` (schema-on-open with no read-only mode). — **CROSS-BOUNDARY → FIXED 2026-10-10**: the data agent shipped `DatabaseManager(path, read_only=True)` and the API now opens only through it (`api/db.py`); the preflight is gone.
 - `api/main.py:108` — **MAJOR** — A locked, corrupt or schema-drifted DB surfaced as a raw 500, and `/api/health` itself could 500. — A global `sqlite3.Error` handler now returns 503 with a generic detail, and health reports `degraded`. — **FIXED** (`test_garbage_file_is_503`).
 - `api/services.py:293` — **MAJOR** — Player search used a regex `str.contains`: `?q=(` returned 500 and `.` acted as a wildcard. `q` was also unbounded. — Now `regex=False` with `Query(max_length=64)`. — **FIXED**.
 - `api/main.py:202` — **MAJOR** — The `name` query param overrode the DB name. Book lines are matched by name, so `/api/players/1?name=Other Guy` mixed one player's logs with another's lines. — The name is always resolved from the DB. A mismatched `name` is a 400; matching is accent- and case-insensitive. The frontend no longer sends it. — **FIXED**.
@@ -77,7 +77,7 @@ per-IP limits. See `docs/DEPLOYMENT.md` §15.
 - `api/services.py:461,724` — **MINOR** — A window with no games returned `mu`/`sigma = 0.0`, which rendered as a fake projection. — Now `null`. — **FIXED**.
 - `api/services.py:78,100` — **MINOR** — `_freshest_scrape` took a string `max` over mixed formats (`YYYY-MM-DD HH:MM:SS` vs ISO `T…+00:00`) and returned naive strings that browsers read as local time. `prop_lines_recent` compared ISO text against `datetime('now')`. — Values are normalized to UTC ISO with an explicit offset, and the comparison uses `datetime()`. — **FIXED** (`test_freshest_scrape_is_utc_iso_with_offset`).
 - `api/main.py` health / 503 bodies — **MINOR** — They exposed the absolute server DB path. — The path is hidden unless `API_EXPOSE_DB_PATH=1`. — **FIXED**.
-- `api/services.py` (per request) — **MINOR** — A single request opens `DatabaseManager` 3–6 times, each rerunning the schema script, which invites "database is locked" during ETL commits (these now map to 503). — Open one read-only connection per request. — **PROPOSED** (needs the CROSS-BOUNDARY read-only mode above).
+- `api/services.py` (per request) — **MINOR** — A single request opens `DatabaseManager` 3–6 times, each rerunning the schema script, which invites "database is locked" during ETL commits (these now map to 503). — Open one read-only connection per request. — **FIXED 2026-10-10**: `api/db.read_only_session` opens one `DatabaseManager(path, read_only=True)` per request, and the wrapped data-layer reads reuse it (`test_one_read_only_open_per_request_on_the_mount_itself` covers all 12 GET endpoints plus the parlay POST).
 - CORS — **INFO** — CORS only allows localhost:5173, GET, no credentials. That is fine: production is same-origin (§4). — no change.
 
 ## 3. Frontend correctness
@@ -163,7 +163,17 @@ per-IP limits. See `docs/DEPLOYMENT.md` §15.
 
 - `api/main.py` `db_state` + health — **MAJOR** — `docker run` without the bind mount started "healthy" (health 200 "degraded") and served empty views. — Missing or 0-byte file → `not_mounted`: health and data endpoints answer 503 with `code: db_not_mounted`, the HEALTHCHECK fails, nothing is created, and the UI shows a dedicated notice. — **FIXED** (`test_api_hardening.py`: missing file on an empty mount dir, 0-byte, invalid, healthy; `DbNotice.test.tsx`).
 - `.dockerignore` — **MINOR** — `COPY nba_model` carried stray SQLite files (`nba_model/data/database/nba_data.db` 0 B, `test_nba_data.db` 53 KB) into the image. — `**/*.db*` excluded; `find` in the built image returns nothing. — **FIXED**.
-- `nba_model/data/database/db_manager.py` `_ensure_game_date_columns` — **MAJOR** — **CROSS-BOUNDARY** — The new open-time `ALTER TABLE` broke every API request on the read-only compose mount ("attempt to write a readonly database"). — API-side workaround: `api/working_copy.py` (`test_working_copy.py`). Proper fix: a read-only open mode in db_manager (data agent).
+- `nba_model/data/database/db_manager.py` `_ensure_game_date_columns` — **MAJOR** — **CROSS-BOUNDARY** — The new open-time `ALTER TABLE` broke every API request on the read-only compose mount ("attempt to write a readonly database"). — Interim workaround: `api/working_copy.py`. **Resolved 2026-10-10**: the live file is migrated and the read-only open exists; the API serves the mount itself through `read_only=True`, and `working_copy.py` + its tests are deleted. An un-migrated file is now reported as `db_unmigrated`, never copied around.
 - `api/services.py` freshness — **MINOR** — It windowed on `observed_at_utc` (last CHANGED), so stable, still-posted lines aged out. — Now `COALESCE(last_seen_at_utc, observed_at_utc)`. — **FIXED** (`test_api_freshness.py`).
-- Per-request `DatabaseManager` opens — still **PROPOSED**: blocked on the read-only open mode, which notes.txt does not report as shipped.
+- Per-request `DatabaseManager` opens — **FIXED 2026-10-10** (see §2 row; `api/db.py`).
+
+## 10. Read-only serving pass (2026-10-10)
+
+- `api/db.py` — **INFO** — One `DatabaseManager(path, read_only=True)` per request, opened on the mounted file itself.
+  - The data-layer read paths the API calls reuse it through a request-scoped rebinding of their `DatabaseManager` name. Outside a request the name is the normal writer, so the ETL is unaffected.
+  - Writes through the shared connection fail loudly.
+  - `DatabaseNotReadyError` → `db_not_mounted` / `db_unmigrated` / `db_invalid` (503). The underlying reason (which includes the path) is logged only.
+- `api/working_copy.py` — **INFO** — Deleted. Compose serves `/data/nba_data.db` directly from a read-only filesystem; no `/tmp/nba-flagship` exists in the container.
+- Frontend — **INFO** — `db_unmigrated` gets its own short notice and a "Needs migration" pill, distinct from "not mounted" and from the offseason empty states.
+- Verified with compose against the host DB: `smoke_check --strict` 18/18, counts match, host mtime and sha256 unchanged.
 

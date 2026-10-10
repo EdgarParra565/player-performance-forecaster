@@ -18,10 +18,9 @@ LONG_MIXED = "Ab" * 30000                 # lowercase present everywhere
 
 
 class LinearTimeTests(unittest.TestCase):
-    """Scope: the PP-style name regex (base + PrizePicks/Underdog/Fliff) and
-    the generic card patterns. Other books' preprocessors (ParlayPlay, Pick6,
-    mlb_props, nfl_props) carry their own name regexes and are still
-    super-linear — recorded in review_findings_data.md, not fixed here."""
+    """PP-style name regex (base + PrizePicks/Underdog/Fliff), the generic card
+    patterns, and (2026-10-10b) the ParlayPlay / Pick6 / mlb_props / nfl_props
+    preprocessors' own name regexes."""
 
     def _fast(self, fn, budget=2.0):
         t = time.perf_counter()
@@ -41,6 +40,24 @@ class LinearTimeTests(unittest.TestCase):
             self._fast(lambda: list(underdog._PROP_RE.finditer(tok)))
 
 
+    def test_other_books_preprocessors_on_long_unspaced_tokens(self):
+        from nba_model.scrapers import mlb_props, nfl_props, parlayplay, pick6
+
+        # Before the fix, 'Ab'*4000 alone took mlb_props 2.2 s and grew ~n².
+        for tok in (LONG, LONG_MIXED, f"Shohei Ohtani {LONG_MIXED} Hits Over 1.5"):
+            self._fast(lambda: parlayplay.preprocess(tok))
+            self._fast(lambda: pick6._ROW_RE.findall(tok))
+            self._fast(lambda: mlb_props.preprocess_mlb_props(tok))
+            self._fast(lambda: nfl_props.preprocess_nfl_props(tok))
+
+    def test_full_extractor_on_long_unspaced_tokens(self):
+        # Runs every book preprocessor + the card patterns (377 s at 8K chars
+        # before 2026-10-10).
+        for tok in (LONG, LONG_MIXED):
+            self._fast(lambda: bp.extract_prop_cards_from_text(
+                tok, "https://app.prizepicks.com/board/nba", 1, "x", set()), budget=5.0)
+
+
 class SameMatchesTests(unittest.TestCase):
     def test_names_still_match_like_before(self):
         pat = re.compile(build_pp_style_name_pattern())
@@ -56,6 +73,13 @@ class SameMatchesTests(unittest.TestCase):
         cards = bp.extract_prop_cards_from_text(
             "LeBron James More 25.5 Points", "https://example.com", 1, "x", set())
         self.assertEqual([c["player_name"] for c in cards], ["LeBron James"])
+
+    def test_other_books_still_match_their_rows(self):
+        from nba_model.scrapers import mlb_props, nfl_props
+
+        self.assertIn("Shohei Ohtani", mlb_props.preprocess_mlb_props("Shohei Ohtani Hits Over 1.5"))
+        self.assertIn("Patrick Mahomes",
+                      nfl_props.preprocess_nfl_props("Patrick Mahomes Passing Yards 275.5 Over"))
 
     def test_name_cannot_start_mid_token(self):
         pat = re.compile(build_pp_style_name_pattern())

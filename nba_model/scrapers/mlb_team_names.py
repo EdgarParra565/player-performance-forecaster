@@ -33,7 +33,10 @@ _MLB_TEAMS: dict[str, tuple[str, ...]] = {
     "Twins":        ("Minnesota Twins", "Twins", "MIN", "Minnesota"),
     "Mets":         ("New York Mets", "Mets", "NYM"),
     "Yankees":      ("New York Yankees", "Yankees", "NYY"),
-    "Athletics":    ("Athletics", "Oakland Athletics", "A's", "OAK", "Oakland"),
+    # Relocated 2025 (Sacramento); feeds now use "ATH". "Sacramento" is
+    # unambiguous within MLB.
+    "Athletics":    ("Athletics", "Oakland Athletics", "A's", "OAK", "Oakland",
+                     "ATH", "Sacramento Athletics", "Sacramento", "SAC"),
     "Phillies":     ("Philadelphia Phillies", "Phillies", "PHI", "Philadelphia"),
     "Pirates":      ("Pittsburgh Pirates", "Pirates", "PIT", "Pittsburgh"),
     "Padres":       ("San Diego Padres", "Padres", "SD", "San Diego"),

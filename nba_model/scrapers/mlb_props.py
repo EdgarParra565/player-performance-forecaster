@@ -74,7 +74,11 @@ for _phrase in list(MLB_STAT_ALIASES) + list(MLB_YESNO_MARKETS):
 _NAME_STOP = (
     "(?!(?:" + "|".join(re.escape(w) for w in sorted(_STOP_WORDS, key=len, reverse=True)) + r")\b)"
 )
-_NAME_WORD = _NAME_STOP + r"[A-Za-z][A-Za-z'\.\-]+"
+# Name words start only at a token boundary (lookbehind) and are consumed
+# possessively: on one long unspaced token the old pattern restarted at
+# every letter and backtracked the rest (super-linear). Every name here is
+# followed by whitespace, so matches are unchanged.
+_NAME_WORD = r"(?<![A-Za-z'\.\-])" + _NAME_STOP + r"[A-Za-z][A-Za-z'\.\-]++"
 _NAME = rf"{_NAME_WORD}(?:\s+{_NAME_WORD}){{1,3}}"
 _LINE = r"\d{1,2}(?:\.\d+)?"
 _OU_SIDE = r"(?:Over|Under|More|Less)"

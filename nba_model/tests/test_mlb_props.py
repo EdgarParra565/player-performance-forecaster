@@ -124,5 +124,56 @@ class MlbParkFactorTests(unittest.TestCase):
         self.assertEqual(adjust_for_park(0.5, "COL", "anytime_home_run"), 0.5)
 
 
+class AthleticsParkFactorAliasTests(unittest.TestCase):
+    """notes.txt follow-up: the relocated Athletics ("ATH") got the neutral
+    1.00 because PARK_FACTORS only keyed "OAK". ATH / SAC now share the
+    EXISTING OAK value — no new number, still TODO(validate)."""
+
+    def test_ath_and_oak_share_the_existing_factor(self):
+        from nba_model.data import mlb_park_factors as mpf
+
+        self.assertEqual(park_factor("ATH"), park_factor("OAK"))
+        self.assertEqual(park_factor("SAC"), park_factor("OAK"))
+        self.assertEqual(park_factor(" ath "), park_factor("OAK"))   # normalized
+        self.assertEqual(park_factor("OAK"), mpf.PARK_FACTORS["OAK"])
+        self.assertNotIn("ATH", mpf.PARK_FACTORS)                    # alias, not a new entry
+
+    def test_unknown_code_stays_neutral(self):
+        self.assertEqual(park_factor("ZZZ"), 1.0)
+        self.assertEqual(park_factor(""), 1.0)
+        self.assertEqual(park_factor(None), 1.0)
+
+    def test_factors_still_flagged_unvalidated(self):
+        import inspect
+        from nba_model.data import mlb_park_factors as mpf
+
+        self.assertIn("TODO(validate)", inspect.getsource(mpf))
+
+    def test_team_names_know_the_athletics_codes(self):
+        from nba_model.scrapers.mlb_team_names import normalize_mlb_team
+
+        for form in ("ATH", "OAK", "Oakland Athletics", "Sacramento Athletics", "A's"):
+            self.assertEqual(normalize_mlb_team(form), "Athletics", form)
+
+    def test_park_adjustment_is_not_wired_into_any_runtime_path(self):
+        # adjust_for_park is unvalidated and must stay unused outside its own
+        # module and tests (no projection / ETL / NBA path).
+        import re
+        from pathlib import Path
+
+        root = Path(__file__).resolve().parents[2]
+        pat = re.compile(r"adjust_for_park|park_factor\(|mlb_park_factors\s+import|"
+                         r"from\s+nba_model\.data\.mlb_park_factors|import\s+mlb_park_factors")
+        offenders = []
+        for sub in ("nba_model", "sports", "api", "scripts"):
+            for path in (root / sub).rglob("*.py"):
+                rel = path.relative_to(root).as_posix()
+                if "/tests/" in rel or rel == "nba_model/data/mlb_park_factors.py":
+                    continue
+                if pat.search(path.read_text(encoding="utf-8", errors="ignore")):
+                    offenders.append(rel)
+        self.assertEqual(offenders, [])
+
+
 if __name__ == "__main__":
     unittest.main()
