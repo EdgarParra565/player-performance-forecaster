@@ -125,7 +125,15 @@ _STOP_WORD_LOOKAHEAD = (
 # letter of every player-name word must be a genuine uppercase letter.  Without
 # this, IGNORECASE would let lowercase letters (e.g. "r" from "rojections")
 # satisfy [A-Z] after the stop-word lookahead rejects the actual uppercase start.
-_NAME_WORD = _STOP_WORD_LOOKAHEAD + r"(?-i:[A-Z])[A-Za-z\.\'\-]{1,}"
+# Anchored to a token start (lookbehind) and consumed possessively (``++``):
+# on one long unspaced token the old ``[A-Z][…]{1,}`` restarted at every
+# capital and backtracked the whole remainder each time (an 8,000-char token
+# took >6 minutes in extract_prop_cards_from_text). Every caller follows a
+# name word with whitespace, so the matches are unchanged.
+_NAME_WORD = (
+    r"(?<![A-Za-z.\'\-])" + _STOP_WORD_LOOKAHEAD
+    + r"(?-i:[A-Z])[A-Za-z\.\'\-]++"
+)
 _NAME_PATTERN = rf"(?:{_NAME_WORD}(?:\s+{_NAME_WORD}){{1,3}})"
 
 _LINE_PATTERN = r"(?:\d{1,3}(?:\.\d+)?)"

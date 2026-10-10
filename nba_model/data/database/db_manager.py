@@ -1,6 +1,7 @@
 """SQLite database manager for NBA data, betting lines, and predictions."""
 import logging
 import sqlite3
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -138,6 +139,28 @@ class DatabaseManager:
             return
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._initialize_database()
+
+    @contextmanager
+    def _atomic(self, name: str = "writer"):
+        """All-or-nothing scope for one writer's statements (SAVEPOINT).
+
+        ``executemany`` runs one statement per row: when row k fails, rows
+        0..k-1 stay in the open transaction and the NEXT unrelated
+        ``commit()`` persists them — a silent partial write. Inside this
+        scope a failure rolls back exactly this writer's rows (work a caller
+        left pending outside the savepoint is untouched) and re-raises; on
+        success the savepoint is released, which commits when it is the
+        outermost transaction.
+        """
+        sp = f"sp_{name}"
+        self.conn.execute(f"SAVEPOINT {sp}")
+        try:
+            yield
+        except BaseException:
+            self.conn.execute(f"ROLLBACK TO {sp}")
+            self.conn.execute(f"RELEASE {sp}")
+            raise
+        self.conn.execute(f"RELEASE {sp}")
 
     @classmethod
     def required_schema(cls) -> dict:
@@ -584,7 +607,8 @@ class DatabaseManager:
         if not payload:
             return {"upserted": 0, "attempted": 0}
         before = self.conn.total_changes
-        self.conn.executemany(query, payload)
+        with self._atomic():
+            self.conn.executemany(query, payload)
         self.conn.commit()
         upserted = self.conn.total_changes - before
         return {"upserted": int(upserted), "attempted": int(len(payload))}
@@ -947,7 +971,8 @@ class DatabaseManager:
             return {"inserted": 0, "attempted": 0, "duplicates_ignored": duplicates}
 
         before = self.conn.total_changes
-        self.conn.executemany(query, payload)
+        with self._atomic():
+            self.conn.executemany(query, payload)
         self.conn.commit()
         inserted = self.conn.total_changes - before
         duplicates += len(payload) - inserted
@@ -1134,7 +1159,8 @@ class DatabaseManager:
                 last_updated = CURRENT_TIMESTAMP
         """
         before = self.conn.total_changes
-        self.conn.executemany(query, rows)
+        with self._atomic("players_sync"):
+            self.conn.executemany(query, rows)
         self.conn.commit()
         upserted = self.conn.total_changes - before
 
@@ -1168,11 +1194,12 @@ class DatabaseManager:
             """
         ).fetchall()
         if team_from_logs:
-            self.conn.executemany(
-                "UPDATE players SET team = ?, last_updated = CURRENT_TIMESTAMP "
-                "WHERE player_id = ? AND (team IS NULL OR team = '')",
-                [(team, pid) for pid, team in team_from_logs],
-            )
+            with self._atomic("players_team_patch"):
+                self.conn.executemany(
+                    "UPDATE players SET team = ?, last_updated = CURRENT_TIMESTAMP "
+                    "WHERE player_id = ? AND (team IS NULL OR team = '')",
+                    [(team, pid) for pid, team in team_from_logs],
+                )
             self.conn.commit()
 
         logger.info(
@@ -1234,7 +1261,8 @@ class DatabaseManager:
         ]
         if not payload:
             return
-        self.conn.executemany(query, payload)
+        with self._atomic():
+            self.conn.executemany(query, payload)
         self.conn.commit()
         logger.info("Upserted %s team_defense rows", len(payload))
 
@@ -1390,16 +1418,17 @@ class DatabaseManager:
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
         """
         before_changes = self.conn.total_changes
-        if payload:
-            self.conn.executemany(query, payload)
-        inserted = self.conn.total_changes - before_changes
-        if bump_ids:
-            # Same 'YYYY-MM-DD HH:MM:SS' UTC format as scraped_at's default.
-            self.conn.executemany(
-                "UPDATE betting_lines SET last_seen_at_utc = datetime('now') "
-                "WHERE line_id = ?",
-                [(i,) for i in sorted(bump_ids)],
-            )
+        with self._atomic("betting_lines"):
+            if payload:
+                self.conn.executemany(query, payload)
+            inserted = self.conn.total_changes - before_changes
+            if bump_ids:
+                # Same 'YYYY-MM-DD HH:MM:SS' UTC format as scraped_at's default.
+                self.conn.executemany(
+                    "UPDATE betting_lines SET last_seen_at_utc = datetime('now') "
+                    "WHERE line_id = ?",
+                    [(i,) for i in sorted(bump_ids)],
+                )
         if payload or bump_ids:
             self.conn.commit()
         ignored = batch_dupes + (len(valid) - inserted)
@@ -1483,7 +1512,8 @@ class DatabaseManager:
             }
 
         before_changes = self.conn.total_changes
-        self.conn.executemany(query, payload)
+        with self._atomic():
+            self.conn.executemany(query, payload)
         self.conn.commit()
         inserted = self.conn.total_changes - before_changes
         logger.info("Inserted %s betting_line_snapshots rows", inserted)
@@ -1542,7 +1572,8 @@ class DatabaseManager:
             }
 
         before_changes = self.conn.total_changes
-        self.conn.executemany(query, payload)
+        with self._atomic():
+            self.conn.executemany(query, payload)
         self.conn.commit()
         inserted = self.conn.total_changes - before_changes
         logger.info("Inserted %s web_text_snapshots rows", inserted)
@@ -1689,7 +1720,8 @@ class DatabaseManager:
             }
 
         before_changes = self.conn.total_changes
-        self.conn.executemany(query, payload)
+        with self._atomic():
+            self.conn.executemany(query, payload)
         self.conn.commit()
         written = self.conn.total_changes - before_changes
         logger.info("Upserted %s nba_active_players_ref rows", written)
@@ -1867,7 +1899,8 @@ class DatabaseManager:
 
         prop_key_sql = "book = ? AND player_name = ? AND stat_type = ? AND side = ?"
         if not payload:
-            self._bump_last_seen("web_prop_cards", "card_id", prop_key_sql, seen_unchanged)
+            with self._atomic("prop_cards"):
+                self._bump_last_seen("web_prop_cards", "card_id", prop_key_sql, seen_unchanged)
             self.conn.commit()
             return {
                 "inserted": 0,
@@ -1876,10 +1909,11 @@ class DatabaseManager:
             }
 
         before_changes = self.conn.total_changes
-        self.conn.executemany(query, payload)
-        inserted_changes = self.conn.total_changes - before_changes
-        # After the inserts, so an in-batch duplicate bumps the row this batch wrote.
-        self._bump_last_seen("web_prop_cards", "card_id", prop_key_sql, seen_unchanged)
+        with self._atomic("prop_cards"):
+            self.conn.executemany(query, payload)
+            inserted_changes = self.conn.total_changes - before_changes
+            # After the inserts, so an in-batch duplicate bumps the row this batch wrote.
+            self._bump_last_seen("web_prop_cards", "card_id", prop_key_sql, seen_unchanged)
         self.conn.commit()
         inserted = inserted_changes
         logger.info(
@@ -2075,14 +2109,16 @@ class DatabaseManager:
             "AND market_type = ? AND side = ? AND team IS ? AND game_date IS ?"
         )
         if not payload:
-            self._bump_last_seen("web_team_lines", "line_id", team_key_sql, seen_unchanged)
+            with self._atomic("team_lines"):
+                self._bump_last_seen("web_team_lines", "line_id", team_key_sql, seen_unchanged)
             self.conn.commit()
             return {"inserted": 0, "attempted": 0, "skipped_unchanged": skipped_unchanged}
 
         before = self.conn.total_changes
-        self.conn.executemany(query, payload)
-        inserted = self.conn.total_changes - before
-        self._bump_last_seen("web_team_lines", "line_id", team_key_sql, seen_unchanged)
+        with self._atomic("team_lines"):
+            self.conn.executemany(query, payload)
+            inserted = self.conn.total_changes - before
+            self._bump_last_seen("web_team_lines", "line_id", team_key_sql, seen_unchanged)
         self.conn.commit()
         logger.info(
             "Inserted %s web_team_lines rows (%s skipped: line unchanged)",
@@ -2318,7 +2354,8 @@ class DatabaseManager:
         if not payload:
             return {"inserted": 0, "attempted": 0}
         before = self.conn.total_changes
-        self.conn.executemany(query, payload)
+        with self._atomic():
+            self.conn.executemany(query, payload)
         self.conn.commit()
         inserted = self.conn.total_changes - before
         logger.info("Upserted %s rows into games", inserted)
@@ -2481,8 +2518,9 @@ class DatabaseManager:
             """
 
             before_changes = self.conn.total_changes
-            self.conn.executemany(
-                query, payload.itertuples(index=False, name=None))
+            with self._atomic("game_logs"):
+                self.conn.executemany(
+                    query, payload.itertuples(index=False, name=None))
             self.conn.commit()
             inserted = self.conn.total_changes - before_changes
             ignored = len(payload) - inserted
@@ -2491,8 +2529,9 @@ class DatabaseManager:
             )
             return int(inserted)
         except Exception as e:
+            # _atomic already rolled this writer's rows back (savepoint), so a
+            # caller's unrelated pending work isn't discarded here.
             logger.error("Error inserting game logs: %s", e)
-            self.conn.rollback()
             raise
 
     def insert_mlb_game_logs(self, records):
@@ -2545,7 +2584,8 @@ class DatabaseManager:
             return {"inserted": 0, "duplicates_ignored": 0, "attempted": 0}
 
         before = self.conn.total_changes
-        self.conn.executemany(query, payload)
+        with self._atomic():
+            self.conn.executemany(query, payload)
         self.conn.commit()
         inserted = self.conn.total_changes - before
         logger.info(
@@ -2649,7 +2689,8 @@ class DatabaseManager:
                     "skipped_unchanged": int(skipped_unchanged)}
 
         before = self.conn.total_changes
-        self.conn.executemany(query, payload)
+        with self._atomic():
+            self.conn.executemany(query, payload)
         self.conn.commit()
         inserted = self.conn.total_changes - before
         logger.info(

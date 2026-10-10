@@ -1,11 +1,11 @@
 # NBA Player Performance Forecaster - Working Notes
 
-Last updated: 2026-09-28
+Last updated: 2026-10-10
 
 Active tracker only: architecture, what's done, what's next. CLI runbooks,
 deployment, and security live in **README.md** and **docs/** — not duplicated here.
 
-Test baseline (2026-10-05, end of data-agent pass): **928 passing** in nba_model/tests
+Test baseline (2026-10-10, end of data-agent pass): **942 passing** in nba_model/tests
 (`.venv/bin/python3 -m pytest nba_model/tests -q`; Windows:
 `.venv\Scripts\python.exe -m pytest nba_model/tests -q`; note `test_daily_etl.py`
 needs real network to stats.nba.com), **108 API tests**
@@ -232,15 +232,25 @@ save; web = Plotly, Tk = matplotlib; do not delete `sports/` scaffolding.
   game log (`game_id 0022400001`, player 2544; game_logs 91,735 → 91,734, his
   real 2024-10-22 game `0022400062` kept) and all 600 test-mock `odds_poll_runs`
   rows (600 → 0). Integrity ok after. The cloud copy keeps both rows until the
-  next `publish_db`. The new additive migrations (`last_seen_at_utc`,
-  `betting_lines.is_main_line` + ladder backfill, team_priors re-key) have NOT
-  run on the live file yet — they apply on the next DatabaseManager open (tested
-  on a copy: 0.05s; 337/337 ladders get exactly one main line; the 4 May priors
-  re-key to NYK/PHI, DET/CLE, OKC/LAL, SAS/MIN and are ignored as stale).
+  next `publish_db`. **Migrations: ALL HAVE RUN on the live file.** The
+  2026-09-28 set (`web_*.last_seen_at_utc`, `betting_lines.is_main_line` +
+  ladder backfill — 337/337 ladders one main line —, team_priors re-key to
+  NYK/PHI, DET/CLE, OKC/LAL, SAS/MIN) applied on the first hourly open that day.
+  The 2026-10-05 set ran **2026-10-10** in one writer open after a backup
+  (`data/database/backups/nba_data_pre_migration_20261010T185552Z.db`, cp, sha256 identical, `integrity_check` ok):
+  `betting_lines.last_seen_at_utc` (backfilled = scraped_at, 0 NULL),
+  `web_team_lines.game_date`, `team_priors` rebuilt with PK (away_team,
+  home_team, game_date), `ux_bet_log_pick` unique index. After: integrity ok;
+  row counts unchanged (games 8,398, game_logs 91,734, web_prop_cards 508,
+  betting_lines 2,955, predictions 65,380, web_team_lines 1,176, team_priors 16,
+  bet_log 0). `DatabaseManager(path, read_only=True)` now opens the live file
+  (writes refused; two read-only opens leave mtime + sha256 unchanged).
 - **Handoff to web/api agent (2026-09-28)** — schema additions readers can use:
-  `web_prop_cards/web_team_lines.last_seen_at_utc` (freshness = 
-  `COALESCE(last_seen_at_utc, observed_at_utc)`; `api/services.py:100` still uses
-  observed_at), `betting_lines.is_main_line` (filter
+  `web_prop_cards/web_team_lines.last_seen_at_utc` (freshness =
+  `COALESCE(last_seen_at_utc, observed_at_utc)` — the web agent's
+  api/services.py already filters on `datetime(COALESCE(last_seen_at_utc,
+  observed_at_utc))`; the earlier "still uses observed_at" note was stale),
+  `betting_lines.is_main_line` (filter
   `COALESCE(is_main_line,1)=1` for "the" line; same rule as `api._main_line`,
   now in `nba_model.model.odds.main_line_index`). Stored book names were NOT
   rewritten (api tests assert "FanDuel").
@@ -260,6 +270,22 @@ save; web = Plotly, Tk = matplotlib; do not delete `sports/` scaffolding.
 - [ ] **Phase 3** — execution layer ONLY if Phases 1–2 pass (book APIs, limits, kill switch).
 
 ### Smaller follow-ups
+
+- [x] **Data-agent pass 2026-10-10 (scraping OFF; no Chrome / live fetch):**
+      live DB migrated (see "Live-DB cleanup" — backup first, integrity ok,
+      counts unchanged) and the read-only open proven on it; every insert
+      helper is all-or-nothing via a `_atomic()` SAVEPOINT (failed executemany
+      rolls back instead of riding the next commit; test_db_atomic_writers);
+      PP-style name regexes anchored + possessive (linear on long unspaced
+      tokens; offline 0-diff over all 286 stored snapshots — no live
+      re-check; test_name_regex_linear). Tests 928 → 942. Still open:
+      publish_db branch (publishing off), other books' name regexes
+      (ParlayPlay / Pick6 / mlb_props / nfl_props), date capture for the
+      undated extractors (BetMGM, DraftKings, theScore, Kalshi, BetRivers — no
+      stored capture to author against).
+      **For the web agent:** the live file opens with
+      `DatabaseManager(path, read_only=True)` — the scratch copy
+      (api/working_copy.py + the compose-mount copy) can be retired.
 
 - [x] **Data-agent pass 2026-10-05 (scraping OFF; no Chrome / live fetch):**
       read-only `DatabaseManager(path, read_only=True)` (SQLite `mode=ro`, no

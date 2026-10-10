@@ -9,10 +9,13 @@ from nba_model.scrapers.base import BookScraper, SessionMarkers
 
 # Mixed-case word pattern: each word must contain at least one lowercase
 # letter, so all-uppercase team abbreviations are excluded from name capture.
+# Token-start anchored + possessive (linear on long unspaced tokens — see
+# base.build_pp_style_name_pattern); same matches when followed by whitespace.
+_NAME_WORD = r"(?<![A-Za-z.\'\-])[A-Z](?=[A-Za-z.\'\-]*[a-z])[A-Za-z.\'\-]*+"
 _NAME_PAT = (
     r"(?P<player>"
-    r"[A-Z][A-Za-z.\'\-]*[a-z][A-Za-z.\'\-]*"
-    r"(?:\s+[A-Z][A-Za-z.\'\-]*[a-z][A-Za-z.\'\-]*){1,3}"
+    + _NAME_WORD
+    + r"(?:\s+" + _NAME_WORD + r"){1,3}"
     r")"
 )
 

@@ -158,6 +158,13 @@ def build_pp_style_name_pattern() -> str:
     "More" / "Less" / "Projections" from starting a name token, even though
     they technically have lowercase letters.  Compiled WITHOUT IGNORECASE so
     [a-z] is genuinely case-sensitive.
+
+    Linear-time on long unspaced tokens: a word may only START at a token
+    boundary (lookbehind), and its body is consumed possessively after a
+    lookahead checks it holds a lowercase letter. The old
+    ``[A-Z][…]*[a-z][…]*`` re-scanned the rest of the token from every
+    capital inside it (quadratic). Same matches whenever a name word is
+    followed by whitespace — which every caller requires.
     """
     stop_lookahead = (
         "(?!"
@@ -168,5 +175,8 @@ def build_pp_style_name_pattern() -> str:
         )
         + ")"
     )
-    name_word = stop_lookahead + r"[A-Z][A-Za-z.\'\-]*[a-z][A-Za-z.\'\-]*"
+    name_word = (
+        r"(?<![A-Za-z.\'\-])" + stop_lookahead
+        + r"[A-Z](?=[A-Za-z.\'\-]*[a-z])[A-Za-z.\'\-]*+"
+    )
     return r"(?P<player>" + name_word + r"(?:\s+" + name_word + r"){1,3}" + r")"
