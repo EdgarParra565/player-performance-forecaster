@@ -44,6 +44,9 @@ data/raw/
 *.log
 logs/
 
+# LLM benchmark reply cache (WS11; prompt-hash keyed, local only)
+data/cache/
+
 # Local browser automation artifacts
 .playwright-browsers/
 data/artifacts/

@@ -324,7 +324,44 @@ CREATE TABLE IF NOT EXISTS mlb_prop_lines (
     FOREIGN KEY (snapshot_id) REFERENCES web_text_snapshots(snapshot_id)
 );
 
+-- LLM calibration benchmark (WS11 — measurement only, never used to pick or
+-- size bets). One row per (run, model, arm, prop): the LLM's P(over) for a
+-- settled prop. Graded by settle_llm_forecasts() with the exact predictions
+-- outcome logic. retro=1 = forecast made after the game (historical); never a
+-- headline result. arm 'blind' = prompt has no outcome and no market price;
+-- 'market' adds the de-vigged price. raw_response keeps every reply verbatim.
+-- A read-only open does NOT require this table (_READ_ONLY_OPTIONAL_TABLES),
+-- so an older DB snapshot without it still serves.
+CREATE TABLE IF NOT EXISTS llm_forecasts (
+    forecast_id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id           TEXT NOT NULL,
+    provider         TEXT NOT NULL,            -- 'anthropic' | 'openai' | ...
+    model_name       TEXT NOT NULL,
+    prompt_version   TEXT NOT NULL,
+    arm              TEXT NOT NULL DEFAULT 'blind',  -- 'blind' | 'market'
+    prompt_hash      TEXT NOT NULL,            -- sha256 of the request (cache key)
+    player_id        INTEGER NOT NULL,
+    player_name      TEXT NOT NULL,
+    game_date        DATE NOT NULL,
+    stat_type        TEXT NOT NULL,
+    line_value       REAL NOT NULL,
+    prob_over        REAL CHECK (prob_over IS NULL OR (prob_over >= 0 AND prob_over <= 1)),
+    parse_status     TEXT NOT NULL,            -- 'ok' | 'invalid' | 'refusal'
+    raw_response     TEXT,                     -- JSON list of every reply, verbatim
+    info_cutoff_utc  TIMESTAMP NOT NULL,       -- newest information in the prompt
+    retro            INTEGER NOT NULL CHECK (retro IN (0, 1)),
+    training_cutoff  DATE,                     -- model training cutoff when known
+    prediction_id    INTEGER,                  -- predictions row = the model baseline
+    actual_result    REAL,                     -- filled by settle_llm_forecasts()
+    outcome          TEXT,                     -- 'over' | 'under' | 'push' | NULL (pending)
+    sport            TEXT NOT NULL DEFAULT 'nba',
+    created_at_utc   TIMESTAMP NOT NULL,
+    UNIQUE (run_id, model_name, arm, player_id, game_date, stat_type, line_value)
+);
+
 -- Indexes for fast queries
+CREATE INDEX IF NOT EXISTS idx_llm_forecasts_run ON llm_forecasts(run_id, model_name, arm);
+CREATE INDEX IF NOT EXISTS idx_llm_forecasts_prop ON llm_forecasts(player_id, game_date, stat_type);
 CREATE INDEX IF NOT EXISTS idx_mlb_prop_lines_key ON mlb_prop_lines(book, player_name, stat_type, side, observed_at_utc DESC);
 CREATE INDEX IF NOT EXISTS idx_mlb_game_logs_player_stat ON mlb_game_logs(player_id, stat_type, game_date DESC);
 CREATE INDEX IF NOT EXISTS idx_mlb_game_logs_date ON mlb_game_logs(game_date DESC, game_pk);

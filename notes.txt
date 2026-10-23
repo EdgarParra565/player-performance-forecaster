@@ -1,14 +1,14 @@
 # NBA Player Performance Forecaster - Working Notes
 
-Last updated: 2026-10-10
+Last updated: 2026-10-23
 
 Active tracker only: architecture, what's done, what's next. CLI runbooks,
 deployment, and security live in **README.md** and **docs/** — not duplicated here.
 
-Test baseline (2026-10-10, end of data-agent pass 2): **949 passing** in nba_model/tests
-(`.venv/bin/python3 -m pytest nba_model/tests -q`; Windows:
+Test baseline (2026-10-23, WS11 tasks 1–4): **1005 passing** in nba_model/tests
+(954 at the start of that pass, not 949; `.venv/bin/python3 -m pytest nba_model/tests -q`; Windows:
 `.venv\Scripts\python.exe -m pytest nba_model/tests -q`; note `test_daily_etl.py`
-needs real network to stats.nba.com), **108 API tests**
+needs real network to stats.nba.com), **113 API tests**
 (`.venv/bin/python3 -m pytest api/tests -q`), and **104 frontend tests + clean tsc**
 (`cd frontend && npm run test`).
 
@@ -16,6 +16,17 @@ needs real network to stats.nba.com), **108 API tests**
 
 ## Near-term objectives (NBA)
 
+0. **PRIORITY (2026-10-19): LLM calibration benchmark (WS11).** Have several
+   LLMs forecast NBA prop outcomes as probabilities, then score them with the
+   existing `calibration_report` pipeline (reliability buckets + Brier) next to
+   the model and the market. Does not need Chrome: it can run first on the
+   65,380 settled `predictions` rows already in the DB. Design + task list in
+   "Open work → WS11". Resume line once a first run exists.
+   **2026-10-23: tasks 1–4 built; the first retro run waits on the owner's API
+   key(s)** (see WS11 "Owner steps").
+0b. **Deploy the flagship (owner step).** `brew install flyctl`, `fly auth login`,
+   then DEPLOYMENT.md §16. Publish the first DB snapshot BEFORE `fly deploy`
+   (health is 503 until a DB exists). Everything else is built and smoke-tested.
 1. **In-season data loop — BUILT, OFF since 2026-09-28 (owner).** The autopilot
    (launchd scraping Chrome on `:9222`, hourly ETL at :05, keep-awake,
    session-health alerts) was verified live on 2026-09-28, then the owner turned
@@ -265,6 +276,125 @@ save; web = Plotly, Tk = matplotlib; do not delete `sports/` scaffolding.
 ---
 
 ## Open work (priority)
+
+### WS11 — LLM calibration benchmark (PRIORITY, added 2026-10-19)
+
+**Question:** how calibrated are LLMs at forecasting NBA player props, scored
+the same way the model and the market are scored? This is a measurement
+project, not a betting one: the deliverable is a reliability table + Brier
+per forecaster (each LLM, the model, the de-vigged market), on the same props.
+
+**Why it fits:** the scoring half already exists (`calibration_report`:
+`build_reliability_table`, `brier_by_stat`, `load_calibration_frame`). The
+only new pieces are a forecast table, a prompt/collection CLI, and a
+`--source llm` reader. No Chrome, no scraping, no live boards needed for the
+first run.
+
+**Design (keep it additive):**
+- New table `llm_forecasts`: `forecast_id`, `run_id`, `model_name`,
+  `prompt_version`, `player_id`, `player_name`, `game_date`, `stat_type`,
+  `line_value`, `prob_over` (0–1), `raw_response`, `info_cutoff_utc`
+  (what the LLM was allowed to "know"), `outcome` / `actual_result` (settled
+  the same way `predictions` is), `created_at_utc`. UNIQUE on
+  (run_id, model_name, player_id, game_date, stat_type, line_value).
+- Prop universe = settled rows from `predictions` (and `bet_log` once it
+  fills). Give each LLM the same facts the model had: player, team,
+  opponent, game date, stat, line, last-N game log for that stat. **No
+  outcome, no market odds in the prompt** (market goes in a second arm to
+  test whether seeing the price helps).
+- Ask for a single number `P(over)`; parse strictly; reject or re-ask on
+  anything that is not a probability. Store the raw text regardless.
+- Scoring: `calibration_report --source llm --run-id …` emits the same
+  bucket table + Brier as the model. Add Brier decomposition
+  (reliability / resolution / uncertainty) and expected calibration error so
+  "calibrated but no resolution" (hedging at 0.5) is visible.
+- Baselines on the exact same prop set: the model (`prob_over` from
+  `predictions`), the market (de-vigged implied from `betting_lines` where
+  a price exists, else -110 → 0.5238), and a constant 0.5.
+- Leakage control: default to **in-season forward runs** (forecast before
+  tip-off, settle after). Historical rows are allowed for a first pass but
+  must be labeled `retro=1`; any model with a training cutoff after the game
+  date is reported separately and never headlined.
+- Cost control: `--limit`, `--stats`, `--date-range`, per-run cost estimate
+  printed before any API call; cache by prompt hash so re-runs are free.
+- Keys via env (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, …); never logged.
+  Redact in reports like the Odds API key.
+
+**Tasks (data agent lane; api/ + frontend/ only for the final view):**
+- [x] `llm_forecasts` table + idempotent migration + read-only compatibility
+      (the flagship opens `mode=ro`; a new table must not break
+      `DatabaseNotReadyError` checks). 2026-10-23: in schema.sql but listed in
+      `DatabaseManager._READ_ONLY_OPTIONAL_TABLES`, so an older snapshot
+      without it still opens read-only (readers call `has_table`). Extra
+      columns beyond the design: provider, arm, prompt_hash, parse_status,
+      retro, training_cutoff, prediction_id (model baseline), sport; UNIQUE
+      adds `arm`. **Live DB migrated** by one writer open after backup
+      `data/database/backups/nba_data_pre_llm_forecasts_20261023T202139Z.db`
+      (sha256 verified): the 18 existing tables are identical (row counts +
+      content hashes), integrity ok, read-only open ok, table empty. Rehearsed
+      on a copy first.
+- [x] `nba_model/evaluation/llm_forecast.py`: prompt builder (versioned),
+      provider adapters behind one interface, strict parser, cache, dry-run
+      cost estimate. Tests with a fake provider — no network in the suite.
+      2026-10-23: prompt v1; `AnthropicProvider` (official `anthropic` SDK,
+      imported lazily, **not installed in .venv**; effort low, no temperature,
+      no refusal fallbacks so every answer stays attributed to its model),
+      `OpenAIProvider` (Chat Completions over `requests`; any compatible
+      endpoint via `--base-url` / `--api-key-env`), `FakeProvider`. Strict
+      parse = the whole reply is one decimal in [0, 1], one re-ask, else
+      'invalid'; refusals stored as 'refusal'. File cache keyed by the prompt
+      hash (`data/cache/llm_forecasts/`, written right after each paid call).
+      `--dry-run` = estimate + sample prompt, no side effects; real runs abort
+      above `--max-cost-usd` (default 5) or when pricing is unknown (only
+      Anthropic list prices are bundled). `--retro` is required (forward runs
+      not built). Tests block sockets + DNS while they run. Guards added after
+      review: a prop already in the run is skipped, and one stored with a
+      different prompt/settings is refused before any call (new --run-id);
+      `--settle-only --dry-run` is refused; `--api-key-env` / `--base-url`
+      values that look like a key or carry credentials are refused without
+      echoing them; market prices count only if scraped before 16:00 UTC on
+      game day (no tip times stored; live betting_lines has a 2026-07-22
+      backfill of May games = post-game prices).
+- [x] Settlement: reuse the `predictions` outcome logic for `llm_forecasts`.
+      `settle_llm_forecasts()` and `backfill_predictions_outcomes()` share
+      `_settle_over_under` (same SAVEPOINT, same stat expressions).
+- [x] `calibration_report --source llm` + Brier decomposition + ECE; one
+      markdown artifact comparing LLM(s) vs model vs market vs 0.5.
+      2026-10-23: common prop set only; `brier = reliability − resolution +
+      uncertainty + within_bin` (exact); retro rows with an unknown or
+      on/after-game training cutoff go to a separate "possible leakage" block.
+- **Prop-universe findings (2026-10-23, read-only):** the settled
+  `predictions` rows are backtest sweeps — 13 players, 6,721 distinct props,
+  2024-11-01 → 2025-03-15, ~9.7 config rows per prop, lines mostly synthetic
+  (a fixed 25.5 for every stat, or line = model mean). Default filters keep
+  1,990 half-point props → -110 that exist only as a model mean → 1,248
+  within 3 SDs of the last-10 mean. Zero overlap with `betting_lines`
+  (2026-03 → 2026-05), so for this universe the market baseline is the -110
+  assumption on every prop and the market arm has 0 props. Every prop
+  predates any current model's training data, so the first retro run will
+  have no headline block — expected; forward runs fix that.
+- **Backtest look-ahead (pre-existing, NOT fixed — outside WS11 tasks 1–4):**
+  `feature_engineering.add_context_features` computes `injury_proxy` from a
+  minutes rolling window that includes the CURRENT game, and
+  `backtest._apply_points_adjustments` lowers the points mean with it. So
+  every stored backtest **points** prediction read the target game's own
+  minutes: the model baseline's points numbers are optimistic (the report
+  flags it), and `line_source='model'` points lines carry target-game info
+  (now excluded). Fix = shift the minutes window by one game, then re-run the
+  sweeps (a DB write — owner's call).
+- **Owner steps before the first retro run:** `.venv/bin/python3 -m pip
+  install anthropic` (and add it to requirements if kept); `export
+  ANTHROPIC_API_KEY=...` in the shell; for OpenAI `export OPENAI_API_KEY=...`
+  plus `--price-in-per-mtok/--price-out-per-mtok`. Then drop `--dry-run` from
+  the README command and run `calibration_report --source llm --run-id RUN`.
+- [ ] First retro run: ~500 settled props, 3 providers, `retro=1`. Record
+      the numbers in this file.
+- [ ] Forward run once props post in-season (needs scraping back on).
+- [ ] Flagship: a "Forecasters" tab on Paper Trades (reliability curve per
+      forecaster) — web agent, after the data is real.
+
+**Not in scope:** using LLM output to place or size picks; prompt tuning
+until an LLM "wins". The result is the result.
 
 ### WS10 — Validation before auto-bet (tooling built; the runs are what's left)
 

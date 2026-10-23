@@ -44,6 +44,7 @@ The current baseline is designed to be reproducible offline (synthetic benchmark
   - one module per book: `prizepicks.py`, `underdog.py`, `pick6.py`, `parlayplay.py`, `betmgm.py`, `caesars.py`, `draftkings.py`, `bovada.py`, `kalshi.py`, plus 11 stub configs
 - `nba_model/evaluation/` - backtesting and benchmark runners
   - `bet_slip.py` / `calibration_report.py` - paper-trading slip export (`bet_log`) + reliability/Brier reporting (WS10)
+  - `llm_forecast.py` - LLM calibration benchmark (WS11): collects LLM P(over) forecasts into `llm_forecasts`; scored by `calibration_report --source llm`
 - `nba_model/tests/` - smoke and integration-style tests
 - `nba_model/visualization/` - distribution plotting + Player/Team chart builders (`player_charts.py` powers both UIs; also exposes `fetch_recent_games` / `fetch_player_recent_results` / `list_seasons` for the browse views)
 - `api/` - **read-only FastAPI service** backing the new flagship UI (wraps the same `player_charts` / `edge_scanner` / consensus functions Streamlit uses; pydantic models; input validation via `nba_model/web/input_validation.py`; tests in `api/tests/`)
@@ -1103,6 +1104,66 @@ Measurement tooling that gates any future auto-betting. **No execution layer.**
 
 Phase 1 backtests over these tools stay data-starved until real in-season market
 data lands in `betting_lines` / `betting_line_snapshots` (a Mac-host ETL task).
+
+## LLM calibration benchmark (WS11 — measurement only)
+
+How calibrated are LLMs at NBA props, scored exactly like the model and the
+market? Never used to pick or size bets.
+
+- **`llm_forecasts` table** — one row per (run, model, arm, prop): `prob_over`,
+  every raw reply, `parse_status` (ok / invalid / refusal), `retro`,
+  `info_cutoff_utc`, `training_cutoff`, the `prediction_id` used as the model
+  baseline, and `outcome` / `actual_result` filled by
+  `DatabaseManager.settle_llm_forecasts()` (the same code path as
+  `backfill_predictions_outcomes`). A read-only open does not require the table.
+- **Collector** — `nba_model.evaluation.llm_forecast`. Historical runs need
+  `--retro` (rows labeled `retro=1`; forward runs aren't built yet). The
+  default `blind` prompt holds player, team, opponent, date, stat, line, and
+  the last-N game log before the game — never the outcome or a price; `--arm
+  market` adds the de-vigged price and only runs on props with a real
+  two-sided price. Replies must be one decimal in [0, 1] (one re-ask, then
+  `invalid`). Every reply is cached by prompt hash under
+  `data/cache/llm_forecasts/`, so re-runs are free. `--max-cost-usd` (default
+  5) blocks a run whose worst-case estimate is higher.
+
+  ```bash
+  # Cost estimate + sample prompt, then stop (no API call, no DB write, no files):
+  python -m nba_model.evaluation.llm_forecast --retro --provider anthropic \
+      --model claude-opus-5-5 --limit 50 --dry-run
+  # Real run: needs `pip install anthropic` + ANTHROPIC_API_KEY in the shell env.
+  python -m nba_model.evaluation.llm_forecast --retro --provider anthropic \
+      --model claude-opus-5-5 --limit 50 --run-id retro-v1
+  # OpenAI (or any OpenAI-compatible endpoint via --base-url / --api-key-env):
+  # OPENAI_API_KEY + explicit pricing, since list prices aren't bundled.
+  python -m nba_model.evaluation.llm_forecast --retro --provider openai \
+      --model <model-id> --price-in-per-mtok <usd> --price-out-per-mtok <usd> \
+      --limit 50 --run-id retro-v1
+  ```
+
+  Keys are read from the environment only and never logged, stored or echoed.
+  The prop universe is settled `predictions` rows (backtest sweeps: 13
+  players, 2024-11 → 2025-03). By default it keeps half-point lines within
+  3 SDs of the player's last-10 mean (`--line-kind any`, `--max-line-z 0` to
+  widen), drops lines that exist only as a backtest model mean, samples
+  deterministically by `--seed`, and uses the production-config row
+  (`get_default_distribution`, window 10) as the model baseline. A run never
+  re-answers a prop it already holds; changing the prompt or settings needs a
+  new `--run-id`. Market prices count only if scraped before 16:00 UTC on
+  game day.
+- **Report** — `calibration_report --source llm --run-id RUN` scores every
+  LLM next to the model, the market (de-vigged `betting_lines` price, else
+  -110 → 0.5238) and a constant 0.5 on the common prop set, with the Brier
+  decomposition (reliability / resolution / uncertainty) and ECE. Retro props
+  whose model training cutoff is unknown or on/after the game date go in a
+  separate "possible leakage" block, never the headline (`--training-cutoff`
+  on the collector records a known cutoff). The report also flags points
+  props whose model baseline comes from backtest rows: that harness's
+  `injury_proxy` reads the target game's own minutes, so those model numbers
+  are optimistic (see notes.txt WS11).
+
+  ```bash
+  python -m nba_model.evaluation.calibration_report --source llm --run-id retro-v1
+  ```
 
 ## Baseline Benchmark Results
 

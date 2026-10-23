@@ -162,17 +162,24 @@ class DatabaseManager:
             raise
         self.conn.execute(f"RELEASE {sp}")
 
+    # schema.sql tables a read-only open does NOT require: added after the
+    # flagship's snapshot format, so an older published DB without them must
+    # still serve. Their readers check ``has_table`` first.
+    _READ_ONLY_OPTIONAL_TABLES = frozenset({"llm_forecasts"})
+
     @classmethod
     def required_schema(cls) -> dict:
         """``{table: {columns}}`` a read-only open requires: every table in
-        schema.sql plus the columns added by migrations (an un-migrated file
-        would make the newer readers fail mid-request instead of at open)."""
+        schema.sql (minus ``_READ_ONLY_OPTIONAL_TABLES``) plus the columns
+        added by migrations (an un-migrated file would make the newer readers
+        fail mid-request instead of at open)."""
         import re
 
         schema = (Path(__file__).parent / "schema.sql").read_text(encoding="utf-8")
         required: dict = {
             name: set() for name in re.findall(
                 r"CREATE TABLE IF NOT EXISTS\s+(\w+)", schema)
+            if name not in cls._READ_ONLY_OPTIONAL_TABLES
         }
         for table in cls._SPORT_COLUMN_TABLES:
             required.setdefault(table, set()).add("sport")
@@ -220,6 +227,14 @@ class DatabaseManager:
                 "open it once with a writer DatabaseManager(path) to migrate"
             )
         logger.info("Database opened read-only at %s", path)
+
+    def has_table(self, name: str) -> bool:
+        """True when ``name`` exists — readers of a ``_READ_ONLY_OPTIONAL_TABLES``
+        table call this before querying it."""
+        return self.conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (str(name),),
+        ).fetchone() is not None
 
     # Tables that gain a ``sport`` discriminator for the multi-sport rollout
     # (NFL first). Added via idempotent migration rather than editing every
@@ -784,15 +799,35 @@ class DatabaseManager:
         Idempotent — re-running just settles any new games that landed
         since the last call.
         """
+        return self._settle_over_under("predictions")
+
+    def settle_llm_forecasts(self):
+        """Settle pending ``llm_forecasts`` rows (WS11) with the exact
+        ``predictions`` outcome logic (shared ``_settle_over_under``): the
+        realized stat from ``game_logs`` vs ``line_value`` → over/under/push.
+        Idempotent; returns the same counts as ``backfill_predictions_outcomes``."""
+        return self._settle_over_under("llm_forecasts")
+
+    # Tables graded over/under against game_logs → their id column. A fixed
+    # map (never caller input) because both names are interpolated into SQL.
+    _OVER_UNDER_TABLES = {
+        "predictions": "prediction_id",
+        "llm_forecasts": "forecast_id",
+    }
+
+    def _settle_over_under(self, table: str) -> dict:
+        """Fill ``actual_result`` + ``outcome`` on every pending row of an
+        over/under ``table`` (see ``backfill_predictions_outcomes``)."""
+        id_col = self._OVER_UNDER_TABLES[table]
         # Map stat_type → SQL expression against game_logs columns (shared with
         # settle_bet_log). PRA / RA are computed from raw columns, others direct.
         stat_expr = _GAMELOG_STAT_EXPR
 
-        update_stmt = """
-            UPDATE predictions
+        update_stmt = f"""
+            UPDATE {table}
                SET actual_result = ?,
                    outcome = ?
-             WHERE prediction_id = ?
+             WHERE {id_col} = ?
         """
 
         settled = 0
@@ -801,9 +836,9 @@ class DatabaseManager:
 
         # Pull pending rows up front so the UPDATEs don't fight a live cursor.
         pending = self.conn.execute(
-            """
-            SELECT prediction_id, player_id, game_date, stat_type, line_value
-            FROM predictions
+            f"""
+            SELECT {id_col}, player_id, game_date, stat_type, line_value
+            FROM {table}
             WHERE actual_result IS NULL
             """
         ).fetchall()
@@ -811,8 +846,8 @@ class DatabaseManager:
         # All-or-nothing: a failure mid-loop rolls back this call's UPDATEs
         # (SAVEPOINT) and re-raises, instead of leaving a partial backfill for
         # the next unrelated commit; a caller's pending work is kept.
-        with self._atomic("predictions_backfill"):
-            for pred_id, player_id, game_date, stat_type, line_value in pending:
+        with self._atomic(f"{table}_backfill"):
+            for row_id, player_id, game_date, stat_type, line_value in pending:
                 scanned += 1
                 stat = (stat_type or "").strip().lower()
                 expr = stat_expr.get(stat)
@@ -842,7 +877,7 @@ class DatabaseManager:
                         outcome = "under"
                     else:
                         outcome = "push"
-                self.conn.execute(update_stmt, (actual, outcome, int(pred_id)))
+                self.conn.execute(update_stmt, (actual, outcome, int(row_id)))
                 settled += 1
 
         self.conn.commit()
@@ -854,11 +889,93 @@ class DatabaseManager:
         if unsupported_stats:
             result["unsupported_stats"] = sorted(unsupported_stats)
         logger.info(
-            "Backfilled predictions outcomes: %s settled, %s still pending "
-            "(scanned %s)",
-            settled, result["remaining_pending"], scanned,
+            "Backfilled %s outcomes: %s settled, %s still pending (scanned %s)",
+            table, settled, result["remaining_pending"], scanned,
         )
         return result
+
+    # ------------------------------------------------------------------
+    # LLM calibration benchmark (WS11 — measurement only)
+    # ------------------------------------------------------------------
+
+    LLM_PARSE_STATUSES = ("ok", "invalid", "refusal")
+    LLM_ARMS = ("blind", "market")
+
+    def insert_llm_forecasts(self, rows):
+        """Insert ``llm_forecasts`` rows (one LLM answer per prop).
+
+        Returns ``{inserted, attempted, duplicates_ignored, rejected}``. A row
+        is rejected (never written) when a required field is missing, its
+        ``arm`` / ``parse_status`` is unknown, ``retro`` isn't 0/1, or
+        ``prob_over`` is outside [0, 1] / missing on an 'ok' row. A (run,
+        model, arm, prop) already stored is kept as-is (INSERT OR IGNORE), so
+        re-running a run never duplicates or rewrites an answer.
+        All-or-nothing per call."""
+        rows = list(rows or [])
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        payload = []
+        rejected = 0
+        for r in rows:
+            prob = _safe_float(r.get("prob_over"))
+            status = str(r.get("parse_status") or "").strip().lower()
+            retro = _safe_int(r.get("retro"))
+            raw = r.get("raw_response")
+            new = (
+                str(r.get("run_id") or "").strip(),
+                str(r.get("provider") or "").strip(),
+                str(r.get("model_name") or "").strip(),
+                str(r.get("prompt_version") or "").strip(),
+                str(r.get("arm") or "blind").strip().lower(),
+                str(r.get("prompt_hash") or "").strip(),
+                _safe_int(r.get("player_id")),
+                str(r.get("player_name") or "").strip(),
+                str(r.get("game_date") or "")[:10],
+                str(r.get("stat_type") or "").strip().lower(),
+                _safe_float(r.get("line_value")),
+                prob,
+                status,
+                (None if raw is None else str(raw)),
+                str(r.get("info_cutoff_utc") or "").strip(),
+                retro,
+                (str(r["training_cutoff"])[:10] if r.get("training_cutoff") else None),
+                _safe_int(r.get("prediction_id")),
+                str(r.get("sport") or "nba"),
+                str(r.get("created_at_utc") or now),
+            )
+            required_ok = all(v not in ("", None) for v in new[:11]) and new[14]
+            if (not required_ok or new[4] not in self.LLM_ARMS
+                    or status not in self.LLM_PARSE_STATUSES
+                    or retro not in (0, 1)
+                    or (prob is not None and not 0.0 <= prob <= 1.0)
+                    or (status == "ok" and prob is None)):
+                rejected += 1
+                continue
+            payload.append(new)
+        if not payload:
+            return {"inserted": 0, "attempted": 0, "duplicates_ignored": 0,
+                    "rejected": int(rejected)}
+
+        before = self.conn.total_changes
+        with self._atomic("llm_forecasts"):
+            self.conn.executemany(
+                """
+                INSERT OR IGNORE INTO llm_forecasts (
+                    run_id, provider, model_name, prompt_version, arm,
+                    prompt_hash, player_id, player_name, game_date, stat_type,
+                    line_value, prob_over, parse_status, raw_response,
+                    info_cutoff_utc, retro, training_cutoff, prediction_id,
+                    sport, created_at_utc
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                payload,
+            )
+        self.conn.commit()
+        inserted = self.conn.total_changes - before
+        logger.info("Inserted %s llm_forecasts rows (%s duplicates ignored, %s rejected)",
+                    inserted, len(payload) - inserted, rejected)
+        return {"inserted": int(inserted), "attempted": int(len(payload)),
+                "duplicates_ignored": int(len(payload) - inserted),
+                "rejected": int(rejected)}
 
     # ------------------------------------------------------------------
     # Paper-trading bet log (WS10 — measurement layer, NOT execution)
